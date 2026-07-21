@@ -7,7 +7,7 @@
 [![CI](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml/badge.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/rlm-tools-bsl.svg)](https://pypi.org/project/rlm-tools-bsl/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Coverage](https://img.shields.io/badge/coverage-83%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-84%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 MCP-сервер для токен-эффективного анализа кодовых баз 1С (BSL).
@@ -224,6 +224,10 @@ rlm_start(project="My Config", query="find module...")
 Поддерживаются OpenAI-совместимые endpoint'ы (OpenRouter, Ollama, vLLM) и Anthropic API. Без настройки LLM все остальные хелперы работают нормально.
 
 Подробная настройка, механика, квоты и примеры — **[docs/LLM_QUERY.md](docs/LLM_QUERY.md)** | Все переменные окружения — **[docs/ENV_REFERENCE.md](docs/ENV_REFERENCE.md)**
+
+## Мост к графовому серверу 1c-mcp-metacode (опционально)
+
+Если рядом развёрнут графовый MCP-сервер 1c-mcp-metacode (Neo4j: полный граф метаданных, граф вызовов, семантический поиск по коду), задайте `RLM_METACODE_URL=http://127.0.0.1:8000/mcp` — и в песочнице появятся хелперы `graph_search_code`, `graph_search_routines`, `graph_object_structure`, `graph_call`, `graph_tools`. Скрипт в `rlm_execute` дополняет RLM-поиск данными графа **на стороне сервера** и возвращает агенту только итоговую выжимку — семантический поиск и полные связи из индекса без расхода контекста на промежуточные ответы. Без переменной мост выключен, автономность не затрагивается. Подробнее — **[docs/HELPERS.md](docs/HELPERS.md#graph-хелперы-мост-к-1c-mcp-metacode)**.
 
 ## Режимы старта сессии анализа: `slim` (по умолчанию) или `full`
 

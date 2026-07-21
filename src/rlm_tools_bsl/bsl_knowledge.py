@@ -1013,7 +1013,15 @@ File I/O:
   NOTE: tree('.') on large configs produces too much output — use tree('SubDir') or find_files()
 LLM (if available):
   llm_query(prompt, context='')            → str (keep context <3000 chars, split if empty response)
-  llm_query_batched(prompts, context)      → [str]"""
+  llm_query_batched(prompts, context)      → [str]
+GRAPH (if available — RLM_METACODE_URL → 1c-mcp-metacode/Neo4j):
+  graph_search_code(query, limit=5)        → семантический поиск по ТЕЛУ кода BSL (недетерминированные вопросы, где grep/FTS слабы)
+  graph_search_routines(query, limit=5)    → поиск процедур по имени/сигнатуре/описанию из графа
+  graph_object_structure(object_ref)       → индексированная карточка объекта; sections=['attributes',...] для деталей
+  graph_call(tool, **params), graph_tools() → любой инструмент графового сервера / их список
+  RECIPE (rlm → граф → rlm): 1) RLM discovery (find_module/search/read_procedure);
+  2) если вопрос семантический или нужны полные связи из индекса — добери graph_search_code/graph_call;
+  3) сведи оба источника в ОДИН компактный print() — не печатай graph-ответы целиком."""
 
 
 def build_helpers_table(registry: dict) -> str:

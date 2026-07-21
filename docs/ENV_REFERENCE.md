@@ -59,6 +59,17 @@ RLM_LOG_HELPERS=all
 
 ---
 
+## Графовый мост (1c-mcp-metacode)
+
+Хелперы `graph_call()`, `graph_tools()`, `graph_search_code()`, `graph_search_routines()`, `graph_object_structure()` обращаются к графовому MCP-серверу 1c-mcp-metacode (Neo4j) прямо из песочницы. Без настройки моста эти хелперы недоступны, всё остальное работает нормально. Подробнее — [HELPERS.md](HELPERS.md#graph-хелперы-мост-к-1c-mcp-metacode).
+
+| Переменная             | По умолчанию | Описание                                                                                                                             |
+| ---------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `RLM_METACODE_URL`     | —            | MCP endpoint сервера metacode (например `http://127.0.0.1:8000/mcp`). Если задан — активирует graph-хелперы в песочнице              |
+| `RLM_METACODE_TIMEOUT` | `60`         | Таймаут одного graph-вызова в секундах                                                                                               |
+
+---
+
 ## Сервер и сессии
 
 | Переменная            | По умолчанию | Описание                                                                                                                               |
@@ -71,51 +82,6 @@ RLM_LOG_HELPERS=all
 | `RLM_HOST`            | `127.0.0.1`  | Адрес для HTTP-транспорта. Можно также задать через `--host`                                                                           |
 | `RLM_PORT`            | `9000`       | Порт для HTTP-транспорта. Можно также задать через `--port`                                                                            |
 | `RLM_CONFIG_FILE`     | —            | Путь к `service.json`. Каталог этого файла определяет расположение `projects.json`, `.env`, `logs/` и `cache/`. Если не задан — `~/.config/rlm-tools-bsl/service.json` для конфига и `~/.cache/rlm-tools-bsl/` для кэша |
-
----
-
-## Песочница `rlm_execute` (процессная изоляция, v1.29.0)
-
-С v1.29.0 код агента может выполняться в отдельном sandbox-worker-процессе на каждую сессию (`RLM_SANDBOX_MODE=process`): stdout разных сессий физически разделён процессами, timeout — авторитетный hard-kill со стороны родителя (Windows Job Object / POSIX process group), падение/OOM worker не роняет MCP-сервер. Режим `inline` (код в основном процессе, как до v1.29.0) остаётся только для диагностики и аварийного ручного восстановления — он небезопасен: hard process isolation отключена, timeout не гарантирует остановку кода. Все inline-execute при этом глобально сериализованы (stdout-гонка закрыта и там ценой параллельности).
-
-**Невалидное или пустое явно заданное значение `RLM_SANDBOX_MODE` — это ошибка старта сервера (fail-fast), а не fallback**: опечатка не имеет права незаметно отключить заявленную границу изоляции. Автоматического отката `process` → `inline` при ошибке spawn/Job Object нет: `rlm_start` возвращает controlled error.
-
-| Переменная | По умолчанию | Описание |
-| ---------- | ------------ | -------- |
-| `RLM_SANDBOX_MODE` | `process` | `process` — worker-процесс на сессию (production default, включается сам); `inline` — прежнее выполнение в MCP-процессе (диагностика/аварийный fallback, hard-kill таймаута НЕ гарантируется). Допустимы ТОЛЬКО эти два значения; иное — ошибка старта, а не откат к inline |
-| `RLM_SANDBOX_START_TIMEOUT_SECONDS` | `60` | Timeout инициализации worker (холодный spawn + импорты + открытие индекса). НЕ равен execution timeout. При истечении `rlm_start` завершается ошибкой, процесс убивается, сессия не создаётся |
-| `RLM_SANDBOX_KILL_GRACE_SECONDS` | `1` | Короткий grace между terminate и hard kill дерева процессов. `0` — немедленный kill |
-| `RLM_SANDBOX_SHUTDOWN_DEADLINE_SECONDS` | `10` | **Один общий** deadline остановки ВСЕХ workers при shutdown сервера (не по 10с на каждого). Целое `1..60`; после истечения оставшиеся деревья получают немедленный force-kill без нового окна ожидания |
-| `RLM_SANDBOX_MEMORY_MB` | `1024` | Per-worker потолок памяти: Windows — Job Object process memory limit; Linux — `RLIMIT_AS`; macOS/прочие POSIX — best effort. `0` — лимит отключён (warning в лог). Суммарный бюджет ≈ `RLM_MAX_SESSIONS × RLM_SANDBOX_MEMORY_MB` + память parent MCP + ОС/descendants; потолок ≠ фактический RSS — подбирайте обе переменные совместно под свои конфигурации |
-| `RLM_SANDBOX_IPC_MAX_BYTES` | `4194304` | Максимальный размер одного IPC JSON-frame parent↔worker. Floor 256 KiB (init-ответ несёт снимок реестра хелперов). Действует в обе стороны: ответ worker крупнее лимита → worker убивается controlled + lazy restart; исходящий execute-frame крупнее лимита отклоняется родителем (`CodeTooLargeError`, worker остаётся жив) — это отдельный от `RLM_SANDBOX_MAX_CODE_CHARS` отказ |
-| `RLM_SANDBOX_MAX_CODE_CHARS` | `1000000` | Код длиннее отклоняется родителем ДО отправки worker (controlled error, worker жив) |
-| `RLM_SANDBOX_MAX_PROCESSES` | `16` | Windows Job Object active-process limit (worker + его descendants, включая `git` из `git_search`). `0` — отключить. POSIX `RLIMIT_NPROC` сознательно НЕ применяется (на ряде систем считается per-UID и задел бы соседние workers) |
-
-Допустимые значения (любое нарушение — **понятная ошибка старта сервера**, а не тихая подстановка default).
-
-Про пустую строку правила РАЗНЫЕ:
-
-* `RLM_SANDBOX_MODE` — default подставляется, только если переменной **нет вообще**. Явно заданная пустая строка (`RLM_SANDBOX_MODE=`) — ошибка старта: иначе опечатка в `.env` молча отключила бы процессную изоляцию.
-* числовые переменные — отсутствие переменной и пустая строка равнозначны и дают default.
-
-| Переменная | Диапазон | Что означает `0` |
-| ---------- | -------- | ---------------- |
-| `RLM_SANDBOX_MODE` | только `process` \| `inline` | — |
-| `RLM_SANDBOX_START_TIMEOUT_SECONDS` | `1..3600` | ошибка конфигурации |
-| `RLM_SANDBOX_KILL_GRACE_SECONDS` | `0..60` | немедленный kill без grace |
-| `RLM_SANDBOX_SHUTDOWN_DEADLINE_SECONDS` | `1..60` | ошибка конфигурации |
-| `RLM_SANDBOX_MEMORY_MB` | `0` или `>= 16` | лимит отключён (warning при старте) |
-| `RLM_SANDBOX_IPC_MAX_BYTES` | `>= 262144` | ошибка конфигурации |
-| `RLM_SANDBOX_MAX_CODE_CHARS` | `>= 1000` | ошибка конфигурации |
-| `RLM_SANDBOX_MAX_PROCESSES` | `0` или `1..1024` | лимит отключён |
-
-Фактически применённые платформенные гарантии пишутся в `server.log` при старте каждого worker (`group=…`, `memlimit=…`). Если запрошенный `RLM_SANDBOX_MEMORY_MB > 0` применить не удалось, в лог идёт отдельный WARNING — потолок памяти не считается установленным молча. Текущий режим песочницы виден агенту в ответе `rlm_start` как `limits.sandbox_mode`.
-
-Семантика timeout в `process`-режиме: deadline контролирует родитель; по истечении дерево процессов убивается независимо от того, что делает код (перехват `BaseException`, C-extension, catastrophic regex, блокирующий I/O). Возвращается частичный stdout, накопленный к моменту kill, с маркером `... [execution terminated after timeout; partial output]`; все переменные и кэши сессии теряются (`sandbox_state.state_lost=true`), следующий `rlm_execute` лениво поднимает чистое поколение worker (`sandbox_state.status="restarted"` в первом ответе). Лимиты `execute`/LLM-вызовов сессии при этом сохраняются.
-
-Процессная изоляция — это application-level containment (hard-kill, отдельные namespace/память), **а не полноценный OS security boundary**: worker работает с правами пользователя сервиса, и после Python-escape ему потенциально доступны файлы/сеть/environment (включая LLM-credentials), разрешённые этому пользователю. OS-jail (отдельная учётная запись, ACL, read-only mounts, firewall/container policy) — ответственность оператора, см. [INSTALL.md](INSTALL.md).
-
-Платформы: Windows и Linux — обязательные CI/release-gates; macOS — best effort (spawn/process-group без Job-эквивалента и без CI-runner).
 
 ---
 
