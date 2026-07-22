@@ -93,7 +93,7 @@ exclude_lines = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Dach-Coin/rlm-tools-bsl"
-Repository = "https://github.com/Dach-Coin/rlm-tools-bsl"
-Issues = "https://github.com/Dach-Coin/rlm-tools-bsl/issues"
-Changelog = "https://github.com/Dach-Coin/rlm-tools-bsl/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/oleg-igorevich-bykov/rlm-tools-bsl"
+Repository = "https://github.com/oleg-igorevich-bykov/rlm-tools-bsl"
+Issues = "https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/issues"
+Changelog = "https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/blob/master/CHANGELOG.md"

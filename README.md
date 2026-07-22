@@ -1,27 +1,27 @@
 # rlm-tools-bsl
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/docs/assets/rlm-tools-bsl-cover.png" alt="rlm-tools-bsl — мастерская для AI-агентов, работающих с 1С" width="720">
+  <img src="https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/docs/assets/rlm-tools-bsl-cover.png" alt="rlm-tools-bsl — мастерская для AI-агентов, работающих с 1С" width="720">
 </p>
 
-[![CI](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml/badge.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
+[![CI](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/actions/workflows/ci.yml/badge.svg)](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/rlm-tools-bsl.svg)](https://pypi.org/project/rlm-tools-bsl/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Coverage](https://img.shields.io/badge/coverage-84%25-brightgreen.svg)](https://github.com/Dach-Coin/rlm-tools-bsl/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-84%25-brightgreen.svg)](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 MCP-сервер для токен-эффективного анализа кодовых баз 1С (BSL).
 
 Адаптация open-source проекта [rlm-tools](https://github.com/stefanoshea/rlm-tools) под специфику платформы 1С:Предприятие — большие кодовые базы, форматы исходников (CF/EDT), структура метаданных, кириллический код, XML-описания объектов.
 
-> 📖 Публикация на Инфостарте: <a href="https://infostart.ru/1c/articles/2707750/"><img src="https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/docs/assets/infostart-logo.svg" alt="Инфостарт" height="20" align="absmiddle"></a> [«rlm-tools-bsl — мастерская для AI-агентов, работающих с 1С»](https://infostart.ru/1c/articles/2707750/)
+> 📖 Публикация на Инфостарте: <a href="https://infostart.ru/1c/articles/2707750/"><img src="https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/docs/assets/infostart-logo.svg" alt="Инфостарт" height="20" align="absmiddle"></a> [«rlm-tools-bsl — мастерская для AI-агентов, работающих с 1С»](https://infostart.ru/1c/articles/2707750/)
 
 ## Установка
 
 **Windows — установка + служба одной командой** (PowerShell от имени администратора):
 
 ```powershell
-irm https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/simple-install-from-pip.ps1 -OutFile simple-install-from-pip.ps1
+irm https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/simple-install-from-pip.ps1 -OutFile simple-install-from-pip.ps1
 PowerShell -ExecutionPolicy Bypass -File .\simple-install-from-pip.ps1
 ```
 
@@ -32,7 +32,7 @@ PowerShell -ExecutionPolicy Bypass -File .\simple-install-from-pip.ps1
 **Linux — установка + systemd-служба одной командой:**
 
 ```bash
-curl -LO https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/simple-install-from-pip.sh
+curl -LO https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/simple-install-from-pip.sh
 chmod +x simple-install-from-pip.sh && ./simple-install-from-pip.sh
 ```
 
@@ -55,7 +55,7 @@ docker compose up -d
 #### Windows (PowerShell от имени администратора)
 
 ```powershell
-git clone https://github.com/Dach-Coin/rlm-tools-bsl.git
+git clone https://github.com/oleg-igorevich-bykov/rlm-tools-bsl.git
 cd rlm-tools-bsl
 PowerShell -ExecutionPolicy Bypass -File .\simple-install.ps1
 ```
@@ -65,7 +65,7 @@ PowerShell -ExecutionPolicy Bypass -File .\simple-install.ps1
 #### Linux
 
 ```bash
-git clone https://github.com/Dach-Coin/rlm-tools-bsl.git
+git clone https://github.com/oleg-igorevich-bykov/rlm-tools-bsl.git
 cd rlm-tools-bsl
 chmod +x simple-install.sh && ./simple-install.sh
 ```
@@ -95,7 +95,7 @@ chmod +x simple-install.sh && ./simple-install.sh
 Получить для AI-ассистента поиск по кодовой базе BSL, сопоставимый по качеству с RAG, но при этом без самого RAG (и его временных затрат на предварительную векторизацию) и при масштабной экономии токенов и контекста на анализ
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/docs/assets/rlm-tools-bsl-agent-flow.png" alt="Схема работы AI-агента с rlm-tools-bsl" width="720">
+  <img src="https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/docs/assets/rlm-tools-bsl-agent-flow.png" alt="Схема работы AI-агента с rlm-tools-bsl" width="720">
 </p>
 
 ## RAG и RLM — что это

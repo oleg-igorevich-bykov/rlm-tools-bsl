@@ -856,7 +856,7 @@ This prompt verifies the 2 new helpers from v1.7.0 (`find_attributes`, `find_pre
 # Where-Used Analysis Prompt — E2E Test for v1.9.0 `find_references_to_object`
 
 Use this prompt to verify the new reverse-index helper added in v1.9.0
-(аналог конфигуратора «Найти ссылки → В свойствах», issue [#10](https://github.com/Dach-Coin/rlm-tools-bsl/issues/10)).
+(аналог конфигуратора «Найти ссылки → В свойствах», issue [#10](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/issues/10)).
 Replace `Справочник.ВидыПодарочныхСертификатов` with your target object and `<path>` with the real path.
 
 ---

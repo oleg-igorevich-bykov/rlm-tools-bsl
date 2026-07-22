@@ -731,7 +731,7 @@ LIMIT 30;
 
 ### metadata_references (Level-12, v12+)
 
-Unified reverse-index всех ссылок объектов метаданных друг на друга — основа для `find_references_to_object()` (issue [#10](https://github.com/Dach-Coin/rlm-tools-bsl/issues/10)). Одна строка = одна реальная ссылка. `ref_object` хранится в канонической форме (`Catalog.X`, `Document.Y`, `DefinedType.Z`) — exact-match без LIKE по JSON.
+Unified reverse-index всех ссылок объектов метаданных друг на друга — основа для `find_references_to_object()` (issue [#10](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/issues/10)). Одна строка = одна реальная ссылка. `ref_object` хранится в канонической форме (`Catalog.X`, `Document.Y`, `DefinedType.Z`) — exact-match без LIKE по JSON.
 
 | Колонка           | Тип        | Описание                                                       | Пример                                          |
 | ----------------- | ---------- | -------------------------------------------------------------- | ----------------------------------------------- |

@@ -69,7 +69,7 @@ uv tool upgrade rlm-tools-bsl
 **Windows — установка + служба одной командой** (PowerShell от имени администратора):
 
 ```powershell
-irm https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/simple-install-from-pip.ps1 -OutFile simple-install-from-pip.ps1
+irm https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/simple-install-from-pip.ps1 -OutFile simple-install-from-pip.ps1
 PowerShell -ExecutionPolicy Bypass -File .\simple-install-from-pip.ps1
 ```
 
@@ -78,7 +78,7 @@ PowerShell -ExecutionPolicy Bypass -File .\simple-install-from-pip.ps1
 **Linux — установка + systemd-служба одной командой:**
 
 ```bash
-curl -LO https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/simple-install-from-pip.sh
+curl -LO https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/simple-install-from-pip.sh
 chmod +x simple-install-from-pip.sh && ./simple-install-from-pip.sh
 ```
 
@@ -273,7 +273,7 @@ docker compose restart rlm
 ### Вариант C: Из исходников (для разработки)
 
 ```bash
-git clone https://github.com/Dach-Coin/rlm-tools-bsl.git
+git clone https://github.com/oleg-igorevich-bykov/rlm-tools-bsl.git
 cd rlm-tools-bsl
 uv tool install . --force
 ```
@@ -425,7 +425,7 @@ PowerShell -ExecutionPolicy Bypass -File .\diagnose-service-win.ps1
 **Если поставлено из PyPI** (без клона репо) — скачать и запустить одной строкой:
 
 ```powershell
-irm https://raw.githubusercontent.com/Dach-Coin/rlm-tools-bsl/master/diagnose-service-win.ps1 -OutFile diagnose-service-win.ps1
+irm https://raw.githubusercontent.com/oleg-igorevich-bykov/rlm-tools-bsl/master/diagnose-service-win.ps1 -OutFile diagnose-service-win.ps1
 PowerShell -ExecutionPolicy Bypass -File .\diagnose-service-win.ps1
 ```
 
@@ -450,7 +450,7 @@ PowerShell -ExecutionPolicy Bypass -File .\diagnose-service-win.ps1 -RunDebug
 - `-EventLogDays <N>` — глубина сканирования Event Log в днях (по умолчанию 3);
 - `-RunDebug` — дополнительно запустить `pythonservice.exe -debug rlm-tools-bsl` на 5 секунд, чтобы поймать ошибки импорта/старта в stderr (требует админа, кратко занимает порт сервиса).
 
-Скрипт **не читает** `.env`-файлы и не дампит переменные окружения. `server.log` может содержать пути к вашему 1С-проекту — просмотрите выгрузку перед публикацией. Получившийся `diagnose-<timestamp>.zip` приложите к [новому issue](https://github.com/Dach-Coin/rlm-tools-bsl/issues/new).
+Скрипт **не читает** `.env`-файлы и не дампит переменные окружения. `server.log` может содержать пути к вашему 1С-проекту — просмотрите выгрузку перед публикацией. Получившийся `diagnose-<timestamp>.zip` приложите к [новому issue](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/issues/new).
 
 ### Установка не проходит или служба грузит старую версию — dangling temp-папки
 
@@ -570,7 +570,7 @@ rlm-bsl-index index build <path-to-1c-sources>
 ## Разработка
 
 ```bash
-git clone https://github.com/Dach-Coin/rlm-tools-bsl.git
+git clone https://github.com/oleg-igorevich-bykov/rlm-tools-bsl.git
 cd rlm-tools-bsl
 uv sync --dev
 uv run pytest tests/ -q

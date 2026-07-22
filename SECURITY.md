@@ -11,7 +11,7 @@
 
 Если вы обнаружили уязвимость в rlm-tools-bsl, **не создавайте публичный issue**.
 
-Напишите на email автора проекта или используйте [GitHub Security Advisories](https://github.com/Dach-Coin/rlm-tools-bsl/security/advisories/new) — это приватный канал, доступный только maintainer'ам.
+Напишите на email автора проекта или используйте [GitHub Security Advisories](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/security/advisories/new) — это приватный канал, доступный только maintainer'ам.
 
 В сообщении укажите:
 - Описание уязвимости

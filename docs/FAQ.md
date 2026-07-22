@@ -1,6 +1,6 @@
 # FAQ — rlm-tools-bsl
 
-Сборник часто задаваемых вопросов от пользователей. Если не нашли ответа — пишите [Issue на GitHub](https://github.com/Dach-Coin/rlm-tools-bsl/issues).
+Сборник часто задаваемых вопросов от пользователей. Если не нашли ответа — пишите [Issue на GitHub](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/issues).
 
 ---
 

@@ -5,7 +5,7 @@
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/Dach-Coin/rlm-tools-bsl.git
+git clone https://github.com/oleg-igorevich-bykov/rlm-tools-bsl.git
 cd rlm-tools-bsl
 uv sync --dev
 ```
@@ -92,4 +92,4 @@ docs/                   # документация
 
 ## Вопросы и баги
 
-Создавайте [issue](https://github.com/Dach-Coin/rlm-tools-bsl/issues) с описанием проблемы, версией Python, ОС и воспроизводимым примером.
+Создавайте [issue](https://github.com/oleg-igorevich-bykov/rlm-tools-bsl/issues) с описанием проблемы, версией Python, ОС и воспроизводимым примером.
