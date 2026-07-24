@@ -2470,6 +2470,9 @@ def main():
 
     load_project_env()
 
+    from rlm_tools_bsl.projects import get_registry, seed_project_from_env
+    seed_project_from_env(get_registry())
+
     session_manager = build_session_manager_from_env()
     session_manager.on_evict = _release_session_resources
 

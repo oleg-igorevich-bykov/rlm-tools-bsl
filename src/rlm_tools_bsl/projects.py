@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import threading
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _make_salt() -> str:
@@ -343,3 +346,43 @@ def _reset_registry() -> None:
     global _registry
     with _registry_lock:
         _registry = None
+
+
+def seed_project_from_env(registry: "ProjectRegistry") -> None:
+    """Идемпотентно регистрирует ОДИН проект из RLM_PROJECT_* env.
+
+    Расчёт на single-tenant деплой (напр. один rlm-tools-bsl контейнер на
+    проект во флоте) — без этого для одной статической записи всё равно
+    нужен был бы generator-written projects.json на хосте. Если
+    RLM_PROJECT_NAME не задан — no-op, существующий файловый/CRUD реестр не
+    затрагивается.
+    """
+    name = os.environ.get("RLM_PROJECT_NAME")
+    if not name:
+        return
+    path = os.environ.get("RLM_PROJECT_PATH")
+    if not path:
+        logger.warning(
+            "RLM_PROJECT_NAME=%s задан, но RLM_PROJECT_PATH пуст — пропускаю auto-seed", name
+        )
+        return
+    description = os.environ.get("RLM_PROJECT_DESCRIPTION", "")
+
+    try:
+        existing = next(
+            (p for p in registry.list_projects() if p["name"].strip().lower() == name.strip().lower()),
+            None,
+        )
+        if existing is None:
+            registry.add(name=name, path=path, description=description)
+            logger.info("Auto-registered project from env: %s -> %s", name, path)
+        elif existing["path"] != path or existing.get("description", "") != description:
+            registry.update(name=name, path=path, description=description)
+            logger.info("Auto-updated project from env: %s -> %s", name, path)
+    except ValueError as exc:
+        # Не валим сервер целиком — типичная причина: path (bind-mount)
+        # ещё не готов на момент старта. Сервер поднимется без проекта,
+        # ошибка видна в логе; следующий рестарт/healthcheck подхватит.
+        logger.error(
+            "Не удалось авто-зарегистрировать проект из env (%s=%s): %s", name, path, exc
+        )

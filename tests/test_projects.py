@@ -12,6 +12,7 @@ from rlm_tools_bsl.projects import (
     _levenshtein,
     _reset_registry,
     get_registry,
+    seed_project_from_env,
 )
 
 
@@ -648,3 +649,75 @@ def test_resolve_has_password_flag(tmp_path):
     reg.add("Alpha", str(d), password="secret")
     matches, _ = reg.resolve("Alpha")
     assert matches[0]["has_password"] is True
+
+
+# ---------------------------------------------------------------------------
+# seed_project_from_env (single-tenant fleet auto-seed)
+# ---------------------------------------------------------------------------
+
+
+def test_seed_project_from_env_noop_without_name(tmp_path, monkeypatch):
+    monkeypatch.delenv("RLM_PROJECT_NAME", raising=False)
+    reg = ProjectRegistry(tmp_path / "projects.json")
+    seed_project_from_env(reg)
+    assert reg.list_projects() == []
+
+
+def test_seed_project_from_env_adds_project(tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("RLM_PROJECT_NAME", "kgg-do30-main")
+    monkeypatch.setenv("RLM_PROJECT_PATH", str(repo_dir))
+    monkeypatch.setenv("RLM_PROJECT_DESCRIPTION", "kgg/do30@main")
+    reg = ProjectRegistry(tmp_path / "projects.json")
+    seed_project_from_env(reg)
+    projects = reg.list_projects()
+    assert len(projects) == 1
+    assert projects[0]["name"] == "kgg-do30-main"
+    assert projects[0]["path"] == str(repo_dir)
+
+
+def test_seed_project_from_env_idempotent(tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    monkeypatch.setenv("RLM_PROJECT_NAME", "p")
+    monkeypatch.setenv("RLM_PROJECT_PATH", str(repo_dir))
+    reg = ProjectRegistry(tmp_path / "projects.json")
+    seed_project_from_env(reg)
+    seed_project_from_env(reg)  # второй вызов не должен упасть на "already exists"
+    assert len(reg.list_projects()) == 1
+
+
+def test_seed_project_from_env_missing_path_logs_and_skips(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("RLM_PROJECT_NAME", "p")
+    monkeypatch.setenv("RLM_PROJECT_PATH", str(tmp_path / "does-not-exist"))
+    reg = ProjectRegistry(tmp_path / "projects.json")
+    seed_project_from_env(reg)
+    assert reg.list_projects() == []
+
+
+def test_seed_project_from_env_missing_path_env_skips(tmp_path, monkeypatch):
+    monkeypatch.setenv("RLM_PROJECT_NAME", "p")
+    monkeypatch.delenv("RLM_PROJECT_PATH", raising=False)
+    reg = ProjectRegistry(tmp_path / "projects.json")
+    seed_project_from_env(reg)
+    assert reg.list_projects() == []
+
+
+def test_seed_project_from_env_updates_on_path_change(tmp_path, monkeypatch):
+    repo_dir_a = tmp_path / "repo_a"
+    repo_dir_a.mkdir()
+    repo_dir_b = tmp_path / "repo_b"
+    repo_dir_b.mkdir()
+    reg = ProjectRegistry(tmp_path / "projects.json")
+
+    monkeypatch.setenv("RLM_PROJECT_NAME", "p")
+    monkeypatch.setenv("RLM_PROJECT_PATH", str(repo_dir_a))
+    seed_project_from_env(reg)
+    assert reg.list_projects()[0]["path"] == str(repo_dir_a)
+
+    monkeypatch.setenv("RLM_PROJECT_PATH", str(repo_dir_b))
+    seed_project_from_env(reg)
+    projects = reg.list_projects()
+    assert len(projects) == 1
+    assert projects[0]["path"] == str(repo_dir_b)
