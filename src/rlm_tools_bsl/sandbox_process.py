@@ -276,6 +276,9 @@ class ProcessBackendConfig:
     index_expected: bool = False
     idx_zero_callers_authoritative: bool = False
     extension_paths: list[str] = field(default_factory=list)
+    # Generic-режим (v1.32.0): False отключает загрузку BSL-хелперов в worker.
+    # Default True — прежнее поведение для всех существующих конструкций.
+    enable_bsl_helpers: bool = True
     max_llm_calls: int = 50
     llm_calls_used: int = 0
     # Только для Python test API (dotted "module:factory") — прокладывает fake
@@ -503,6 +506,7 @@ class ProcessSandboxBackend:
         self._index_loaded = False
         self.index_warning: str | None = None
         self._has_llm_tools = False
+        self._has_graph_tools = False
         tracked = False
         if startup_register is not None:
             if not startup_register(self):
@@ -558,6 +562,10 @@ class ProcessSandboxBackend:
     @property
     def has_llm_tools(self) -> bool:
         return self._has_llm_tools
+
+    @property
+    def has_graph_tools(self) -> bool:
+        return self._has_graph_tools
 
     @property
     def index_loaded(self) -> bool:
@@ -720,6 +728,7 @@ class ProcessSandboxBackend:
                 "index_expected": cfg.index_expected,
                 "idx_zero_callers_authoritative": cfg.idx_zero_callers_authoritative,
                 "extension_paths": list(cfg.extension_paths),
+                "enable_bsl_helpers": cfg.enable_bsl_helpers,
                 "execution_timeout_seconds": 0,
                 "max_llm_calls": cfg.max_llm_calls,
                 "llm_calls_used": self._llm_used,
@@ -771,13 +780,16 @@ class ProcessSandboxBackend:
         self._index_loaded = bool(payload.get("index_loaded"))
         self.index_warning = payload.get("index_warning")
         self._has_llm_tools = bool(payload.get("has_llm_tools"))
+        self._has_graph_tools = bool(payload.get("has_graph_tools"))
         logger.info(
-            "sandbox worker gen=%d pid=%s started in %.1fs (index_loaded=%s llm=%s python=%s group=%s memlimit=%s)",
+            "sandbox worker gen=%d pid=%s started in %.1fs "
+            "(index_loaded=%s llm=%s graph=%s python=%s group=%s memlimit=%s)",
             gen,
             payload.get("pid"),
             self.last_start_elapsed,
             self._index_loaded,
             self._has_llm_tools,
+            self._has_graph_tools,
             payload.get("python_version"),
             payload.get("process_group_detail"),
             payload.get("memory_limit_detail"),

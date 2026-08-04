@@ -43,11 +43,29 @@ from rlm_tools_bsl.format_detector import detect_format
 # rlm_help, not inline. Growth is confined to full mode and to a query-matched recipe, i.e. it
 # is paid only when the agent actually asked about that topic.
 # Re-baselining to the measured values restores a real +5% margin for the next edit.
+#
+# v1.30.0 re-baseline of the FULL-mode numbers only (INTENTIONAL, same reasoning as v1.28.0).
+# The v1.28.0 baselines were already at 99.1% (full/"") and 99.7% (full/"проведение") of their
+# ceilings on the untouched v1.29.1 tree, i.e. the guard had ~270 and ~110 chars of headroom
+# left before this release started. The +210 chars added here are the agent-facing contract of
+# the v1.30.0 fixes — text the agent must see BEFORE the call, or the fix is invisible:
+#   * safe_grep            → срез max_files действует ВСЕГДА (hint меняет лишь ЧТО режется),
+#                            поэтому пустой результат не доказывает отсутствие
+#   * search_regions /     → count_only считает в ТОМ ЖЕ scope, что и выдача
+#     search_module_headers  (+ total_main/total_extensions при настроенных расширениях)
+#   * get_overrides        → by_*_top — это dict{имя:N}; target_method_line=None валиден
+# The prose was compacted first (the long explanations live in the UNBUDGETED `recipe`, which
+# rlm_help serves on demand; the get_overrides sig got shorter, not longer). What remains is
+# irreducible without deleting the contract itself.
+#
+# slim is NOT re-baselined: both slim cases are byte-for-byte what v1.29.1 emitted (the new
+# text lands in sections slim serves via rlm_help, not inline), so the default start path did
+# not grow at all — the cost is paid only in full mode.
 _BASELINES = {
     ("slim", ""): 7146,
     ("slim", "проведение"): 7990,
-    ("full", ""): 30063,
-    ("full", "проведение"): 31555,
+    ("full", ""): 31508,
+    ("full", "проведение"): 33233,
 }
 # Whole rlm_start payload baselines (strategy + available_functions + index +
 # extension_context) for a fixed minimal INDEXED config — the plan's real target.
@@ -62,6 +80,19 @@ _BASELINES = {
 # next edit trips the guard on its own merits rather than on inherited saturation.
 _PAYLOAD_BASELINES = {"slim": 20691, "full": 43482}
 _DRIFT = 1.05  # allow ≤5% growth before failing
+
+# v1.32.0: бюджет меряется на ПОДДЕРЖИВАЕМОМ дереве. С гейтом чужих форматов
+# заглушка `<Configuration/>` дала бы source_support=foreign_with_bsl и лишний
+# блок предупреждения в стратегии — то есть бюджет считался бы не для того
+# сценария, который защищает (тест ниже это ещё и ассертит).
+_CF_DESCRIPTOR = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">\n'
+    '  <Configuration uuid="00000000-0000-0000-0000-000000000001">\n'
+    "    <Properties><Name>Тест</Name></Properties>\n"
+    "  </Configuration>\n"
+    "</MetaDataObject>\n"
+)
 
 _IDX_STATS = {
     "methods": 1000,
@@ -120,7 +151,7 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
     obj = tmp_path / "Documents" / "БюджетТест" / "Ext"
     obj.mkdir(parents=True)
     (obj / "ObjectModule.bsl").write_text("Процедура П() Экспорт\nКонецПроцедуры\n", encoding="utf-8")
-    (tmp_path / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
+    (tmp_path / "Configuration.xml").write_text(_CF_DESCRIPTOR, encoding="utf-8")
     monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".idx"))
     monkeypatch.setenv("RLM_STRATEGY_MODE", mode)
     IndexBuilder().build(str(tmp_path), build_calls=False, build_metadata=True)
@@ -141,6 +172,9 @@ def test_full_rlm_start_payload_within_budget(monkeypatch, tmp_path, mode):
     data = json.loads(raw)
     try:
         assert not data["extension_context"]["nearby_extensions"], "budget config must be extension-free"
+        # Бюджет обязан меряться на поддерживаемом дереве: на чужом формате
+        # стратегия несёт лишний блок предупреждения, и число было бы не про то.
+        assert data["source_support"] == "supported", "budget config must be a supported cf/edt tree"
         ceiling = int(_PAYLOAD_BASELINES[mode] * _DRIFT)
         assert len(raw) <= ceiling, (
             f"{mode} rlm_start payload {len(raw)} > {ceiling} (+5% of {_PAYLOAD_BASELINES[mode]}). "

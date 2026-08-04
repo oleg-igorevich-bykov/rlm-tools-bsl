@@ -38,7 +38,7 @@ Step 1 — DISCOVER: find what you need
   search_methods('substring')            → precise: find METHODS by code name (FTS)
   search_regions('имя')                  → precise: find code regions
   search_module_headers('текст')         → precise: find modules by header
-  NOTE: search_regions/search_module_headers молча усекаются по limit — для census/статистики бери count_only=True (index-side {total})
+  NOTE: search_regions/search_module_headers молча усекаются по limit — для census бери count_only=True: тот же scope, что и выдача (с CFE +total_main/total_extensions)
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
@@ -68,7 +68,7 @@ Step 4 — ANALYZE: get the full picture
   they may be slow (>60s). Prefer calling individual helpers separately if timeout occurs.
 
 Step 5 — EXTENSIONS: check if behavior is modified
-  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top/unique_* полны iff partial=False; иначе lower bound, см. _meta
+  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top=dict{имя:N}/unique_* полны iff partial=False; иначе lower bound, см. _meta. target_method_line=None валидно
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
@@ -122,7 +122,7 @@ File I/O:
   NOTE: For BSL modules prefer find_module()/find_by_type() over glob_files()
   NOTE: tree('.') on large configs produces too much output — use tree('SubDir') or find_files()
 LLM (if available):
-  llm_query(prompt, context='')            → str (keep context <3000 chars, split if empty response)
+  llm_query(prompt, context='')            → str (keep context <3000 chars; '[EMPTY]/[ERROR]' prefix or '[TRUNCATED]' tail = incomplete answer)
   llm_query_batched(prompts, context)      → [str]
 GRAPH (if available — RLM_METACODE_URL → 1c-mcp-metacode/Neo4j):
   graph_search_code(query, limit=5)        → семантический поиск по ТЕЛУ кода BSL (недетерминированные вопросы, где grep/FTS слабы)

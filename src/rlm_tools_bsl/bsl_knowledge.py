@@ -315,7 +315,7 @@ Step 1 — DISCOVER: find what you need
   search_methods('substring')            → precise: find METHODS by code name (FTS)
   search_regions('имя')                  → precise: find code regions
   search_module_headers('текст')         → precise: find modules by header
-  NOTE: search_regions/search_module_headers молча усекаются по limit — для census/статистики бери count_only=True (index-side {total})
+  NOTE: search_regions/search_module_headers молча усекаются по limit — для census бери count_only=True: тот же scope, что и выдача (с CFE +total_main/total_extensions)
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
@@ -368,7 +368,7 @@ LIVE (читают тела процедур / parse XML — медленно, �
 CAUTION: на конфигах 10K+ файлов analyze_* могут быть >60с. Батчь LIVE-хелперы по одному; INSTANT — по 5-10.
 
 Step 5 — EXTENSIONS: check if behavior is modified
-  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top/unique_* полны iff partial=False; иначе lower bound, см. _meta
+  get_overrides('ObjectName') → overrides=срез 200. Агрегаты by_annotation/by_object_top/by_extension_top=dict{имя:N}/unique_* полны iff partial=False; иначе lower bound. target_method_line=None валидно
   read_procedure(path, name, include_overrides=True) → original + extension body
   extract_procedures includes overridden_by field
   NOTE: extension files are OUTSIDE the sandbox: read_file/grep/glob_files on '../' paths raise PermissionError.
@@ -813,6 +813,8 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "full": [
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты одного объекта (метод, аннотация, файл расширения)",
+            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей",
+            "target_method_line=None — валидно: перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения) без текстового объявления в базовом модуле либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
@@ -1012,7 +1014,7 @@ File I/O:
   NOTE: For BSL modules prefer find_module()/find_by_type() over glob_files()
   NOTE: tree('.') on large configs produces too much output — use tree('SubDir') or find_files()
 LLM (if available):
-  llm_query(prompt, context='')            → str (keep context <3000 chars, split if empty response)
+  llm_query(prompt, context='')            → str (keep context <3000 chars; '[EMPTY]/[ERROR]' prefix or '[TRUNCATED]' tail = incomplete answer)
   llm_query_batched(prompts, context)      → [str]
 GRAPH (if available — RLM_METACODE_URL → 1c-mcp-metacode/Neo4j):
   graph_search_code(query, limit=5)        → семантический поиск по ТЕЛУ кода BSL (недетерминированные вопросы, где grep/FTS слабы)
@@ -1115,6 +1117,53 @@ def get_strategy_mode() -> str:
     """Resolved strategy mode for the current environment ('slim' or 'full')."""
     mode = os.environ.get("RLM_STRATEGY_MODE", "slim").lower()
     return mode if mode in ("slim", "full") else "slim"
+
+
+# --- Generic mode: чужой формат исходников БЕЗ единого .bsl (v1.32.0) ---
+# BSL-хелперы в такой сессии не загружаются, поэтому маршрутная карта не имеет
+# права ссылаться ни на один из них. Строится отдельно от slim/full — те
+# описывают ИМЕННО BSL-инструментарий и остаются нетронутыми.
+
+_GENERIC_LLM_GUIDANCE_SENTENCE = " Use llm_query() for semantic analysis."
+
+_GENERIC_STRATEGY_BODY = """\
+== UNSUPPORTED SOURCE FORMAT - GENERIC MODE ==
+This directory is neither a Configurator dump (cf) nor a 1C:EDT project, and no .bsl file was found.
+1C/BSL helpers are not loaded. Use only generic file exploration.
+
+== WORKFLOW ==
+Write Python in rlm_execute and print() compact results.
+  1. tree('.', max_depth=2) or glob_files('**/*') - inspect the tree
+  2. grep(pattern, path) / grep_summary(pattern, path) - locate text
+  3. read_file(path) / read_files(paths) - read only relevant files
+
+== HELPERS ==
+  read_file(path), read_files(paths)
+  grep(pattern, path), grep_summary(pattern, path)
+  grep_read(pattern, path, max_files=10, context_lines=0)
+  glob_files(pattern), tree(path, max_depth=3), find_files(name)"""
+
+_GENERIC_LLM_HELPERS_LINE = "  llm_query(prompt, context=''), llm_query_batched(prompts, context='')"
+
+
+def build_generic_strategy(effort: str, has_llm_tools: bool = False) -> str:
+    """Маршрутная карта сессии без BSL-хелперов (чужой формат, .bsl нет)."""
+    effort_key = effort if effort in EFFORT_LEVELS else "medium"
+    config = EFFORT_LEVELS[effort_key]
+    guidance = config.guidance
+    body = _GENERIC_STRATEGY_BODY
+    if has_llm_tools:
+        body += "\n" + _GENERIC_LLM_HELPERS_LINE
+    else:
+        guidance = guidance.replace(_GENERIC_LLM_GUIDANCE_SENTENCE, "")
+    return "\n".join(
+        [
+            body,
+            f"\n== EFFORT: {effort_key} ==",
+            guidance,
+            f"Limits: max_execute_calls={config.max_execute_calls}, max_llm_calls={config.max_llm_calls}",
+        ]
+    )
 
 
 def _build_full_strategy(

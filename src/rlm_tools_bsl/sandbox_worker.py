@@ -345,6 +345,26 @@ class _WorkerLlmTools:
         return self._batched(prompts, context)
 
 
+def _install_graph_tools(sandbox) -> bool:
+    """Optional bridge to 1c-mcp-metacode (RLM_METACODE_URL), off by default.
+
+    Mirrors the llm tools install above: best-effort, never fails worker init.
+    See ``graph_bridge.py`` for the bridge design.
+    """
+    try:
+        from rlm_tools_bsl.graph_bridge import get_graph_config, make_graph_helpers
+
+        config = get_graph_config()
+        if config is None:
+            return False
+        url, timeout = config
+        helpers = make_graph_helpers(url, timeout)
+        sandbox._namespace.update(sandbox._wrap_helpers(helpers))
+        return True
+    except Exception:
+        return False
+
+
 def _serialize_helper_calls(helper_calls) -> list[dict]:
     return [
         {"name": h.name, "elapsed": h.elapsed, "seq": h.seq, "duplicate_of": h.duplicate_of}
@@ -477,7 +497,7 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
             _time.sleep(float(test_delay))
 
         try:
-            sandbox, idx_reader, llm_tools, index_loaded, index_warning = _build_session(
+            sandbox, idx_reader, llm_tools, index_loaded, index_warning, has_graph_tools = _build_session(
                 payload, out_buf, out_published, out_truncated, out_lock, quota_value, quota_lock
             )
             registry_snapshot = sandbox.registry_metadata_snapshot()
@@ -508,6 +528,7 @@ def sandbox_worker_main(conn, out_buf, out_published, out_truncated, out_lock, q
                     "index_loaded": index_loaded,
                     "index_warning": index_warning,
                     "has_llm_tools": llm_tools is not None,
+                    "has_graph_tools": has_graph_tools,
                     "extension_paths_count": len(payload.get("extension_paths") or []),
                     "python_version": sys.version.split()[0],
                     "pid": os.getpid(),
@@ -603,6 +624,8 @@ def _build_session(payload: dict, out_buf, out_published, out_truncated, out_loc
         idx_zero_callers_authoritative=bool(payload.get("idx_zero_callers_authoritative")),
         extension_paths=list(payload.get("extension_paths") or []),
         output_capture_factory=lambda: writer,
+        # Отсутствие ключа = прежнее поведение (BSL-хелперы включены).
+        enable_bsl_helpers=bool(payload.get("enable_bsl_helpers", True)),
     )
     # reset() на каждый execute делает command loop; сохранить ссылку.
     sandbox._shared_stdout_writer = writer
@@ -619,7 +642,9 @@ def _build_session(payload: dict, out_buf, out_published, out_truncated, out_loc
         sandbox._namespace["llm_query"] = llm_tools.llm_query
         sandbox._namespace["llm_query_batched"] = llm_tools.llm_query_batched
 
-    return sandbox, idx_reader, llm_tools, idx_reader is not None, index_warning
+    has_graph_tools = _install_graph_tools(sandbox)
+
+    return sandbox, idx_reader, llm_tools, idx_reader is not None, index_warning, has_graph_tools
 
 
 def _compute_prefixes(sandbox, idx_reader) -> tuple[list[str], str]:

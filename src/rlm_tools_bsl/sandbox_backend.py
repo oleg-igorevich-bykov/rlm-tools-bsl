@@ -110,6 +110,7 @@ class InlineSandboxBackend:
         max_llm_calls: int = 50,
         llm_calls_used: int = 0,
         install_llm_tools: bool = True,
+        install_graph_tools: bool = True,
     ):
         self._sandbox = sandbox
         self._idx_reader = idx_reader
@@ -125,6 +126,7 @@ class InlineSandboxBackend:
         self.last_reset_reason: str | None = None
         self._quota = LlmQuota(max_llm_calls, llm_calls_used)
         self._has_llm_tools = self._install_llm_tools() if install_llm_tools else False
+        self._has_graph_tools = self._install_graph_tools() if install_graph_tools else False
         # Может поднять RuntimeError (helper вне каталога) — это init failure
         # сессии by design, не повод собирать альтернативную схему (§7.5).
         self._registry_snapshot: dict[str, dict] = sandbox.registry_metadata_snapshot()
@@ -161,6 +163,10 @@ class InlineSandboxBackend:
     @property
     def has_llm_tools(self) -> bool:
         return self._has_llm_tools
+
+    @property
+    def has_graph_tools(self) -> bool:
+        return self._has_graph_tools
 
     @property
     def llm_calls_used(self) -> int:
@@ -336,6 +342,27 @@ class InlineSandboxBackend:
             return True
         except Exception as e:
             logger.warning(f"Could not initialize llm_query: {e}")
+            return False
+
+    def _install_graph_tools(self) -> bool:
+        """Optional bridge to 1c-mcp-metacode (RLM_METACODE_URL), off by default.
+
+        Mirrors ``_install_llm_tools``: best-effort, never fails session init.
+        See ``graph_bridge.py`` for the bridge design.
+        """
+        try:
+            from rlm_tools_bsl.graph_bridge import get_graph_config, make_graph_helpers
+
+            config = get_graph_config()
+            if config is None:
+                return False
+            url, timeout = config
+            helpers = make_graph_helpers(url, timeout)
+            self._sandbox._namespace.update(self._sandbox._wrap_helpers(helpers))
+            logger.info("graph bridge enabled: %s (timeout=%.0fs)", url, timeout)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not initialize graph bridge: {e}")
             return False
 
 

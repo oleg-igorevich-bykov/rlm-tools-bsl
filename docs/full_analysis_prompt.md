@@ -406,7 +406,7 @@ Replace `<path>` with the actual path to your 1C source code that has nearby ext
    - Проверь extension_context из ответа rlm_start — какая роль конфигурации, есть ли расширения рядом
 
 2. **Обзор всех перехватов из индекса**:
-   - get_overrides() без фильтров → сначала проверь `partial`. При `partial=False` `total` и агрегаты посчитаны по ПОЛНОМУ выбранному источнику; при `partial=True` это нижняя оценка по успешно прочитанной части, а причины перечислены в `_meta.failed_extension_roots`. **Сводку строй по АГРЕГАТАМ**, а не по срезу: `by_annotation`, `by_object_top` (топ-20 объектов), `by_extension_top` (топ-20 расширений), `unique_objects`/`unique_methods`/`unique_extensions`. Список `overrides` — усечённый срез (первые 200), **группировать его вручную НЕЛЬЗЯ**
+   - get_overrides() без фильтров → сначала проверь `partial`. При `partial=False` `total` и агрегаты посчитаны по ПОЛНОМУ выбранному источнику; при `partial=True` это нижняя оценка по успешно прочитанной части, а причины перечислены в `_meta.failed_extension_roots`. **Сводку строй по АГРЕГАТАМ**, а не по срезу: `by_annotation`, `by_object_top` (топ-20 объектов), `by_extension_top` (топ-20 расширений), `unique_objects`/`unique_methods`/`unique_extensions`. Три `by_*` — это **dict `{имя: количество}`**, а не список записей: итерируй `.items()`, срез бери как `list(d.items())[:N]`. Список `overrides` — усечённый срез (первые 200), **группировать его вручную НЕЛЬЗЯ**. `target_method_line=None` у строки — валидное значение (перехват предопределённого события платформы без текстового объявления в базовом модуле), не ошибка индекса
    - Разбивка по расширениям — из `by_extension_top` (+ `unique_extensions`); назначение (purpose) каждого расширения возьми из extension_context/detect_extensions()
    - Разбивка по типам аннотаций (&Перед, &После, &Вместо, &ИзменениеИКонтроль) — из `by_annotation`
 
@@ -1575,13 +1575,16 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Reachability (NEW) | `find_path(from, to, to_hint=...)` | СНАЧАЛА `if 'error' in res` (многозначное имя без hint → `{error, hint, candidates}`); затем forward path; `_meta.precision` exact/heuristic; `call_line` = edge line; `found=False`+`budget_exceeded=False`+нет `error` = truly unreachable |
 | Data path (NEW) | `find_data_path(from, to)` → `find_metadata_refs_from` | edge list {from,to,kind}; bare endpoint → structural hint (no traversal); `partial` on old index |
 | Recipes (NEW) | `help('достижимость')`, `help('путь данных')` | recipes resolve |
-| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,partial,source,by_annotation,by_object_top,by_extension_top,unique_objects,unique_methods,unique_extensions,_meta?}`; `overrides`=отсортированный срез первых 200. При `partial=false` агрегаты полны для выбранного источника; при `true` — нижняя оценка, см. `_meta.failed_extension_roots`. Каждый row несёт `extension_name` (incl. live extension session) |
+| Contract: get_overrides | `get_overrides()` | dict `{overrides,total,truncated,partial,source,by_annotation,by_object_top,by_extension_top,unique_objects,unique_methods,unique_extensions,_meta?}`; `overrides`=отсортированный срез первых 200. При `partial=false` агрегаты полны для выбранного источника; при `true` — нижняя оценка, см. `_meta.failed_extension_roots`. Каждый row несёт `extension_name` (incl. live extension session). `by_*` — dict `{имя: количество}` (итерировать `.items()`); `target_method_line=None` валиден. **v1.30.0**: набор ключей строки одинаков у `get_overrides` и `find_ext_overrides` (алиасы `module_path`↔`ext_module_path`, `line`↔`ext_line`, `module_type`), состав и порядок среза 200 не изменились |
 | Contract: register movements | `find_register_movements()` | `code_registers`=Posting/CFE-фильтрованные кандидаты list[dict]; main-строки — снимок SQLite и после изменения кода проверяются по живому файлу. При `is_postable=False` строки статические; если хотя бы один CFE `&Вместо` не вызывает напрямую `ПродолжитьВызов`/`ProceedWithCall`, handler-only main rows переходят в `suppressed_main_code_registers` и объясняются в `_meta.cfe_posting_replacement`; `erp_mechanisms`/`manager_tables`/`adapted_registers`=list[str] |
 | Contract: register writers | `find_register_writers()` | `writers` — статические кандидаты, `runtime_filtered=false`: CFE/`Posting=Deny` не применены; forward-helper применяет эти фильтры, свежесть main-строки проверяется по живому файлу |
 | Contract: roles | `find_roles()` | `rights` = list[str] |
 | Contract: doc flow | `analyze_document_flow()` | dict with documented keys |
 | Contract: form attrs | `parse_form()` | attribute key `types` (not `attr_type`) |
-| Contract: grep | `safe_grep(pattern, name_hint=...)` | param `name_hint` accepted |
+| Contract: grep | `safe_grep(pattern, name_hint=...)` | param `name_hint` accepted; пустой результат НЕ доказывает отсутствие — срез `max_files` действует всегда, `name_hint` меняет лишь ЧТО режется. Исчерпывающий поиск — `git_search` |
+| Contract: count_only | `search_regions(q, count_only=True)` | при настроенных расширениях и непустом `q` — `{total, total_main, total_extensions, source:"index+live"\|"live", truncated, scope:"main_index+live_extensions"}` и `total == len(list)`; без расширений или при пустом/пробельном `q` — прежний main-only dict |
+| Contract: functional options | `find_functional_options(obj, include_code=False)` | `xml_options` — ТОЧНОЕ совпадение: typed-ввод category-aware (включая member-ссылки), bare — по точному имени объекта; чужой глубокий `...Attribute.<Имя>` больше не засчитывается. Совпадает с `get_object_profile(...).functional_options` |
+| Contract: queries | `extract_queries(path)` | находит `Запрос.Текст = "..."` (в т.ч. с литералом на СЛЕДУЮЩЕЙ строке), `Новый Запрос("...")`/`New Query("...")`; разбор source-aware — вхождения в комментариях и внутри текста самого запроса ложных записей не дают. У конструктора и перенесённой формы `НСтр`/переменная/конкатенация не извлекаются; однострочное присваивание намеренно мягче — `Запрос.Текст = "..." + Хвост;` извлекается вместе с хвостом строки |
 
 ## Expected results
 
@@ -1739,3 +1742,148 @@ Use this prompt to verify the three navigation primitives added in v1.20.0:
 | `git_search(token, exclude_path='a*')` | `[{error: ...}]` (без молчаливого расширения) |
 | git_search недоступен | источник не под git → пункт 4 пропущен (это нормально) |
 
+---
+
+# Sub-LLM Diagnostics Prompt — E2E Test for v1.31.0 `llm_query`
+
+Use this prompt to verify the sub-LLM contract added in v1.31.0: configurable request parameters
+(`RLM_LLM_MAX_TOKENS`, `RLM_LLM_EXTRA_BODY`) and the diagnostic markers that replaced silent empty
+answers. Requires a configured LLM provider (see [LLM_QUERY.md](LLM_QUERY.md)); no index rebuild needed.
+
+**Background:** before v1.31.0 a sub-LLM that spent its whole token budget on internal reasoning
+returned an empty string, indistinguishable from «модель ничего не нашла». A truncated answer looked
+like a complete one. Both cases are now diagnosable.
+
+**Важно про этот тест.** Ответы sub-LLM **недетерминированы**: один и тот же запрос к одной и той же
+модели в разных прогонах даёт то полный ответ, то `[EMPTY]`, то хвост `[TRUNCATED]`. Поэтому приёмка
+идёт по **инвариантам контракта**, а не по совпадению текста. Пункт «получен именно такой маркер» —
+не критерий; критерий — «полученное значение принадлежит known-множеству и не течёт».
+
+---
+
+## Prompt
+
+```
+Мне нужно проверить контракт вспомогательной LLM (llm_query) в конфигурации 1С.
+Путь: <путь к каталогу исходников 1С>
+
+Используй ТОЛЬКО MCP-сервер rlm-tools-bsl (rlm_start / rlm_execute / rlm_end).
+Не используй встроенные инструменты чтения файлов — всё делай через песочницу.
+
+Заведи в первом же rlm_execute функцию-классификатор ответа и пользуйся ей везде:
+классы — '[EMPTY]', '[REFUSAL]', '[ERROR]' (по префиксу), 'TRUNCATED-хвост'
+(если в ответе есть '\n\n[TRUNCATED] '), иначе 'обычный ответ'.
+
+Мне нужно проверить:
+
+1. **Контракт возврата**:
+   - llm_query('Ответь одним словом: да') → проверь, что результат ИМЕННО str, а не список/None
+   - llm_query('') → должен подняться ValueError с внятным текстом
+   - Классифицируй ответ. Любой из пяти классов — приемлемый результат; неприемлемо только
+     значение не-str или необработанное исключение
+
+2. **Сжатие большого контекста** (главный сценарий хелпера):
+   - Собери имена ВСЕХ методов крупного документа (get_object_modules(include_methods=True),
+     обойди outline рекурсивно — у областей есть children)
+   - Одним llm_query попроси выбрать максимум 10 имён, относящихся к проведению
+   - Посчитай и покажи: длину контекста, длину ответа, коэффициент сжатия, класс ответа
+   - Если получен '[EMPTY]' — это НЕ провал теста: покажи текст маркера и переходи дальше,
+     он и есть доказательство работающей диагностики
+
+3. **Подтверждение имён по индексу** (sub-LLM сужает — индекс подтверждает):
+   - Разбери ответ из п.2 на имена и сверь их с собранным списком методов
+   - Покажи: предложено N, подтверждено M, не найдено K
+   - Для ненайденных ОБЯЗАТЕЛЬНО проверь второй раз по ГОЛОМУ имени объекта, а не по полной
+     строке вида 'Тип.Имя': 1С ссылается на метаданные по-разному (строковый литерал в
+     ПолучитьФункциональнуюОпцию, тип реквизита, квалифицированное имя), и расхождение ФОРМЫ
+     не является галлюцинацией. Галлюцинация — это когда такого имени в конфигурации нет вовсе
+
+4. **Сжатие тела процедуры в намерение**:
+   - Найди самый крупный метод модуля объекта (по end_line - line) и прочитай его
+   - Попроси llm_query вернуть строго три строки: СУТЬ / ЧИТАЕТ / ПИШЕТ
+   - Покажи коэффициент сжатия и примени проверку из п.3 к названным объектам
+
+5. **Обрыв ответа по лимиту**:
+   - Запроси заведомо длинный ответ (например, 300 элементов списка) с пустым контекстом
+   - Если получен хвост '[TRUNCATED]' — раздели ответ ПРАВИЛЬНО:
+     body, sep, note = answer.rpartition('\n\n[TRUNCATED] '); если sep пустой — маркера нет
+     и body надо взять равным answer (rpartition без совпадения кладёт всё в ТРЕТИЙ элемент)
+   - Покажи: длина, класс, число строк в теле, текст хвоста
+   - Если вместо хвоста пришёл '[EMPTY]' — тоже валидный исход, зафиксируй его
+
+6. **Безопасность маркеров**:
+   - Для любого полученного маркера проверь и покажи, что в нём НЕТ: твоего промпта,
+     текста контекста, API-ключа
+   - Убедись, что маркер '[EMPTY]' содержит машинную причину (finish_reason=...) и
+     число потраченных токенов
+
+7. **Батч**:
+   - llm_query_batched с двумя промптами и общим контекстом
+   - Проверь: длина результата равна числу промптов, все элементы str, порядок сохранён
+   - Сравни llm_calls_used до и после: батч из N промптов расходует РОВНО N единиц квоты
+     (батч экономит время, но не токены и не квоту — контекст уходит провайдеру N раз)
+
+8. **Итог**:
+   - Таблица: пункт → класс полученного ответа → вердикт (инвариант соблюдён / нарушен)
+   - Отдельно перечисли всё, что реально не соответствует контракту
+
+Дай итоговую сводку со всеми цифрами. Сохрани файл с анализом в текущий рабочий каталог
+своими инструментами (НЕ через rlm_execute).
+
+## ВАЖНЫЕ ПРАВИЛА
+
+1. Каждый rlm_execute должен батчить несколько связанных операций. Плохо: один вызов на один хелпер. Хорошо: несколько хелперов + print() в одном вызове.
+2. Переменные сохраняются между вызовами rlm_execute.
+3. Используй print() для вывода результатов.
+4. Ограничь расход: передай max_llm_calls в rlm_start (8 достаточно на весь тест).
+5. В конце ОБЯЗАТЕЛЬНО вызови rlm_end для освобождения ресурсов.
+```
+
+---
+
+## What it covers
+
+Проверяет контракт `llm_query` целиком: тип возврата, поведение на пустом промпте, четыре
+диагностических исхода, отсутствие утечек в маркерах, семантику батча и — отдельно — дисциплину
+подтверждения имён по индексу вместе с типичной ошибкой такой проверки.
+
+| Area | What to verify |
+|------|---------------|
+| Return contract | `llm_query()` всегда возвращает `str`; пустой промпт → `ValueError` |
+| Empty-content diagnostic | `[EMPTY]` несёт `finish_reason` и число completion-токенов; reasoning-совет только при `length`/наличии reasoning |
+| Truncation diagnostic | Непустой оборванный ответ несёт хвост `[TRUNCATED]`; тело до `\n\n` восстанавливается `rpartition` |
+| Malformed response | Нестандартная форма ответа провайдера → `[ERROR]` с именем типа, без значения |
+| Refusal | Отказ модели → `[REFUSAL]` с текстом отказа (это ответ, а не пустота) |
+| No leakage | Ни один маркер не содержит промпта, контекста и API-ключа |
+| Compression | Большой контекст → компактный ответ; измеренный коэффициент |
+| Narrow-then-confirm | Имена от sub-LLM сверяются с индексом; расхождение ФОРМЫ ≠ галлюцинация |
+| Batch semantics | `len(результат) == len(prompts)`, порядок сохранён, квота = N |
+| Non-determinism | Один и тот же вход даёт разные классы ответа в разных прогонах — приёмка по инвариантам |
+
+## Expected results
+
+Замерено на ERP CF (~23K файлов, индекс v14, 626K методов) через OpenAI-совместимый шлюз,
+`RLM_LLM_MAX_TOKENS=4096`.
+
+| Metric | Actual | Expected range |
+|--------|--------|---------------|
+| Тип возврата `llm_query` | `str` всегда | `str` (иначе — провал) |
+| `llm_query('')` | `ValueError: prompt cannot be empty` | `ValueError` |
+| Контекст в п.2 | 22 246 симв. (626 методов) | 15 000–30 000 |
+| Ответ в п.2 | 207–310 симв. | 150–600 либо `[EMPTY]` |
+| Сжатие в п.2 | 70:1 … 107:1 | 40:1 и выше |
+| Тело процедуры в п.4 | 25 564 симв. (497 строк) | 10 000–30 000 |
+| Ответ в п.4 | 989 симв. | 300–1 500 |
+| Сжатие в п.4 | 25:1 | 15:1 и выше |
+| Имена подтверждены индексом | 10 из 10 и 14 из 14 | 100% после проверки по голому имени |
+| Ложных «галлюцинаций» при наивной сверке по `Тип.Имя` | 7 из 14 | ожидаемо — не считать провалом |
+| `[EMPTY]` в реальном прогоне | `finish_reason=length, completion_tokens=4096` | появляется на тяжёлом контексте |
+| Хвост `[TRUNCATED]` | 3 401 симв., тело 93 строки | появляется на длинном ответе |
+| Утечки промпта/контекста/ключа в маркерах | 0 | 0 |
+| Батч из 2 промптов | 2 элемента, оба `str` | `len == len(prompts)` |
+| Квота на батч из N | N единиц | ровно N |
+
+**Наблюдение, важное для интерпретации.** Один и тот же запрос «300 существительных» в разных
+прогонах дал и хвост `[TRUNCATED]` (ответ на 3 401 символ), и `[EMPTY]` с полностью потраченным
+бюджетом. Модель одна и та же. Поэтому вердикт «маркер не тот» невалиден — валиден только вердикт
+«значение вне known-множества», «утечка в маркере» или «возврат не `str`».

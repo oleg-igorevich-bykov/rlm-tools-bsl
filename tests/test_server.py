@@ -23,6 +23,24 @@ from rlm_tools_bsl.server import (
 from rlm_tools_bsl.sandbox import HelperCall
 
 
+# v1.32.0: публичный MCP build гейтится по валидному дескриптору нашего формата.
+# Фикстуры, которые раньше обходились одним Module.bsl, получают реалистичный
+# маркер CF — иначе они проверяли бы отказ гейта, а не свой предмет.
+_CF_DESCRIPTOR_FOR_BUILD = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">\n'
+    '  <Configuration uuid="00000000-0000-0000-0000-000000000001">\n'
+    "    <Properties><Name>Тест</Name></Properties>\n"
+    "  </Configuration>\n"
+    "</MetaDataObject>\n"
+)
+
+
+def _write_cf_descriptor(dir_path: str) -> None:
+    with open(os.path.join(dir_path, "Configuration.xml"), "w", encoding="utf-8") as f:
+        f.write(_CF_DESCRIPTOR_FOR_BUILD)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_sandbox_backend_lifecycle(monkeypatch):
     """Synthetic main() lifecycles must not leak shutdown state to neighbours."""
@@ -1437,9 +1455,24 @@ def test_streamable_http_server_starts():
             "id": 1,
         }
 
-        # Retry a few times while server starts up
+        # Ждём старта сервера. Бюджет задан ДЕДЛАЙНОМ, а не числом попыток: цена
+        # одной попытки зависит от того, отказано в соединении сразу (refused —
+        # мгновенно) или сокет ушёл в таймаут. Под нагрузкой это разные величины, и
+        # «20 попыток» означали то ~10 секунд, то почти минуту.
+        #
+        # Ловим весь TransportError, а не только ConnectError: httpx.ConnectTimeout
+        # — НЕ подкласс ConnectError (оба наследуются от TransportError). На
+        # загруженной машине connect упирается в свой таймаут вместо refused, и
+        # раньше первое же такое событие валило тест мимо всех ретраев.
+        #
+        # Досрочный выход по proc.poll(): если сервер умер, ждать дедлайн бессмысленно,
+        # а сообщение с его stderr объясняет причину вместо глухого «не запустился».
         response = None
-        for _ in range(20):
+        last_error = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
             try:
                 response = client.post(
                     mcp_url,
@@ -1448,13 +1481,20 @@ def test_streamable_http_server_starts():
                         "Content-Type": "application/json",
                         "Accept": "application/json, text/event-stream",
                     },
-                    timeout=2,
+                    timeout=5,
                 )
                 break
-            except httpx.ConnectError:
+            except httpx.TransportError as exc:
+                last_error = exc
                 time.sleep(0.5)
 
-        assert response is not None, "Server did not start in time"
+        if response is None and proc.poll() is not None:
+            _out, err = proc.communicate(timeout=5)
+            raise AssertionError(
+                f"server exited with code {proc.returncode} before answering; "
+                f"stderr tail: {err.decode('utf-8', 'replace')[-2000:]}"
+            )
+        assert response is not None, f"Server did not start in time; last error: {last_error!r}"
         assert response.status_code == 200
         assert len(response.content) > 0
     finally:
@@ -1706,6 +1746,7 @@ async def test_rlm_index_build_correct_confirm():
         os.makedirs(src)
         with open(os.path.join(src, "Module.bsl"), "w", encoding="utf-8") as f:
             f.write("Процедура Тест()\nКонецПроцедуры\n")
+        _write_cf_descriptor(src)
 
         _reset_registry()
         with patch.dict(
@@ -1739,6 +1780,7 @@ async def test_rlm_index_drop_correct_confirm():
         os.makedirs(src)
         with open(os.path.join(src, "Module.bsl"), "w", encoding="utf-8") as f:
             f.write("Процедура Тест()\nКонецПроцедуры\n")
+        _write_cf_descriptor(src)
 
         _reset_registry()
         with patch.dict(
@@ -1770,6 +1812,7 @@ async def test_rlm_index_update_correct_confirm():
         os.makedirs(src)
         with open(os.path.join(src, "Module.bsl"), "w", encoding="utf-8") as f:
             f.write("Процедура Тест()\nКонецПроцедуры\n")
+        _write_cf_descriptor(src)
 
         _reset_registry()
         with patch.dict(
@@ -2595,6 +2638,7 @@ async def test_mcp_build_returns_started():
             os.environ, {"RLM_CONFIG_FILE": os.path.join(tmpdir, "service.json"), "RLM_INDEX_DIR": idx_dir}
         ):
             _reset_registry()
+            _write_cf_descriptor(src)
             _rlm_projects(action="add", name="Proj1", path=src, password="pw")
             r = json.loads(await rlm_index(action="build", project="Proj1", confirm="pw"))
             assert r["started"] is True
@@ -2653,6 +2697,7 @@ async def test_mcp_build_completes_check_info():
             os.environ, {"RLM_CONFIG_FILE": os.path.join(tmpdir, "service.json"), "RLM_INDEX_DIR": idx_dir}
         ):
             _reset_registry()
+            _write_cf_descriptor(src)
             _rlm_projects(action="add", name="Proj3", path=src, password="pw")
             r = json.loads(await rlm_index(action="build", project="Proj3", confirm="pw"))
             assert r["started"] is True
@@ -2710,6 +2755,7 @@ async def test_mcp_build_already_running():
             os.environ, {"RLM_CONFIG_FILE": os.path.join(tmpdir, "service.json"), "RLM_INDEX_DIR": idx_dir}
         ):
             _reset_registry()
+            _write_cf_descriptor(src)
             _rlm_projects(action="add", name="Proj5", path=src, password="pw")
             # Simulate a running build by injecting into _build_jobs
             resolved = _canonicalize_path(src)
@@ -2990,6 +3036,7 @@ async def test_mcp_build_db_tables_valid():
             os.environ, {"RLM_CONFIG_FILE": os.path.join(tmpdir, "service.json"), "RLM_INDEX_DIR": idx_dir}
         ):
             _reset_registry()
+            _write_cf_descriptor(src)
             _rlm_projects(action="add", name="DbCheck", path=src, password="pw")
             r = json.loads(await rlm_index(action="build", project="DbCheck", confirm="pw"))
             assert r["started"] is True
