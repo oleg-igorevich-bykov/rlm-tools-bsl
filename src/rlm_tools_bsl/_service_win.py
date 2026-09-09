@@ -10,6 +10,7 @@ Architecture:
 import datetime
 import os
 import pathlib
+import stat
 import subprocess
 import threading
 import time
@@ -20,11 +21,24 @@ import win32event
 import win32service
 import win32serviceutil
 
+from rlm_tools_bsl._config import SERVICE_NO_ENV_VAR
+from rlm_tools_bsl._git_process import CAPTURE_FILE_GLOB, GIT_CAPTURE_DIR_ENV, SERVICE_CAPTURE_DIRNAME
 from rlm_tools_bsl._service_env import build_service_env_vars
-from rlm_tools_bsl.service import _config_path, load_config, save_config
+from rlm_tools_bsl._service_watchdog import RestartPolicy
+from rlm_tools_bsl.service import (
+    _absolute_env_file,
+    _config_path,
+    _restore_file,
+    _snapshot_file,
+    installer_leftovers,
+    load_config,
+    save_config,
+)
 
 SERVICE_NAME = "rlm-tools-bsl"
 SERVICE_DISPLAY = "RLM Tools BSL (MCP HTTP Server)"
+# ERROR_SERVICE_DOES_NOT_EXIST: removing an already-removed service is not a failure.
+ERROR_SERVICE_DOES_NOT_EXIST = 1060
 _SERVICE_DESC_BASE = "RLM-инструменты для анализа 1C BSL-кода. Предназначены для экономии расхода токенов и контекста при анализе BSL-проектов"
 
 
@@ -41,30 +55,149 @@ def _get_service_desc() -> str:
 SERVICE_DESC = _get_service_desc()
 
 
+def health_probe_host(host: str) -> str:
+    """Turn a BIND address into one the watchdog can actually connect to.
+
+    A wildcard bind is not a connectable address: ``http://:::3000/health`` does not
+    even parse, so every probe would fail and the watchdog would keep killing a
+    perfectly healthy server until it ran out of restarts.
+    """
+    value = (host or "").strip().strip("[]")
+    if value in ("", "0.0.0.0", "*"):
+        return "127.0.0.1"
+    if value in ("::", "0:0:0:0:0:0:0:0"):
+        return "[::1]"
+    return f"[{value}]" if ":" in value else value
+
+
 class RlmWindowsService(win32serviceutil.ServiceFramework):
     _svc_name_ = SERVICE_NAME
     _svc_display_name_ = SERVICE_DISPLAY
     _svc_description_ = SERVICE_DESC
 
-    def SvcDoRun(self) -> None:
-        self._stop_event = win32event.CreateEvent(None, 0, 0, None)
+    # Результат подготовки capture-каталога (см. SvcDoRun). Значения по
+    # умолчанию нужны, чтобы _run_server оставался вызываемым сам по себе.
+    _git_capture_dir: pathlib.Path | None = None
+    _git_capture_error: str | None = None
+    _git_capture_swept: int = 0
+    # Stop intent, up from the FIRST line of SvcStop -- everything it does after that
+    # takes time, and the loop must not read those seconds as ordinary work.
+    _stopping: bool = False
+    # Serialises publishing `_proc` against SvcStop reading it. Replaced per instance
+    # in __init__; the class-level one keeps `_serve` callable on its own.
+    _proc_lock = threading.Lock()
+
+    def __init__(self, args) -> None:
+        """Build everything SvcStop touches BEFORE the control handler can fire.
+
+        `ServiceFramework.__init__` is what registers that handler, and `SvcRun`
+        reports SERVICE_RUNNING before it ever calls `SvcDoRun` -- so an ordinary
+        quick `net start && net stop` can deliver a STOP while `SvcDoRun` has not
+        run a single line. Reaching for `_proc` or `_stop_event` from there would
+        raise inside the SCM's own callback, and creating this state in `SvcDoRun`
+        instead would silently overwrite a stop the SCM had already accepted.
+        """
+        # Manual-reset (second argument): ONE SetEvent releases BOTH waiters --
+        # SvcDoRun and the watchdog thread. An auto-reset event hands it to exactly
+        # one of them. The service stopped either way -- the loser of that race was
+        # either torn down with the process or set the event again on its own way
+        # out -- but WHICH path did it depended on the race, and the watchdog now
+        # waits up to 15 minutes at a time. Manual reset makes the stop the same
+        # every time. Nothing relies on the event resetting itself: it is set once.
+        self._stop_event = win32event.CreateEvent(None, 1, 0, None)
+        self._stopping = False
+        self._proc_lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        super().__init__(args)
+
+    def SvcDoRun(self) -> None:
+        # Стоп-состояние живёт в __init__ — см. там; пересоздавать его здесь нельзя.
+        # Приватный capture-каталог для git-вызовов сервера. Best-effort: отказ
+        # выключает ТОЛЬКО Git-ускорение, а не службу, поэтому watchdog-поток
+        # стартует и SERVICE_RUNNING сообщается в любом случае.
+        self._git_capture_dir: pathlib.Path | None = None
+        self._git_capture_error: str | None = None
+        self._git_capture_swept: int = 0
+        try:
+            self._git_capture_dir = _prepare_git_capture_dir()
+        except BaseException as exc:  # noqa: BLE001 - старт службы не срывается ничем
+            self._git_capture_error = type(exc).__name__
+        else:
+            # Уборка — только по ПРОВЕРЕННОМУ каталогу: подметать что-то, чему мы
+            # не доверяем (не тот путь, ссылка, чужой DACL), нельзя. Отдельный
+            # try обязателен: провал уборки НЕ меняет вердикт о готовности
+            # каталога, иначе `_git_capture_error` оказался бы выставлен при
+            # живом `_git_capture_dir` — состояние, которого остальной код не
+            # ждёт (ошибка записана, но нигде не всплывёт).
+            try:
+                self._git_capture_swept = _sweep_git_capture_dir(self._git_capture_dir)
+            except BaseException:  # noqa: BLE001 - уборка не критична вовсе
+                self._git_capture_swept = 0
+        if self._stopping:
+            # A stop was accepted while the SCM already believed us RUNNING. Starting a
+            # server now would leave one running behind a service that is stopping.
+            return
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
-        self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+        # No status is reported here on purpose. `ServiceFramework.SvcRun` reports
+        # SERVICE_RUNNING immediately before calling us, so a second report says
+        # nothing new -- and a stop delivered while the thread is starting is past the
+        # check above, which would let that report paint RUNNING over the STOP_PENDING
+        # SvcStop had just sent. Reporting readiness later would mean overriding
+        # SvcRun, not duplicating one of its lines here.
         win32event.WaitForSingleObject(self._stop_event, win32event.INFINITE)
 
     def _run_server(self) -> None:
+        """Thread body.  Nothing may escape it.
+
+        A dying thread would leave the SCM at SERVICE_RUNNING with no server behind it:
+        `net start` succeeds, the service shows as running, and every request fails.
+        An unusable service.json (wrong encoding, broken JSON) reaches exactly this
+        path, because the settings cannot be guessed -- so say so in the log and stop
+        the service for real.
+        """
+        try:
+            self._serve()
+        except BaseException as exc:  # noqa: BLE001 - see the docstring
+            self._log_fatal("Fatal: %s: %s. Service is stopping (check %s).", type(exc).__name__, exc, _config_path())
+        else:
+            # A normal return means the watchdog is done: either the server shut down
+            # cleanly or SvcStop was requested. The budget can no longer run out -- it
+            # backs off instead -- so there is no server any more and the service must
+            # stop instead of sitting at SERVICE_RUNNING forever.
+            self._log_fatal("Watchdog finished: no server process left. Service is stopping.")
+        finally:
+            # The exception exit is an exit too: without this the loop's own child
+            # outlives the service that was watching it and keeps the port. Before
+            # SetEvent, so the main thread cannot tear the process down first.
+            try:
+                self._abandon_child()
+            except Exception:
+                pass
+            try:
+                win32event.SetEvent(self._stop_event)
+            except Exception:
+                pass
+
+    def _log_fatal(self, msg: str, *args) -> None:
+        """Best-effort note in server.log. Never raises: this runs on the way out."""
+        try:
+            log_dir = _config_path().parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "server.log", "a", encoding="utf-8") as f:
+                _log_watchdog(f, msg, *args)
+        except Exception:
+            pass
+
+    def _serve(self) -> None:
         cfg = load_config()
         exe = cfg.get("exe_path") or "rlm-tools-bsl"
         host = cfg["host"]
         port = str(cfg["port"])
-        health_url = f"http://{host}:{port}/health"
+        health_url = f"http://{health_probe_host(host)}:{port}/health"
 
-        env = os.environ.copy()
         env_file = cfg.get("env_file")
-        if env_file and pathlib.Path(env_file).exists():
-            _load_env_file(env_file, env)
+        env = _service_child_environment(env_file)
         # Force line-buffered stdout/stderr in the subprocess so log records
         # (which go to stderr via basicConfig and get redirected here) appear
         # in server.log immediately, not in 4-8 KB block-buffered chunks.
@@ -79,7 +212,22 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         # The child skips its own log-retention purge (see server._setup_file_logging):
         # we purge here, before opening server.log for the child's stderr redirect, so the
         # child never truncates a file this service holds open.
-        env["RLM_UNDER_SERVICE"] = "1"
+        #
+        # Обе переменные ниже — решения СЛУЖБЫ, а не настройки: вместе они и
+        # образуют гейт capture-каталога (`_git_process._git_capture_dir()`
+        # требует `RLM_UNDER_SERVICE=1` И точного совпадения маркера). Поэтому
+        # выставляются регистронезависимо — см. `_set_service_env_var`.
+        _set_service_env_var(env, "RLM_UNDER_SERVICE", "1")
+        _set_service_env_var(env, SERVICE_NO_ENV_VAR, "1" if cfg.get("no_env") is True else None)
+        # Маркер capture-каталога — приватный канал служба→ребёнок. Любое
+        # унаследованное значение (в т.ч. из `.env`, загруженного выше)
+        # вычищается: подставленный извне путь обошёл бы и mkdir, и
+        # DACL-проверку. Выставляем только то, что реально подготовили сами.
+        _set_service_env_var(
+            env,
+            GIT_CAPTURE_DIR_ENV,
+            str(self._git_capture_dir) if self._git_capture_dir is not None else None,
+        )
 
         log_dir = _config_path().parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -94,21 +242,60 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
         except Exception:
             pass
 
-        max_restarts = 5
-        restart_count = 0
+        if self._git_capture_dir is None:
+            # Одна обезличенная строка: имя класса исключения без пути и ACL-деталей.
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    _log_watchdog(
+                        f,
+                        "Git capture unavailable; Git acceleration disabled (%s)",
+                        self._git_capture_error or "Unknown",
+                    )
+            except OSError:
+                pass
+        elif self._git_capture_swept:
+            # Штатно тут убирать нечего, поэтому непустой счётчик — сигнал. Но
+            # источников у него ДВА, и приписывать его только выключению ОС
+            # нельзя: осиротевший git из деградировавшей ветки (без Job) тоже
+            # мог пережить остановку службы и оставить своё имя в каталоге.
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    _log_watchdog(
+                        f,
+                        "Git capture: removed %d stale file(s) (unclean shutdown or an orphaned git process)",
+                        self._git_capture_swept,
+                    )
+            except OSError:
+                pass
 
-        while restart_count <= max_restarts:
-            log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-            _log_watchdog(log_file, "Starting subprocess: %s", exe)
-            self._proc = subprocess.Popen(
-                [exe, "--transport", "streamable-http", "--host", host, "--port", port],
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
+        # Every "when do we kill / how long do we wait" decision lives in the policy;
+        # this loop only carries them out.  See _service_watchdog.py for why a single
+        # missed probe and a lifetime restart budget were both wrong.
+        policy = RestartPolicy()
+
+        while True:
+            # Under the lock, and only after re-reading the intent: a stop delivered
+            # while `Popen` runs would otherwise terminate the process SvcStop saw --
+            # the previous, already dead one -- and this brand new server would
+            # outlive the service that launched it, holding the port.
+            with self._proc_lock:
+                if self._stopping:
+                    return  # SvcStop was called: launch nothing more
+                log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+                _log_watchdog(log_file, "Starting subprocess: %s", exe)
+                self._proc = subprocess.Popen(
+                    [exe, "--transport", "streamable-http", "--host", host, "--port", port],
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+            policy.process_started(time.monotonic())
 
             # Grace period for startup
-            time.sleep(5)
+            if self._wait_for_stop(5):
+                self._abandon_child()
+                log_file.close()
+                return  # SvcStop was called
 
             # Health-check loop: check every 30s, poll stop_event every 1s
             health_failed = False
@@ -116,23 +303,54 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             while self._proc.poll() is None:
                 for _ in range(30):
                     if win32event.WaitForSingleObject(self._stop_event, 1000) != win32event.WAIT_TIMEOUT:
+                        self._abandon_child()
                         log_file.close()
                         return  # SvcStop was called
                     if self._proc.poll() is not None:
                         break
                 else:
-                    if _check_health(health_url):
+                    answered = _check_health(health_url)
+                    # The probe takes up to 10 s and never looks at the stop event, so a
+                    # `net stop` delivered inside it arrives here as a dead child. Read
+                    # as a missed probe, it would put a wrong reason in the log.
+                    if self._wait_for_stop(0):
+                        self._abandon_child()
+                        log_file.close()
+                        return  # SvcStop was called
+                    if answered:
+                        if policy.consecutive_failures:
+                            _log_watchdog(
+                                log_file,
+                                "Health check recovered after %d missed probe(s) (%s)",
+                                policy.consecutive_failures,
+                                health_url,
+                            )
+                        policy.probe_succeeded(time.monotonic())
                         if first_health_ok:
                             _log_watchdog(log_file, "Health check OK (%s)", health_url)
                             first_health_ok = False
-                    else:
-                        _log_watchdog(log_file, "Health check failed (%s), terminating process", health_url)
+                    elif policy.probe_failed(time.monotonic()):
+                        _log_watchdog(
+                            log_file,
+                            "Health check failed %d times in a row (%s), terminating process",
+                            policy.consecutive_failures,
+                            health_url,
+                        )
                         self._proc.terminate()
                         try:
                             self._proc.wait(timeout=10)
                         except subprocess.TimeoutExpired:
                             self._proc.kill()
                         health_failed = True
+                    else:
+                        # Logged, not acted on: a late answer under load is ordinary,
+                        # and this line is what makes an eventual kill explicable.
+                        _log_watchdog(
+                            log_file,
+                            "Health check missed %d time(s) in a row (%s), giving the server more time",
+                            policy.consecutive_failures,
+                            health_url,
+                        )
 
                 if health_failed:
                     break
@@ -143,22 +361,74 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             if exit_code == 0 and not health_failed:
                 break  # clean shutdown
 
-            restart_count += 1
-            if restart_count <= max_restarts:
-                with open(log_path, "a", encoding="utf-8") as f:
+            # SvcStop terminates the child, so the loop meets a dead process here and
+            # would announce a restart that is never coming: the probe it was inside
+            # does not look at the event, so this is the first chance to notice.
+            if self._wait_for_stop(0):
+                return  # SvcStop was called
+
+            delay = policy.note_restart(time.monotonic())
+            with open(log_path, "a", encoding="utf-8") as f:
+                _log_watchdog(
+                    f,
+                    "Process exited (code=%s health_fail=%s), restarting in %d s...",
+                    exit_code,
+                    health_failed,
+                    round(delay),
+                )
+                if policy.backing_off:
+                    # Without this the operator sees a long wait with no reason for it.
                     _log_watchdog(
                         f,
-                        "Process exited (code=%s health_fail=%s), restarting (%d/%d)...",
-                        exit_code,
-                        health_failed,
-                        restart_count,
-                        max_restarts,
+                        "%d starts in a row failed to stay healthy; backing off. The service "
+                        "keeps retrying and does not give up.",
+                        policy.failed_starts,
                     )
-                time.sleep(5)
+            # Interruptible on purpose: an uninterruptible sleep here would make
+            # `net stop` hang for the whole backoff — up to 15 minutes.
+            if self._wait_for_stop(delay):
+                self._abandon_child()
+                return  # SvcStop was called
+
+    def _abandon_child(self) -> None:
+        """Kill the server process on the way out of the loop.
+
+        Belt to the lock's braces, not the primary mechanism: `_proc_lock` already
+        makes SvcStop's snapshot the last word, so the process it terminates is the
+        one actually running. This covers the exits the lock says nothing about --
+        above all the exception one, where the thread body stops the service and
+        would otherwise leave the server it had just started holding the port.
+        """
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def _wait_for_stop(self, seconds: float) -> bool:
+        """Wait up to `seconds`, returning True as soon as SvcStop is requested.
+
+        The flag is checked first: SvcStop raises it immediately but sets the event
+        only after terminating the child, which can take ten seconds.
+        """
+        if self._stopping:
+            return True
+        # Clamped at zero: WaitForSingleObject takes a DWORD, so a negative count would
+        # arrive as INFINITE and hang the watchdog on a restart that never comes.
+        milliseconds = max(0, int(seconds * 1000))
+        return win32event.WaitForSingleObject(self._stop_event, milliseconds) != win32event.WAIT_TIMEOUT
 
     def SvcStop(self) -> None:
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-        proc = self._proc
+        # Intent first, and only then the process: raising the flag before taking the
+        # lock means the loop can never publish another child behind our back, so the
+        # snapshot below is the last one there will be.
+        self._stopping = True
+        with self._proc_lock:
+            proc = self._proc
         if proc is not None:
             proc.terminate()
             try:
@@ -166,6 +436,211 @@ class RlmWindowsService(win32serviceutil.ServiceFramework):
             except subprocess.TimeoutExpired:
                 proc.kill()
         win32event.SetEvent(self._stop_event)
+
+
+# ---------------------------------------------------------------------------
+# Приватный capture-каталог для git-вызовов сервера (v1.33.1)
+# ---------------------------------------------------------------------------
+# Все pywin32-модули, нужные только для подготовки/проверки DACL, импортируются
+# ЛОКАЛЬНО внутри этих Windows-only helper-ов. Top-level import seam модуля
+# намеренно не расширяется: существующий Linux-тест импортирует _service_win с
+# минимальными заглушками win32event/win32service/win32serviceutil и не должен
+# начать требовать service-extra.
+
+
+def _set_service_env_var(env: dict, name: str, value: str | None) -> None:
+    """Выставить (или снять) переменную службы, вычистив ЛЮБОЙ регистровый вариант.
+
+    Имена переменных окружения на Windows регистронезависимы, а собираемый здесь
+    `env` — обычный регистрозависимый dict. `os.environ.copy()` даёт ключи уже в
+    верхнем регистре, но `_load_env_file` кладёт их из `.env` **дословно**,
+    поэтому `env.pop("_RLM_GIT_CAPTURE_DIR")` не убирает `_rlm_git_capture_dir`
+    — а ребёнок получит его как раз под каноническим именем. Для приватного
+    маркера capture-каталога это означало бы обход и mkdir, и DACL-проверки:
+    при неудачной подготовке сервер принял бы непроверенный каталог и снова
+    включил Git-ускорение.
+
+    ``value=None`` — переменная снимается целиком (ни один вариант не уезжает).
+    """
+    upper = name.upper()
+    for key in [k for k in env if k.upper() == upper]:
+        del env[key]
+    if value is not None:
+        env[name] = value
+
+
+def _service_child_environment(env_file: str | None) -> dict:
+    """Build the child environment without letting ``.env`` redirect its config."""
+    env = os.environ.copy()
+    env_file = _absolute_env_file(env_file, base_dir=_config_path().parent)
+    if env_file and pathlib.Path(env_file).exists():
+        _load_env_file(env_file, env)
+    # Windows environment names are case-insensitive, while `env` is now an ordinary
+    # case-sensitive dict. A `.env` entry such as `rlm_config_file=...` would coexist
+    # with the registry's uppercase key and win when CreateProcess builds the child
+    # environment. Remove every spelling and pin the path the wrapper just read.
+    _set_service_env_var(env, "RLM_CONFIG_FILE", str(_config_path()))
+    return env
+
+
+def _current_user_sid():
+    """SID учётной записи, под которой реально работает служба."""
+    import win32api
+    import win32security
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+    try:
+        return win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+
+
+def _git_capture_allowed_sids() -> list:
+    """Единственный источник истины для «кому можно»: служба, SYSTEM, Administrators.
+
+    Тем же списком и ставится DACL, и проверяется — иначе применение и проверка
+    могли бы разъехаться.
+    """
+    import win32security
+
+    candidates = [
+        _current_user_sid(),
+        win32security.CreateWellKnownSid(win32security.WinLocalSystemSid),
+        win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid),
+    ]
+    out: list = []
+    seen: set[str] = set()
+    for sid in candidates:
+        key = win32security.ConvertSidToStringSid(sid)
+        if key not in seen:
+            seen.add(key)
+            out.append(sid)
+    return out
+
+
+def _apply_protected_dacl(path: pathlib.Path) -> None:
+    """Protected DACL: наследование от родителя отрезается, ACE — только свои."""
+    import ntsecuritycon
+    import win32security
+
+    dacl = win32security.ACL()
+    inherit = win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE
+    for sid in _git_capture_allowed_sids():
+        dacl.AddAccessAllowedAceEx(win32security.ACL_REVISION_DS, inherit, ntsecuritycon.FILE_ALL_ACCESS, sid)
+    win32security.SetNamedSecurityInfo(
+        str(path),
+        win32security.SE_FILE_OBJECT,
+        win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        dacl,
+        None,
+    )
+
+
+def _verify_protected_dacl(path: pathlib.Path) -> None:
+    """Перечитать DACL и убедиться, что он именно такой, каким его ставили.
+
+    Проверка отдельным чтением, а не «мы же только что записали»: только так
+    видно, что DACL действительно protected и что в нём не осталось
+    унаследованных или посторонних ACE.
+    """
+    import win32security
+
+    sd = win32security.GetNamedSecurityInfo(
+        str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION
+    )
+    control, _revision = sd.GetSecurityDescriptorControl()
+    if not control & win32security.SE_DACL_PROTECTED:
+        raise OSError("git capture directory DACL is not protected")
+    dacl = sd.GetSecurityDescriptorDacl()
+    if dacl is None:
+        raise OSError("git capture directory has no DACL")
+    ace_count = dacl.GetAceCount()
+    if ace_count == 0:
+        raise OSError("git capture directory DACL is empty")
+    allowed = {win32security.ConvertSidToStringSid(s) for s in _git_capture_allowed_sids()}
+    for i in range(ace_count):
+        (_ace_type, ace_flags), _mask, sid = dacl.GetAce(i)
+        if ace_flags & win32security.INHERITED_ACE:
+            raise OSError("git capture directory DACL carries an inherited ACE")
+        if win32security.ConvertSidToStringSid(sid) not in allowed:
+            raise OSError("git capture directory DACL grants a foreign principal")
+
+
+def _is_reparse_point(path: pathlib.Path) -> bool:
+    """Junction/symlink увёл бы capture за пределы config-root."""
+    attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+    return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _prepare_git_capture_dir() -> pathlib.Path:
+    """Создать и проверить `<parent RLM_CONFIG_FILE>/git-capture`.
+
+    Возвращает готовый каталог либо поднимает исключение — половинчатого
+    результата не бывает: маркер `_RLM_GIT_CAPTURE_DIR` получает только каталог,
+    прошедший ВСЕ проверки, а `_git_process._git_capture_dir()` под службой
+    принимает исключительно этот путь. Поэтому частично созданный или не
+    прошедший DACL-check каталог использован быть не может в принципе.
+    """
+    config_file = _config_path()
+    if not config_file.is_absolute():
+        raise OSError("service config path is not absolute")
+    target = config_file.parent / SERVICE_CAPTURE_DIRNAME
+    target.mkdir(parents=True, exist_ok=True)
+    if not target.is_dir():
+        raise OSError("git capture path is not a directory")
+    if _is_reparse_point(target):
+        raise OSError("git capture path is a reparse point")
+    _apply_protected_dacl(target)
+    _verify_protected_dacl(target)
+    return target
+
+
+def _sweep_git_capture_dir(path: pathlib.Path) -> int:
+    """Убрать capture-файлы, пережившие АВАРИЙНОЕ выключение ОС. Возвращает число убранных.
+
+    Штатно уборка здесь не нужна и не работает: файлы открыты с
+    `FILE_FLAG_DELETE_ON_CLOSE`, поэтому ядро удаляет их при закрытии последнего
+    дескриптора — в том числе когда процессы просто убивают (остановка службы,
+    kill дерева по timeout). Остаются два случая: аварийное выключение самой ОС
+    (питание, BSOD, reset — дескрипторы не закрылись вовсе) и осиротевший git из
+    деградировавшей ветки без Job, переживший остановку службы.
+
+    Удалить имя у файла, который такой потомок ещё держит, безопасно: Windows
+    снимает имя сразу, а сам держатель продолжает читать и писать через свой
+    дескриптор, и данные освобождаются при его выходе. Своих читателей у нас
+    тут быть не может — `run_git` читает capture только через УЖЕ открытый
+    файловый объект и никогда не переоткрывает файл по имени.
+
+    Почему именно здесь. План (§2.2) отверг stale-cleanup **на критическом
+    пути** — сканер внутри каждого `run_git` не может иметь честного лимита по
+    времени вокруг блокирующих обращений к ФС. Разовый проход при старте службы
+    — другое дело: он вне критического пути, случается раз за запуск, каталог
+    приватный и маленький, а дочерний сервер в этот момент ещё не поднят, так
+    что занятых НАМИ файлов там быть не может.
+
+    Отдельная причина, почему без этого нельзя: системный temp (куда пишет
+    ручной запуск и CLI) рано или поздно чистит сама Windows, а приватный
+    `<config>/git-capture` не чистит НИЧТО, кроме нас.
+
+    Best-effort и поштучно: неудача на одном файле не мешает остальным и никогда
+    не срывает старт службы. Трогаются только файлы нашего шаблона — посторонние
+    остаются на месте.
+    """
+    removed = 0
+    try:
+        stale = sorted(path.glob(CAPTURE_FILE_GLOB))
+    except OSError:
+        return 0
+    for entry in stale:
+        try:
+            if entry.is_file():
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _load_env_file(path: str, env: dict) -> None:
@@ -208,11 +683,20 @@ def _check_health(url: str) -> bool:
 
 
 def _log_watchdog(f, msg: str, *args) -> None:
-    """Write a timestamped watchdog message to the log file."""
+    """Write a timestamped watchdog message to the log file.
+
+    A write failure costs a line, never the service. `server.log` is line-buffered
+    and shared with the child, so a full disk raises OSError right here -- inside
+    the watchdog loop, where it would escape to the thread body and stop a service
+    whose server is perfectly healthy.
+    """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = msg % args if args else msg
-    f.write(f"[watchdog {ts}] {text}\n")
-    f.flush()
+    try:
+        f.write(f"[watchdog {ts}] {text}\n")
+        f.flush()
+    except OSError:
+        pass
 
 
 def _set_service_environment(service_name: str, site_packages: str, config_file: str) -> None:
@@ -241,12 +725,17 @@ def _set_service_environment(service_name: str, site_packages: str, config_file:
         for ev in env_vars:
             print(f"Service env set: {ev}")
     except Exception as exc:
-        print(f"Warning: could not set Environment in registry: {exc}")
+        # NOT swallowed: without this key pythonservice.exe cannot import rlm_tools_bsl
+        # and LocalSystem cannot find the config, i.e. the service is registered but
+        # cannot start.  The caller rolls the registration back.
+        raise RuntimeError(f"could not set Environment in the service registry key: {exc}") from exc
 
 
-def install(host: str, port: int, env_file: str | None) -> None:
+def install(host: str, port: int, env_file: str | None, *, no_env: bool = False) -> None:
     import shutil
     import sys
+
+    env_file = _absolute_env_file(env_file)
 
     # Locate rlm-tools-bsl.exe in the current (uv tool) Python environment.
     # We try two strategies: PATH lookup and sibling of sys.executable.
@@ -295,7 +784,15 @@ def install(host: str, port: int, env_file: str | None) -> None:
             shutil.copy2(dll, dest)
             print(f"Copied {dll.name} -> {svc_dir}")
 
-    save_config(host, port, env_file, exe_path=exe_path)
+    try:
+        config_snapshot = _snapshot_file(_config_path())
+    except OSError as exc:
+        # An explicit set of install flags may let the facade continue past an
+        # unreadable old config, but this backend still must be able to put its exact
+        # bytes back if the registry write fails after save_config() succeeds.
+        print(f"Install error: cannot prepare config rollback: {exc}")
+        raise SystemExit(1)
+
     try:
         win32serviceutil.InstallService(
             pythonClassString="rlm_tools_bsl._service_win.RlmWindowsService",
@@ -304,29 +801,71 @@ def install(host: str, port: int, env_file: str | None) -> None:
             description=SERVICE_DESC,
             startType=win32service.SERVICE_AUTO_START,
         )
-        # Allow pythonservice.exe (system Python) to find rlm_tools_bsl at runtime
-        # and locate the config file (LocalSystem has a different home dir)
-        _set_service_environment(SERVICE_NAME, site_packages, str(_config_path()))
-        print(f"Service '{SERVICE_NAME}' installed.")
-        print("Start with: rlm-tools-bsl service start")
     except Exception as exc:
+        # Nothing has been written yet: a failed registration (already installed, no
+        # admin rights) leaves the previous configuration exactly as it was.
         print(f"Install error: {exc}")
         print("Make sure you are running as Administrator.")
         raise SystemExit(1)
 
+    try:
+        # Saved only after the service really exists, so an install that fails cannot
+        # leave the config pointing somewhere the running service is not.
+        save_config(host, port, env_file, exe_path=exe_path, no_env=no_env)
+        # Allow pythonservice.exe (system Python) to find rlm_tools_bsl at runtime
+        # and locate the config file (LocalSystem has a different home dir)
+        _set_service_environment(SERVICE_NAME, site_packages, str(_config_path()))
+    except Exception as exc:
+        # Registered but unconfigured is the worst of both worlds: the service cannot
+        # start AND the next attempt is blocked by "service already exists".
+        print(f"Install error after registration: {exc}")
+        try:
+            win32serviceutil.RemoveService(SERVICE_NAME)
+            print(f"Rolled back: service '{SERVICE_NAME}' removed.")
+        except Exception as rollback_exc:
+            print(f"Rollback failed, remove it manually: {rollback_exc}")
+        try:
+            _restore_file(config_snapshot)
+            print(f"Rolled back: service config restored: {_config_path()}")
+        except Exception as rollback_exc:
+            print(f"Config rollback failed, restore it manually: {rollback_exc}")
+        raise SystemExit(1)
 
-def uninstall() -> None:
+    print(f"Service '{SERVICE_NAME}' installed.")
+    print("Start with: rlm-tools-bsl service start")
+
+
+def uninstall(purge: bool = False) -> None:
+    """Remove the service.  The config survives unless *purge* is asked for.
+
+    Update scripts call uninstall + install back to back; deleting service.json
+    here used to throw away the user's host/port/.env on every upgrade -- and on
+    Windows it is that very file the running service reads its bind address from.
+    """
     try:
         win32serviceutil.StopService(SERVICE_NAME)
     except Exception:
         pass
     try:
         win32serviceutil.RemoveService(SERVICE_NAME)
-        _config_path().unlink(missing_ok=True)
         print(f"Service '{SERVICE_NAME}' removed.")
     except Exception as exc:
-        print(f"Error: {exc}")
-        raise SystemExit(1)
+        # An already-removed service must not block --purge: after a plain uninstall
+        # that is the only way left to delete the config, and on Linux it works.
+        if getattr(exc, "winerror", None) != ERROR_SERVICE_DOES_NOT_EXIST:
+            print(f"Error: {exc}")
+            raise SystemExit(1)
+        print(f"Service '{SERVICE_NAME}' is not installed.")
+    config = _config_path()
+    if purge:
+        # Copies FIRST, config last: if removing a copy fails (read-only, locked), the
+        # config is still there, and nothing can be resurrected from a half-purge.
+        for leftover in installer_leftovers(config):
+            leftover.unlink(missing_ok=True)
+        config.unlink(missing_ok=True)
+        print(f"Service config removed: {config}")
+    elif config.exists():
+        print(f"Settings kept: {config} (remove them too: service uninstall --purge)")
 
 
 def start() -> None:

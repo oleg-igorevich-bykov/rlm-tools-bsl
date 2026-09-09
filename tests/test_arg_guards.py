@@ -55,6 +55,54 @@ def _make_saturating_fixture(root):
     (doc_dir / "ObjectModule.bsl").write_text(
         "Процедура ОбработкаПроведения(Отказ, Режим)\nКонецПроцедуры\n", encoding="utf-8"
     )
+    # Метаданные-XML: без них find_references_to_object и find_functional_options
+    # отдают ноль, и любой тест «валидный вид продолжает фильтровать» превращается
+    # в вакуумное 0 == 0. Форма тегов — та же, что в tests/test_find_references.py
+    # (проверенная на боевых CF-конфигурациях).
+    cat_dir = root / "Catalogs" / "ТестовыйСправочник" / "Ext"
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    (cat_dir / "Catalog.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"\n'
+        '                xmlns:v8="http://v8.1c.ru/8.1/data/core"\n'
+        '                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"\n'
+        '                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+        "  <Catalog>\n"
+        "    <Properties>\n"
+        "      <Name>ТестовыйСправочник</Name>\n"
+        "    </Properties>\n"
+        "    <ChildObjects>\n"
+        "      <Attribute>\n"
+        "        <Properties>\n"
+        "          <Name>Основание</Name>\n"
+        "          <Type>\n"
+        "            <v8:Type>DocumentRef.ТестовыйДокумент</v8:Type>\n"
+        "          </Type>\n"
+        "        </Properties>\n"
+        "      </Attribute>\n"
+        "    </ChildObjects>\n"
+        "  </Catalog>\n"
+        "</MetaDataObject>\n",
+        encoding="utf-8",
+    )
+    fo_dir = root / "FunctionalOptions" / "ТестоваяОпция" / "Ext"
+    fo_dir.mkdir(parents=True, exist_ok=True)
+    (fo_dir / "FunctionalOption.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"\n'
+        '                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"\n'
+        '                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+        "  <FunctionalOption>\n"
+        "    <Properties>\n"
+        "      <Name>ТестоваяОпция</Name>\n"
+        "      <Content>\n"
+        "        <xr:Object>Document.ТестовыйДокумент</xr:Object>\n"
+        "      </Content>\n"
+        "    </Properties>\n"
+        "  </FunctionalOption>\n"
+        "</MetaDataObject>\n",
+        encoding="utf-8",
+    )
     (root / "Configuration.xml").write_text("<Configuration/>", encoding="utf-8")
     return root
 
@@ -200,7 +248,11 @@ def test_family_b_none_still_unlimited(guarded_bsl):
 
     fo = guarded_bsl["find_functional_options"]("ТестовыйДокумент", False, None)
     assert set(fo) >= {"xml_options", "code_options"}
-    assert "total" not in fo  # limit=None → без per-bucket cap, а не усечение
+    # v1.34.0: totals в этой ветке появились (они тривиальны — длины списков),
+    # поэтому смысл «limit=None не включает ПАГИНАЦИЮ» проверяется по её ключам.
+    assert "returned" not in fo and "has_more" not in fo
+    assert fo["xml_total"] == len(fo["xml_options"])
+    assert fo["code_total"] == len(fo["code_options"])
 
 
 def test_safe_grep_max_files_none_is_normalized(guarded_bsl, caplog):
@@ -227,7 +279,7 @@ def test_safe_grep_result_cap_none_untouched(guarded_bsl, caplog):
     `max_files` по нему не должно быть НИ ОДНОГО предупреждения."""
     with caplog.at_level("WARNING"):
         rows = guarded_bsl["safe_grep"]("ЦелеваяПроцедура", "", 5, _result_cap=None)
-    assert isinstance(rows, list)
+    assert isinstance(rows, dict) and isinstance(rows["results"], list)
     assert not [r for r in caplog.records if "_result_cap" in r.getMessage()]
 
 
@@ -282,7 +334,11 @@ def test_bool_is_not_silently_treated_as_int(guarded_bsl):
             id="code_usages",
         ),
         pytest.param(lambda b: b["find_callers"]("ЦелеваяПроцедура", "", 0), list, id="find_callers"),
-        pytest.param(lambda b: b["safe_grep"]("ЦелеваяПроцедура", "", 0), list, id="safe_grep"),
+        pytest.param(
+            lambda b: b["safe_grep"]("ЦелеваяПроцедура", "", 0),
+            lambda r: r["results"],
+            id="safe_grep",
+        ),
         pytest.param(lambda b: b["search_regions"]("Служебные", 0), list, id="search_regions"),
         pytest.param(lambda b: b["search_methods"]("Обработать", 0), list, id="search_methods"),
     ],
@@ -336,13 +392,13 @@ def test_git_search_max_results_guarded(tmp_path, monkeypatch):
     )
     try:
         assert "git_search" in bsl, "фикстура не под git — тест выродился бы в пустышку"
-        # У git_search свой исторический контракт: при усечении он добавляет
-        # последним элементом sentinel {_truncated, shown}. Ноль уважён — реальных
-        # строк нет, а `shown: 0` это подтверждает.
+        # v1.34.0: sentinel снят на границе публичного хелпера, его значение
+        # переехало в `truncated`. Ноль уважён — реальных строк нет.
         zero = bsl["git_search"]("ЦелеваяПроцедура", max_results=0)
-        assert [r for r in zero if "_truncated" not in r] == [], zero
-        assert zero and zero[-1]["shown"] == 0, zero
-        assert len([r for r in bsl["git_search"]("ЦелеваяПроцедура", max_results=None) if "_truncated" not in r]) <= 200
+        assert zero["results"] == [] and zero["returned"] == 0, zero
+        assert zero["truncated"] is True, zero
+        assert zero["error"] is None, zero
+        assert len(bsl["git_search"]("ЦелеваяПроцедура", max_results=None)["results"]) <= 200
     finally:
         reader.close()
 
@@ -382,3 +438,90 @@ def test_list_overload_isolation_preserved(guarded_bsl):
     assert set(res) == {"ЦелеваяПроцедура", "Обработать000_0"}
     for name, data in res.items():
         assert "error" not in data, (name, data)
+
+
+# ── v1.33.0: гард имён секций get_object_profile ────────────────────────────
+
+
+def test_unknown_profile_section_yields_arg_warning(guarded_bsl):
+    """Опечатка в имени секции обязана быть заметной, а не давать пустой профиль."""
+    res = guarded_bsl["get_object_profile"]("Документ.ТестовыйДокумент", sections=["predefined_items"])
+    warn = (res.get("_meta") or {}).get("arg_warning") or ""
+    assert "predefined_items" in warn
+    assert "structure" in warn, "варнинг обязан перечислить принятые имена"
+
+
+def test_flow_and_code_usages_are_accepted_as_section_names(guarded_bsl):
+    """sections=['flow'] — естественная догадка по имени секции в самом же ответе."""
+    res = guarded_bsl["get_object_profile"]("Документ.ТестовыйДокумент", sections=["flow"])
+    assert "flow" in res["sections"]
+    res = guarded_bsl["get_object_profile"]("Документ.ТестовыйДокумент", sections=["code_usages"])
+    assert "code_usages" in res["sections"]
+
+
+def test_known_section_produces_no_warning(guarded_bsl):
+    res = guarded_bsl["get_object_profile"]("Документ.ТестовыйДокумент", sections=["structure"])
+    assert not (res.get("_meta") or {}).get("arg_warning")
+
+
+# ── kinds= у find_references_to_object: тот же класс, что и sections= ─────────
+#
+# Неизвестный вид ссылки ни с чем не совпадает, и раньше это давало МОЛЧАЛИВЫЙ
+# total=0 — ответ, неотличимый от честного «ссылок нет». В e2e-прогоне v1.33.0
+# агент на этом построил вывод «документ ни в какие подсистемы не входит»,
+# передав человекочитаемое 'Subsystem' вместо ключа 'subsystem_content'.
+
+
+def test_unknown_ref_kind_yields_arg_warning(guarded_bsl):
+    res = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["Subsystem"])
+    warn = (res.get("_meta") or {}).get("arg_warning") or ""
+    assert "Subsystem" in warn, "варнинг обязан назвать отвергнутый вид"
+    assert "subsystem_content" in warn, "варнинг обязан перечислить допустимые виды"
+    assert res["total"] == 0
+
+
+def test_mixed_ref_kinds_keep_filtering_by_valid_ones(guarded_bsl):
+    """Валидный вид продолжает фильтровать как прежде — гард только информирует."""
+    mixed = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["Subsystem", "attribute_type"])
+    only_valid = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["attribute_type"])
+    assert only_valid["total"] > 0, "фикстура обязана давать ссылку, иначе сравнение вакуумно (0 == 0)"
+    assert mixed["total"] == only_valid["total"]
+    assert mixed["by_kind"] == only_valid["by_kind"]
+    assert "Subsystem" in ((mixed.get("_meta") or {}).get("arg_warning") or "")
+
+
+def test_known_ref_kind_produces_no_meta_noise(guarded_bsl):
+    """Без предупреждения ключа _meta у хелпера быть не должно — контракт прежний."""
+    res = guarded_bsl["find_references_to_object"]("Документ.ТестовыйДокумент", kinds=["attribute_type"])
+    # v1.34.0: `_meta` стал БЕЗУСЛОВНЫМ (оси охвата Задачи 7) — раньше он рождался
+    # через setdefault только при arg-warning, и shape ответа зависел от аргумента.
+    # Исходный смысл теста сохранён: штатный вызов не порождает ШУМА предупреждений.
+    assert "arg_warning" not in res["_meta"]
+    assert res["_meta"]["source"] in {"index", "live", "unavailable"}
+    assert res["_meta"]["unsupported_kinds"] == []
+
+
+# ── две корзины find_functional_options ──────────────────────────────────────
+#
+# `total` — сумма корзин РАЗНОЙ точности (xml — exact, code — подстрочный grep).
+# Два прогона подряд (1.30.0 и 1.33.0) агент читал её как «столько ФО у объекта»
+# и получал 167 вместо 34. Разбивка обязана лежать в самом ответе.
+
+
+def test_functional_options_without_limit_keep_legacy_key_set(guarded_bsl):
+    """Ветка без limit — прежний контракт: ни total, ни разбивки, только списки."""
+    res = guarded_bsl["find_functional_options"]("ТестовыйДокумент", include_code=False)
+    assert len(res["xml_options"]) > 0, "фикстура обязана давать ФО, иначе проверка вакуумна"
+    # Freeze обновлён, а НЕ ослаблен до >=: смысл заморозки — ловить
+    # незапланированный рост формы, а totals здесь запланированы (Задача 5).
+    assert set(res) == {"object", "xml_options", "code_options", "total", "xml_total", "code_total"}
+
+
+def test_functional_options_bucket_totals_match_total_with_limit(guarded_bsl):
+    # limit=0 — единственный вход, который РАЗЛИЧАЕТ «полную корзину» и «длину среза»:
+    # при limit>=размера корзины оба числа совпадают и тест ничего не доказывает.
+    res = guarded_bsl["find_functional_options"]("ТестовыйДокумент", limit=0)
+    assert res["total"] > 0, "фикстура обязана давать ФО, иначе проверка вакуумна"
+    assert res["total"] == res["xml_total"] + res["code_total"]
+    assert res["xml_options"] == [], "срез при limit=0 обязан быть пустым"
+    assert res["xml_total"] > 0, "xml_total — ПОЛНАЯ корзина, а не длина среза"

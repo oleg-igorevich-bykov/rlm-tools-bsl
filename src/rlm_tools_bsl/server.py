@@ -45,8 +45,10 @@ from rlm_tools_bsl.extension_detector import (
     ConfigRole,
     _ext_list_cap,
     detect_extension_context,
+    filter_alias_extension_infos,
     find_extension_overrides,
     resolve_config_root,
+    validate_root_topology,
 )
 from rlm_tools_bsl.bsl_knowledge import (
     EFFORT_LEVELS,
@@ -101,6 +103,11 @@ mcp = FastMCP(
         "helpers via rlm_execute; rlm_help() lists the available recipes and helpers."
     ),
 )
+# FastMCP 1.x не принимает version в конструкторе, а низкоуровневый сервер без неё
+# подставляет версию пакета mcp — интегратор видел в serverInfo.version чужую версию
+# (при mcp 1.29.0 и нашей 1.32.1 сервер представлялся как 1.29.0) и не мог выбрать
+# парсер под нашу.
+mcp._mcp_server.version = importlib.metadata.version("rlm-tools-bsl")
 
 session_manager = SessionManager()  # defaults for tests/import
 
@@ -539,6 +546,10 @@ def _create_session_backend(
     ext_paths_for_sandbox: list[str],
     registry_epoch: int,
     enable_bsl_helpers: bool = True,
+    current_config_role: str | None = None,
+    current_config_name: str = "",
+    current_config_root: str = "",
+    extension_name_by_root: dict[str, str] | None = None,
 ):
     """Фабрика backend по режиму (§5.2): выбор делается один раз при rlm_start,
     дальше server не ветвится по типу backend.
@@ -546,7 +557,16 @@ def _create_session_backend(
     Возвращает ``(backend, parent_reader_still_owned)``: в inline режиме reader
     переходит во владение backend (закрывается его finish_close); в process
     режиме reader остаётся временным parent-объектом и его закрывает вызывающий
-    сразу после успешного init (§8.3)."""
+    сразу после успешного init (§8.3).
+
+    Роль/имя/current-root/карта имён расширений (v1.34.0) уже вычислены сервером
+    через ``detect_extension_context`` и едут JSON-safe примитивами — внутри
+    сессии detector не повторяется."""
+    # Защитная проверка топологии корней ДО создания backend: на активном
+    # BSL-пути пересекающиеся base/ext дали бы двойной учёт одного дерева.
+    # В generic-режиме валидация не выполняется — provenance там не используется.
+    if format_info is not None and enable_bsl_helpers:
+        validate_root_topology(resolved, list(ext_paths_for_sandbox or []))
     if sandbox_mode == "process":
         from rlm_tools_bsl.sandbox_process import (
             ProcessBackendConfig,
@@ -566,11 +586,27 @@ def _create_session_backend(
             enable_bsl_helpers=enable_bsl_helpers,
             max_llm_calls=session.max_llm_calls,
             llm_calls_used=session.llm_calls_used,
+            current_config_role=current_config_role,
+            current_config_name=current_config_name,
+            current_config_root=current_config_root,
+            extension_name_by_root=dict(extension_name_by_root or {}),
         )
+
+        def _startup_unregister(candidate) -> None:
+            # Сначала ДИАГНОСТИКА, затем ОБЯЗАТЕЛЬНО передача в reaper. Lifecycle-
+            # cleanup живёт в `finally`: исключение drain-а ловится и логируется, но
+            # не пропускает reaper-transfer и не подменяет исходный SandboxClosedError.
+            try:
+                _drain_startup_log_records(session.session_id, candidate)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("sandbox: session=%s startup drain failed", session.session_id, exc_info=True)
+            finally:
+                _reap_failed_starting_backend(candidate)
+
         backend = ProcessSandboxBackend(
             config,
             startup_register=lambda candidate: _track_starting_backend(candidate, registry_epoch),
-            startup_unregister=_reap_failed_starting_backend,
+            startup_unregister=_startup_unregister,
         )
         return backend, True
 
@@ -583,6 +619,10 @@ def _create_session_backend(
         idx_zero_callers_authoritative=callers_authoritative,
         extension_paths=ext_paths_for_sandbox,
         enable_bsl_helpers=enable_bsl_helpers,
+        current_config_role=current_config_role,
+        current_config_name=current_config_name,
+        current_config_root=current_config_root,
+        extension_name_by_root=dict(extension_name_by_root or {}),
     )
     backend = InlineSandboxBackend(
         sandbox,
@@ -591,6 +631,23 @@ def _create_session_backend(
         llm_calls_used=session.llm_calls_used,
     )
     return backend, False
+
+
+def _drain_startup_log_records(session_id: str, backend) -> None:
+    """Записать startup-предупреждения воркера в ``server.log`` (v1.34.0).
+
+    Читает READ-ONCE свойство backend и пишет каждую запись ПАРАМЕТРИЗОВАННЫМ
+    вызовом логгера (не format-string из worker), сохраняя связь с сессией.
+    В inline-backend свойство всегда пусто — там логгер и так родительский.
+    В public JSON-ответ строки НЕ копируются: это диагностика оператора.
+    """
+    try:
+        records = getattr(backend, "startup_log_records", None) or []
+    except Exception:  # pragma: no cover - диагностика не имеет права ломать lifecycle
+        logger.warning("sandbox: session=%s startup log drain failed", session_id, exc_info=True)
+        return
+    for record in records:
+        logger.warning("sandbox: session=%s %s", session_id, record)
 
 
 def _session_warnings(source_support: SourceSupport, ext_warnings: list[str]) -> list[str]:
@@ -796,8 +853,11 @@ def _rlm_start(
                         idx_version = int(idx_stats.get("builder_version") or 0)
                         if idx_version < BUILDER_VERSION:
                             msg = (
-                                f"Index built with v{idx_version}, current v{BUILDER_VERSION} — "
-                                f'new helpers available after rebuild: rlm-bsl-index index build "{resolved}"'
+                                f"Индекс собран сборщиком v{idx_version}, текущий v{BUILDER_VERSION}. "
+                                "Он продолжает работать, но содержит объявления и движения, взятые "
+                                "из комментариев и строковых литералов. Следующий 'rlm-bsl-index "
+                                f'index update "{resolved}"\' пересоберет индекс полностью — '
+                                "это разовая длительная операция."
                             )
                             idx_warnings.append(msg)
                             logger.warning("rlm_start: session=%s %s", session_id, msg)
@@ -900,9 +960,20 @@ def _rlm_start(
         _callers_authoritative = idx_status == IndexStatus.FRESH and idx_reader is not None and idx_reader.has_calls
 
         t_step = time.monotonic()
-        ext_paths_for_sandbox = (
-            [e.path for e in ext_context.nearby_extensions] if ext_context.current.role == ConfigRole.MAIN else []
+        # Foundation-фильтр (v1.34.0): directory symlink/junction рядом с базой
+        # может указывать ВНУТРЬ current root. Такой alias — не соседний
+        # source-root, а второй путь к уже учтённому дереву: пропустив его в BSL
+        # transport, мы получили бы либо topology-отказ штатного rlm_start, либо
+        # двойной учёт тех же файлов. Публичный ext_context НЕ меняется —
+        # index-builder и override-consumers видят прежний состав.
+        _current_root_for_bsl = ext_context.current.path or resolved
+        _nearby_for_bsl = (
+            filter_alias_extension_infos(_current_root_for_bsl, ext_context.nearby_extensions)
+            if ext_context.current.role == ConfigRole.MAIN
+            else []
         )
+        ext_paths_for_sandbox = [e.path for e in _nearby_for_bsl]
+        ext_name_by_root = {e.path: e.name for e in _nearby_for_bsl if e.path and e.name}
         backend, parent_owns_reader = _create_session_backend(
             sandbox_mode=sandbox_mode,
             resolved=resolved,
@@ -916,7 +987,12 @@ def _rlm_start(
             ext_paths_for_sandbox=ext_paths_for_sandbox,
             registry_epoch=registry_epoch,
             enable_bsl_helpers=not generic_mode,
+            current_config_role=ext_context.current.role.value,
+            current_config_name=ext_context.current.name or "",
+            current_config_root=_current_root_for_bsl,
+            extension_name_by_root=ext_name_by_root,
         )
+        _drain_startup_log_records(session_id, backend)
         if not parent_owns_reader:
             # inline: reader теперь во владении backend — не закрывать вторично.
             idx_reader = None
@@ -1108,6 +1184,15 @@ def _rlm_start(
         # No index loaded — SAME key set with safe defaults so the payload shape is stable
         # (strategy/docs tell the agent to read these from rlm_start.index; a missing key
         # would break that or push agents back to a get_index_info() call).
+        _incomplete_status = "incomplete" if (index_incomplete(db_path) or idx_load_failed) else "missing"
+        if _incomplete_status == "incomplete":
+            # v1.33.0: раньше здесь выставлялся только машинный index_status, а
+            # idx_warnings оставался пустым — человек и агент об оборванной сборке
+            # не узнавали. Текст без «ё» (ломает совпадение по ключевым словам).
+            idx_warnings.append(
+                "Предыдущая пересборка индекса не была завершена. Повторите "
+                "'rlm-bsl-index index update' — это доведет сборку до конца."
+            )
         index_block = {
             "loaded": index_loaded,
             "index_check": "quick",
@@ -1136,7 +1221,7 @@ def _rlm_start(
             # — the marker may already be cleared by a finishing rebuild, so "missing" would
             # lie; "incomplete" signals retry — codex Low). Else "missing". index_incomplete
             # is None-safe → a non-existent db yields "missing".
-            "index_status": "incomplete" if (index_incomplete(db_path) or idx_load_failed) else "missing",
+            "index_status": _incomplete_status,
             "warnings": idx_warnings,
         }
 
@@ -1385,7 +1470,13 @@ def _rlm_execute(
 
         session.execute_calls += 1
         try:
-            result = backend.execute(code)
+            try:
+                result = backend.execute(code)
+            finally:
+                # На успешном пути этот finally выполняется ДО _finish_rlm_execute,
+                # поэтому startup-записи идут перед runtime-записями, а повторный
+                # drain видит пустой read-once буфер.
+                _drain_startup_log_records(session_id, backend)
         except SandboxClosedError:
             return json.dumps(
                 {"error": f"Session '{session_id}' was closed during execution (rlm_end/eviction/shutdown)"},
@@ -1420,6 +1511,11 @@ def _rlm_execute(
 
 def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0) -> str:
     session_id = session.session_id
+    # Runtime WARNING+ из воркера — ПОСЛЕ возврата валидированного результата, но ДО
+    # сериализации public response. Параметризованный вызов логгера; в ответ агенту
+    # строки не уезжают.
+    for record in getattr(result, "log_records", None) or []:
+        logger.warning("sandbox: session=%s %s", session_id, record)
     elapsed = time.monotonic() - t0
     # Log helper calls with timing (grouped by name)
     helpers_summary = ""
@@ -1741,7 +1837,9 @@ def _rlm_help_dispatch(
                 "rlm_help(topic='проведение'|'печать'|'обмен'|...) → recipe for a domain. "
                 "rlm_help(category='discovery'|'code'|...) → list helpers in a category. "
                 "rlm_help(helpers=['name1','name2']) → details. "
-                "rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io'|'critical')."
+                "rlm_help(section='workflow'|'disambiguation'|'performance'|'batching'|'io'|'critical'). "
+                "Не уверен, что означают source/owner/extensions_included/total_exact/partial/"
+                "index_coverage/truncated/scope → rlm_help(section='coverage')."
             ),
         }
         return json.dumps({"mode": "menu", "result": result, "warnings": warnings}, ensure_ascii=False)
@@ -1886,11 +1984,13 @@ if get_strategy_mode() == "slim":
             Field(description="Helper category to list (one-line entries: name+sig, no recipes)"),
         ] = None,
         section: Annotated[
-            Literal["workflow", "disambiguation", "performance", "batching", "io", "critical"] | None,
+            Literal["workflow", "disambiguation", "performance", "batching", "io", "critical", "coverage"] | None,
             Field(
                 description=(
                     "Strategy section to fetch. 'disambiguation' returns a structured array of "
                     "overlapping-helper pairs (use with helpers=[a,b] to narrow to one pair). "
+                    "'coverage' — как читать полноту ответа (source/owner/extensions_included/"
+                    "total_exact/partial/index_coverage/truncated/scope). "
                     "Other values return raw text."
                 )
             ),
@@ -2916,6 +3016,51 @@ def _warmup_imports():
     logger.info("warmup: completed in %.1fs", time.monotonic() - _t0)
 
 
+def _prepare_stdio_transport():
+    """Развести дескрипторы и выбрать способ запуска stdio-транспорта.
+
+    Возвращает `(restore, runner)`: `runner is None` означает «поднимать
+    транспорт обычным `mcp.run()`».
+
+    Предпочтительный путь — отдать транспорту провода ЯВНО, оставив
+    `sys.stdin`/`sys.stdout` на отводах: тогда посторонний `print()` из любого
+    кода процесса физически не может попасть в JSON-RPC поток. Точка входа
+    FastMCP для этого резолвится ДО разводки: если её не окажется, поднимать
+    транспорт с уже уведённым fd 1 нельзя — ответы молча ушли бы в stderr,
+    поэтому в этом случае разводка выполняется с подменой sys-потоков, а
+    транспорт запускается штатно.
+    """
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    from rlm_tools_bsl._stdio_hardening import harden_stdio_for_children
+
+    low_level = getattr(mcp, "_mcp_server", None)
+    explicit_streams = callable(getattr(low_level, "run", None)) and callable(
+        getattr(low_level, "create_initialization_options", None)
+    )
+
+    hardening = harden_stdio_for_children(swap_sys_streams=not explicit_streams)
+    logger.info("stdio hardening: applied=%s (%s)", hardening.applied, hardening.detail)
+    if not explicit_streams:
+        logger.warning(
+            "stdio transport: точка входа FastMCP недоступна — протокол берётся из sys-потоков, "
+            "посторонний вывод в stdout не изолирован от протокола"
+        )
+
+    if not (explicit_streams and hardening.applied):
+        return hardening.restore, None
+
+    async def _serve() -> None:
+        async with stdio_server(
+            stdin=anyio.wrap_file(hardening.wire_stdin),
+            stdout=anyio.wrap_file(hardening.wire_stdout),
+        ) as (read_stream, write_stream):
+            await low_level.run(read_stream, write_stream, low_level.create_initialization_options())
+
+    return hardening.restore, lambda: anyio.run(_serve)
+
+
 def main():
     global session_manager
     from rlm_tools_bsl._config import load_project_env
@@ -2941,6 +3086,12 @@ def main():
         except (AttributeError, OSError, ValueError):
             pass
 
+    # A service command must keep the config selected by the CALLER. The .env loaded
+    # below may legitimately contain RLM_CONFIG_FILE for ordinary server/CLI work, but
+    # allowing it to redirect `service install` means we stop reading the very config
+    # whose settings are supposed to survive the reinstall.
+    config_file_was_set = "RLM_CONFIG_FILE" in os.environ
+    config_file_before_env = os.environ.get("RLM_CONFIG_FILE")
     load_project_env()
 
     from rlm_tools_bsl.projects import get_registry, seed_project_from_env
@@ -2965,10 +3116,18 @@ def main():
         default=os.environ.get("RLM_HOST", "127.0.0.1"),
         help="Bind host for HTTP transport (env: RLM_HOST, default: 127.0.0.1)",
     )
+    # Parsed defensively: this default is computed while the parser is BUILT, so a
+    # RLM_PORT of "not-a-number" used to abort every invocation -- `--version` and
+    # `service install --help` included -- before argparse could say anything useful.
+    from rlm_tools_bsl.service import DEFAULT_PORT, _first_port
+
+    env_port = _first_port(os.environ.get("RLM_PORT"))
+    if env_port is None and os.environ.get("RLM_PORT"):
+        logger.warning("RLM_PORT=%r is not a valid port, using %d", os.environ["RLM_PORT"], DEFAULT_PORT)
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("RLM_PORT", "9000")),
+        default=env_port or DEFAULT_PORT,
         help="Bind port for HTTP transport (env: RLM_PORT, default: 9000)",
     )
 
@@ -2977,16 +3136,56 @@ def main():
     service_sub = service_parser.add_subparsers(dest="service_action")
 
     install_p = service_sub.add_parser("install", help="Install and enable the service")
-    install_p.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-    install_p.add_argument("--port", type=int, default=9000, help="Bind port (default: 9000)")
-    install_p.add_argument("--env", default=None, metavar="PATH", help="Path to .env file")
+    # Defaults are resolved in service.resolve_install_settings(), NOT here: an omitted
+    # flag means "keep what the previous installation used", so that re-running the
+    # installer to upgrade cannot silently reset the service to 127.0.0.1:9000.
+    install_p.add_argument(
+        "--host",
+        default=None,
+        help="Bind host (default: saved value, then env RLM_HOST, then 127.0.0.1)",
+    )
+    install_p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port (default: saved value, then env RLM_PORT, then 9000)",
+    )
+    # --env and --no-env answer the same question, so let argparse reject the pair
+    # instead of silently letting one of them win.
+    env_group = install_p.add_mutually_exclusive_group()
+    env_group.add_argument(
+        "--env",
+        default=None,
+        metavar="PATH",
+        help="Path to .env file (default: keep the saved one)",
+    )
+    env_group.add_argument(
+        "--no-env",
+        action="store_true",
+        dest="no_env",
+        help="Start the SERVICE without any .env file (drops the saved path). "
+        "Does not affect the environment of this install command itself",
+    )
 
-    for _action in ("start", "stop", "status", "uninstall"):
+    for _action in ("start", "stop", "status"):
         service_sub.add_parser(_action)
+
+    uninstall_p = service_sub.add_parser("uninstall", help="Stop and remove the service")
+    uninstall_p.add_argument(
+        "--purge",
+        action="store_true",
+        help="Also delete service.json (host/port/.env settings)",
+    )
 
     args = parser.parse_args()
 
     if args.command == "service":
+        if config_file_was_set:
+            # Membership above also covers an explicitly empty value. Keep it exact;
+            # _config_path() deliberately treats empty as the default path.
+            os.environ["RLM_CONFIG_FILE"] = config_file_before_env or ""
+        else:
+            os.environ.pop("RLM_CONFIG_FILE", None)
         from rlm_tools_bsl.service import handle_service_command
 
         handle_service_command(args)
@@ -3090,11 +3289,32 @@ def main():
     except Exception as exc:
         logger.warning("cleanup_stale_cache failed: %s", exc)
 
+    # stdio: увести fd 0/1 с протокольных труб ДО старта транспорта и любого
+    # спавна. Иначе дочерний Python (sandbox-worker) наследует стандартные
+    # хэндлы родителя и зависает внутри инициализации интерпретатора на pipe,
+    # где транспорт держит блокирующее чтение (CPython gh-78961). Best-effort:
+    # неудача разводки не имеет права сорвать старт сервера.
+    stdio_restore = None
+    run_stdio = None
+    if args.transport == "stdio":
+        try:
+            stdio_restore, run_stdio = _prepare_stdio_transport()
+        except Exception as exc:
+            logger.warning("stdio hardening failed: %s: %s", type(exc).__name__, exc)
+
     _begin_sandbox_backend_lifecycle()
     try:
         threading.Thread(target=_warmup_imports, daemon=True).start()
-        mcp.run(transport=args.transport)
+        if run_stdio is not None:
+            run_stdio()
+        else:
+            mcp.run(transport=args.transport)
     finally:
         # Не полагаться на daemon-семантику процессов: явный bounded shutdown
         # всех sandbox workers с единым deadline (§13.6).
         _shutdown_all_sandbox_backends()
+        if stdio_restore is not None:
+            try:
+                stdio_restore()
+            except Exception as exc:  # shutdown-путь: диагностика, но не новая ошибка
+                logger.warning("stdio hardening restore failed: %s: %s", type(exc).__name__, exc)

@@ -18,12 +18,18 @@ import sqlite3
 import subprocess
 import threading
 import time
+from bisect import insort
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
-from rlm_tools_bsl.bsl_knowledge import BSL_PATTERNS, _merge_proc_continuations
+from rlm_tools_bsl._git_process import run_git
+from rlm_tools_bsl.bsl_knowledge import (
+    BSL_PATTERNS,
+    _merge_proc_continuations_with_mask,
+    mask_comments_and_strings,
+)
 from rlm_tools_bsl.cache import _paths_hash
 from rlm_tools_bsl.format_detector import BslFileInfo, parse_bsl_path
 from rlm_tools_bsl.bsl_xml_parsers import (
@@ -35,7 +41,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
 
 logger = logging.getLogger(__name__)
 
-BUILDER_VERSION = 14
+BUILDER_VERSION = 15
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -1080,15 +1086,6 @@ _GLOBAL_TABLE_BY_CATEGORY: dict[str, str] = {
 
 _git_exe: str | None | bool = None  # cached: str=path, False=not found, None=not yet searched
 
-# Common kwargs for all git subprocess calls.
-# errors="replace" handles cp1251 stderr from git on Windows services.
-_GIT_SUBPROCESS_KW: dict = {
-    "capture_output": True,
-    "text": True,
-    "encoding": "utf-8",
-    "errors": "replace",
-}
-
 
 class _GitDirtyResult(NamedTuple):
     """Result of a git dirty / changed-files detection.
@@ -1147,6 +1144,20 @@ def _parse_numstat_paths(stdout: str) -> set[str]:
     return paths
 
 
+def _abs_git_exe(path: str) -> str:
+    """Windows: абсолютный путь к git.exe; на POSIX — без изменений.
+
+    ``run_git`` на Windows создаёт процесс напрямую через ``CreateProcessW`` и
+    передаёт ``lpApplicationName``, а тот PATH не ищет. ``shutil.which`` уже
+    возвращает абсолютный путь в подавляющем большинстве случаев, но
+    нормализация обязана произойти **до** записи в кеш, иначе относительный
+    результат осел бы в ``_git_exe`` на весь процесс.
+    """
+    if os.name != "nt":
+        return path
+    return os.path.abspath(path)
+
+
 def _find_git() -> str | None:
     """Resolve git executable path (cached).
 
@@ -1159,8 +1170,8 @@ def _find_git() -> str | None:
 
     found = shutil.which("git")
     if found:
-        _git_exe = found
-        logger.debug("_find_git: shutil.which → %s", found)
+        _git_exe = _abs_git_exe(found)
+        logger.debug("_find_git: shutil.which → %s", _git_exe)
         return _git_exe
 
     # Windows fallback: check common locations
@@ -1172,8 +1183,8 @@ def _find_git() -> str | None:
         ]
         for c in candidates:
             if os.path.isfile(c):
-                _git_exe = c
-                logger.info("_find_git: found at %s (PATH fallback)", c)
+                _git_exe = _abs_git_exe(c)
+                logger.info("_find_git: found at %s (PATH fallback)", _git_exe)
                 return _git_exe
         # Registry fallback
         try:
@@ -1185,8 +1196,8 @@ def _find_git() -> str | None:
                         install_path = winreg.QueryValueEx(key, "InstallPath")[0]
                         candidate = os.path.join(install_path, "cmd", "git.exe")
                         if os.path.isfile(candidate):
-                            _git_exe = candidate
-                            logger.info("_find_git: found at %s (registry)", candidate)
+                            _git_exe = _abs_git_exe(candidate)
+                            logger.info("_find_git: found at %s (registry)", _git_exe)
                             return _git_exe
                 except OSError:
                     pass
@@ -1219,23 +1230,13 @@ def _git_available(base_path: str) -> bool:
         logger.debug("_git_available: _find_git returned None")
         return False
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "--is-inside-work-tree"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "--is-inside-work-tree"], timeout=10)
         ok = r.returncode == 0 and r.stdout.strip() == "true"
         if not ok:
-            logger.info(
-                "_git_available: cmd=%s rc=%d stdout=%r stderr=%r",
-                cmd[0],
-                r.returncode,
-                r.stdout.strip(),
-                r.stderr.strip()[:200],
-            )
+            logger.info("_git_available: rc=%d", r.returncode)
         return ok
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
-        logger.info("_git_available: exception %s: %s", type(exc).__name__, exc)
+        logger.info("_git_available: exception %s", type(exc).__name__)
         return False
 
 
@@ -1249,11 +1250,7 @@ def _git_repo_info(base_path: str) -> tuple[str, str] | None:
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "--show-toplevel"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "--show-toplevel"], timeout=10)
         if r.returncode != 0:
             return None
         git_root = r.stdout.strip()
@@ -1271,11 +1268,7 @@ def _git_head_sha(base_path: str) -> str | None:
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "rev-parse", "HEAD"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=10,
-        )
+        r = run_git([*cmd, "rev-parse", "HEAD"], timeout=10)
         return r.stdout.strip() if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -1296,11 +1289,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     if cmd is None:
         return None
     try:
-        r = subprocess.run(
-            [*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"],
-            **_GIT_SUBPROCESS_KW,
-            timeout=60,
-        )
+        r = run_git([*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"], timeout=60)
         if r.returncode != 0:
             return None
     except (subprocess.TimeoutExpired, OSError):
@@ -1313,7 +1302,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     def _run_critical(args: list[str]) -> set[str] | None:
         """Run a critical git command; ``None`` on failure aborts the fast path."""
         try:
-            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=60)
+            r = run_git(args, timeout=60)
             if r.returncode != 0:
                 return None
             return _lines_to_set(r.stdout)
@@ -1329,7 +1318,7 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
         """
         nonlocal unreliable_reason
         try:
-            r = subprocess.run(args, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            r = run_git(args, timeout=best_effort_timeout)
             if r.returncode != 0:
                 logger.info("_git_changed_files: %s rc=%d, marking unreliable", label, r.returncode)
                 if unreliable_reason is None:
@@ -1446,7 +1435,7 @@ def _git_current_dirty(base_path: str, prefix: str) -> _GitDirtyResult:
     def _run(cmd: list[str], label: str, parser=_lines_to_set) -> set[str]:
         nonlocal unreliable_reason
         try:
-            r = subprocess.run(cmd, **_GIT_SUBPROCESS_KW, timeout=best_effort_timeout)
+            r = run_git(cmd, timeout=best_effort_timeout)
             if r.returncode == 0:
                 return parser(r.stdout)
             if unreliable_reason is None:
@@ -1691,8 +1680,18 @@ def _git_grep(
 
     The one and only place that shells out to ``git grep``. Searches the working
     tree (tracked files as they are on disk, including uncommitted edits) plus
-    untracked-but-not-ignored files (``--untracked``); ``.gitignore``'d paths are
-    intentionally skipped.
+    untracked files (``--untracked``).
+
+    **Ignore/binary semantics differ by branch, and the difference is deliberate:**
+
+    * the general (*path*/*file_types*) branch keeps ``-I`` and honours
+      ``.gitignore`` — for a whole-tree search, skipping ignored and
+      binary-classified files is documented behaviour;
+    * the trusted ``literal_files`` branch adds ``--no-exclude-standard`` and uses
+      ``--text`` instead of ``-I``. There the file list is an exact set the server
+      built from its own catalogue, so "search exactly these files" must not depend
+      on ``.gitignore`` or on ``*.bsl binary`` in ``.gitattributes``: a silent skip
+      there is a lost hit that the Python fallback would no longer re-read either.
 
     Parameters:
       * *pattern* — literal substring (default) or POSIX ERE when *regex* is True.
@@ -1715,11 +1714,16 @@ def _git_grep(
       * *mode* — ``"lines"`` → ``[{file, line, text}]``; ``"files"`` → ``[{file}]``.
       * *max_results* — hard cap on returned records.
       * *max_per_file* — per-file match cap (``-m``), anti-noise for heavy files
-        (lines mode only).
-      * *include_truncation_sentinel* — when True and the result was capped, the
-        last element is ``{"_truncated": True, "shown": N}``. Kept False for
-        ``safe_grep`` whose strict ``[{file, line, text}]`` contract internal
-        callers rely on.
+        (lines mode only). Git is actually run with ``-m max_per_file + 1``: the
+        extra probe line is dropped from the result but raises the truncation
+        flag, so hitting the per-file cap stops being indistinguishable from an
+        honest "that's all there was". ``max_per_file=0`` disables the cap and the
+        probe alike.
+      * *include_truncation_sentinel* — when True and the result was capped **by
+        either cap** (per-file OR global *max_results*), the last element is
+        ``{"_truncated": True, "shown": N}`` where ``N`` is the number of ordinary
+        rows after both slices. Kept False for ``safe_grep`` whose strict
+        ``[{file, line, text}]`` contract internal callers rely on.
 
     Returns a list of dicts, or **``None``** on a real failure (git unavailable,
     rc≥2, timeout, or a malformed filter). ``None`` is distinct from ``[]`` (zero
@@ -1795,19 +1799,35 @@ def _git_grep(
                 pathspecs.append(f":(glob,exclude)**/{e}")  # file/dir node, any depth
 
     output_flag = "-l" if mode == "files" else "-n"
-    grep_cmd = [*cmd, "grep", "-z", "--untracked", "--no-color", "-I", output_flag]
+    grep_cmd = [*cmd, "grep", "-z", "--untracked", "--no-color"]
+    if literal_files is not None:
+        # ДОВЕРЕННЫЙ ТОЧНЫЙ набор: список сформировал сам сервер из своего каталога,
+        # и «искать ровно в этих файлах» не должно зависеть ни от .gitignore
+        # (``--untracked`` молча пропускает игнорируемые тем же rc=0, после чего
+        # Python-ветка эти пути уже не читает), ни от ``*.bsl binary`` в
+        # .gitattributes (``-I`` так же молча пропускал бы валидный текстовый BSL).
+        grep_cmd += ["--no-exclude-standard", "--text"]
+    else:
+        grep_cmd.append("-I")
+    grep_cmd.append(output_flag)
     if ignore_case:
         grep_cmd.append("-i")
-    if mode == "lines" and max_per_file and max_per_file > 0:
-        grep_cmd += ["-m", str(max_per_file)]
+    # Probe ``max_per_file + 1``: с ровно ``max_per_file`` упор в per-file cap
+    # неотличим от честного «столько и было», и 51 совпадение в одном файле при
+    # общем max_results=200 возвращалось как 50 строк БЕЗ признака усечения.
+    per_file_probe = mode == "lines" and bool(max_per_file) and max_per_file > 0
+    if per_file_probe:
+        grep_cmd += ["-m", str(max_per_file + 1)]
     grep_cmd.append("-E" if regex else "-F")
     grep_cmd += ["-e", pattern, "--", *pathspecs]
 
     t = timeout if timeout is not None else _git_grep_timeout()
     try:
-        r = subprocess.run(grep_cmd, **_GIT_SUBPROCESS_KW, timeout=t)
+        r = run_git(grep_cmd, timeout=t)
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
-        logger.info("_git_grep: %s: %s", type(exc).__name__, exc)
+        # В лог — только класс исключения: argv несёт repo path и grep-pattern.
+        # Agent-facing ``detail`` остаётся прежним.
+        logger.info("_git_grep: %s", type(exc).__name__)
         kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "spawn_failed"
         return _fail(kind, detail=f"{type(exc).__name__}: {exc}")
 
@@ -1818,11 +1838,17 @@ def _git_grep(
         # git ЗАПУСТИЛСЯ и сам объяснил, что не так (битый ERE → rc=128 + "Invalid preceding
         # regular expression" / "unmatched ( for expression group"). Его вердикт точнее любой
         # эвристики на нашей стороне: он называет и pattern, и причину.
-        logger.info("_git_grep: rc=%d stderr=%r", rc, (r.stderr or "")[:200])
+        # rc — контролируемое число; сырой stderr git содержит и pattern, и пути,
+        # поэтому в server.log он не попадает (агенту отдаётся как прежде).
+        logger.info("_git_grep: rc=%d", rc)
         return _fail("rc", rc=rc, stderr=(r.stderr or "")[:500])
 
     stdout = r.stdout or ""
     results: list[dict] = []
+    # Единый внутренний флаг усечения: per-file ИЛИ global. Публичная обёртка
+    # снимает sentinel и переносит значение в ``truncated``.
+    capped = False
+    per_file_counts: dict[str, int] = {}
     if mode == "files":
         # ``-l -z`` → NUL-separated paths (printed verbatim).
         for f in stdout.split("\x00"):
@@ -1843,12 +1869,21 @@ def _git_grep(
                 ln = int(lineno)
             except ValueError:
                 continue
+            if per_file_probe:
+                seen = per_file_counts.get(f, 0) + 1
+                per_file_counts[f] = seen
+                if seen > max_per_file:
+                    # Probe-строка: число обычных строк файла остаётся прежним
+                    # (max_per_file), но упор теперь ВИДЕН.
+                    capped = True
+                    continue
             results.append({"file": f, "line": ln, "text": text.strip()})
 
     if len(results) > max_results:
         results = results[:max_results]
-        if include_truncation_sentinel:
-            results.append({"_truncated": True, "shown": max_results})
+        capped = True
+    if capped and include_truncation_sentinel:
+        results.append({"_truncated": True, "shown": len(results)})
     return results
 
 
@@ -2278,38 +2313,65 @@ def _scan_module(lines: list[str]):
     """
     in_string = False
     for lineno, raw in enumerate(lines, start=1):
+        # v1.33.0: комментарий между строками-продолжениями многострочного литерала
+        # 1С допускает, и состояние он НЕ меняет. Без этого правила закомментированный
+        # конец запроса (`//|  Поле";`) закрывал бы литерал, и разбор рассинхронизировался
+        # бы до конца модуля. См. mask_comments_and_strings в bsl_knowledge.
+        if in_string and raw.lstrip().startswith("//"):
+            yield lineno, "", []
+            continue
         n = len(raw)
+        # Быстрый путь: строка ВНЕ литерала, где нет кавычек, — это чистый код
+        # (с возможным хвостом-комментарием). Ни одного посимвольного шага и ни
+        # одной склейки. Так идёт большинство строк, и именно это делает скан
+        # дешёвым на ЕРП-масштабе.
+        if not in_string:
+            q = raw.find('"')
+            c = raw.find("//")
+            if q < 0:
+                yield lineno, (raw if c < 0 else raw[:c]), []
+                continue
+            if 0 <= c < q:  # комментарий начинается раньше литерала
+                yield lineno, raw[:c], []
+                continue
+
+        # Медленный путь — та же машина состояний, но прыжками по str.find и
+        # срезами вместо символ-за-символом (семантика идентична посимвольной
+        # версии, покрыта тестом эквивалентности на боевых исходниках).
         i = 0
-        code_chars: list[str] = []
+        code_parts: list[str] = []
         strings: list[str] = []
         seg_start = 0 if in_string else -1
         while i < n:
-            ch = raw[i]
             if in_string:
-                if ch == '"':
-                    if i + 1 < n and raw[i + 1] == '"':
-                        i += 2  # escaped "" — stays inside the string
-                        continue
-                    strings.append(raw[seg_start:i])
-                    in_string = False
-                    seg_start = -1
-                    i += 1
-                else:
-                    i += 1
+                j = raw.find('"', i)
+                if j < 0:
+                    break  # литерал продолжается на следующей строке
+                if j + 1 < n and raw[j + 1] == '"':
+                    i = j + 2  # экранированная "" — остаёмся внутри литерала
+                    continue
+                strings.append(raw[seg_start:j])
+                in_string = False
+                seg_start = -1
+                i = j + 1
             else:
-                if ch == '"':
+                q = raw.find('"', i)
+                c = raw.find("//", i)
+                if q < 0 and c < 0:
+                    code_parts.append(raw[i:])
+                    break
+                if q >= 0 and (c < 0 or q < c):
+                    code_parts.append(raw[i:q])
                     in_string = True
-                    seg_start = i + 1
-                    i += 1
-                elif ch == "/" and i + 1 < n and raw[i + 1] == "/":
-                    break  # line comment — rest is neither code nor string
+                    seg_start = q + 1
+                    i = q + 1
                 else:
-                    code_chars.append(ch)
-                    i += 1
+                    code_parts.append(raw[i:c])
+                    break  # комментарий — остаток строки не код и не литерал
         if in_string:
-            # literal continues onto the next line — emit what we have here
+            # литерал продолжается на следующей строке — отдаём накопленное здесь
             strings.append(raw[seg_start:])
-        yield lineno, "".join(code_chars), strings
+        yield lineno, "".join(code_parts), strings
 
 
 def _extract_code_usages(
@@ -2384,23 +2446,30 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
     Returns list of dicts: {name, type, line, end_line, is_export, params, loc}.
     Здесь ``params`` — СЫРАЯ строка сигнатуры (build-time, хранится в TEXT-колонке).
     На helper-границе ``_split_params`` превращает её в list[str] для агента (v1.18.0).
+
+    v1.33.0: и матч сигнатуры, и поиск ``КонецПроцедуры``, и решение о склейке идут
+    по МАСКЕ (комментарии и содержимое строковых литералов погашены), а ``params``
+    вырезается из ОРИГИНАЛА по смещениям маски — она посимвольно той же длины,
+    поэтому строковый дефолт (``Знач Адрес = "http://x/y"``) сохраняется дословно.
     """
-    merged_lines, line_map = _merge_proc_continuations(lines)
+    masked = mask_comments_and_strings(lines)
+    merged_lines, merged_masked, line_map = _merge_proc_continuations_with_mask(lines, masked)
     total_merged = len(merged_lines)
     total_orig = len(lines)
 
     procedures: list[dict] = []
     m_idx = 0
     while m_idx < total_merged:
-        merged = merged_lines[m_idx]
-        m = _PROC_DEF_RE.search(merged)
+        m = _PROC_DEF_RE.search(merged_masked[m_idx])
         if not m:
             m_idx += 1
             continue
 
+        original = merged_lines[m_idx]
         proc_type = m.group(1)
         proc_name = m.group(2)
-        params = m.group(3).strip() if m.group(3) else ""
+        # params — из ОРИГИНАЛА по смещениям маски (см. докстринг).
+        params = original[m.start(3) : m.end(3)].strip() if m.group(3) is not None else ""
         is_export = m.group(4) is not None and m.group(4).strip() != ""
         line_number = line_map[m_idx]  # 1-based original line
 
@@ -2410,7 +2479,9 @@ def _parse_procedures_from_lines(lines: list[str]) -> list[dict]:
 
         end_line: int | None = None
         for orig_idx in range(scan_from, total_orig):
-            if _PROC_END_RE.search(lines[orig_idx]):
+            # По маске: строковый литерал "КонецПроцедуры" в начале строки обманул бы
+            # заякоренный _PROC_END_RE и оборвал тело раньше времени.
+            if _PROC_END_RE.search(masked[orig_idx]):
                 end_line = orig_idx + 1
                 break
 
@@ -2743,46 +2814,6 @@ def _collect_metadata_tables(
             return cat in _METADATA_REFERENCES_TRIGGER_CATEGORIES
         return cat in _active_ref_cats
 
-    # Match <Name>X</Name> (CF) and <name>X</name> (EDT) — case-sensitive on tag name
-    _NAME_RE_CACHE: dict[str, re.Pattern] = {}
-
-    def _name_re(name: str) -> re.Pattern:
-        pat = _NAME_RE_CACHE.get(name)
-        if pat is None:
-            pat = re.compile(rf"<\s*[Nn]ame\s*>{re.escape(name)}<\s*/\s*[Nn]ame\s*>")
-            _NAME_RE_CACHE[name] = pat
-        return pat
-
-    def _line_for_ref(ref: dict, content_lines: list[str] | None) -> int | None:
-        """Best-effort line lookup for attribute-level refs.
-
-        Looks up `<Name>AttrName</Name>` in the file content. Cheap (one regex scan
-        per attribute name). Returns None when content is unavailable or the suffix
-        does not encode an attribute name.
-        """
-        if content_lines is None:
-            return None
-        suffix = ref.get("used_in_suffix", "")
-        if not suffix:
-            return None
-        # Suffixes we can resolve: Attribute.X.Type, Dimension.X.Type, Resource.X.Type,
-        # TabularSection.TS.Attribute.X.Type
-        target_name: str | None = None
-        if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
-            parts = suffix.split(".")
-            if len(parts) >= 2:
-                target_name = parts[1]
-        elif suffix.startswith("TabularSection.") and ".Attribute." in suffix:
-            after = suffix.split(".Attribute.", 1)[1]
-            target_name = after.split(".", 1)[0]
-        if not target_name:
-            return None
-        pat = _name_re(target_name)
-        for idx, line in enumerate(content_lines, start=1):
-            if pat.search(line):
-                return idx
-        return None
-
     def _emit_refs(
         parsed_refs: list[dict],
         source_object: str,
@@ -2795,13 +2826,16 @@ def _collect_metadata_tables(
             return
         type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(source_category, source_category)
         used_in_root = f"{type_prefix}.{source_object}"
+        # Индекс якорей строится ОДИН раз на файл: порядок отдачи ссылок парсером не
+        # совпадает с порядком в документе, поэтому резолв идёт по ключу, а не по позиции.
+        anchor = _ref_anchor_index(content_lines)
         for ref in parsed_refs:
             ref_object = ref.get("ref_object", "")
             if not ref_object:
                 continue
             suffix = ref.get("used_in_suffix", "")
             used_in = f"{used_in_root}.{suffix}" if suffix else used_in_root
-            line = _line_for_ref(ref, content_lines)
+            line = anchor.line_for(ref)
             result["metadata_references"].append(
                 (
                     source_object,
@@ -3964,41 +3998,314 @@ def _can_use_pointwise(
 
 
 # ---------------------------------------------------------------------------
-# Pointwise — line-number lookup for attribute-level metadata_references
-# (полный аналог _line_for_ref / _emit_refs из _collect_metadata_tables)
+# Якорь ссылок метаданных: номер строки САМОЙ ссылки (v1.33.0)
+#
+# Заменяет _line_for_ref / _line_for_ref_pointwise, которые искали <Name>X</Name>
+# и отдавали ПЕРВОЕ вхождение имени по файлу: замер на боевых показал, что на
+# 3000 ссылок attribute_type строка НИ РАЗУ не совпала со строкой тега типа,
+# а 30% имён реквизитов встречаются в одном XML больше одного раза.
 # ---------------------------------------------------------------------------
-_POINTWISE_NAME_RE_CACHE: dict[str, re.Pattern] = {}
+_SECTION_OPEN_RE = re.compile(
+    r"<\s*(Attribute|Dimension|Resource|TabularSection"
+    r"|attributes|dimensions|resources|tabularSections)\b"
+)
+_TS_CLOSE_RE = re.compile(r"</\s*(?:TabularSection|tabularSections)\s*>")
+_ANCHOR_NAME_RE = re.compile(r"<\s*[Nn]ame\s*>([^<]+)<\s*/\s*[Nn]ame\s*>")
+_TYPE_BLOCK_OPEN_RE = re.compile(r"<\s*(?:Type|type|valueType)\s*>")
+_TYPE_BLOCK_CLOSE_RE = re.compile(r"</\s*(?:Type|type|valueType)\s*>")
+# Отдельный ТИП внутри блока: его текст нужен, чтобы сопоставить строку с ref_object
+_TYPE_ITEM_RE = re.compile(r"<\s*(?:v8:Type|types)\s*>([^<]+)<")
+# ref_kind -> охватывающий тег (CF-вариант, EDT-вариант). Нужен, чтобы owner и
+# based_on с ОДНИМ ref_object не схлопнулись в одну строку: такие пары есть в боевых
+# конфигурациях, и порядок секций у CF и EDT противоположный.
+_KIND_SECTION_TAGS: dict[str, tuple[str, ...]] = {
+    "owner": ("Owners", "owners"),
+    "based_on": ("BasedOn", "basedOn"),
+}
+
+# Виды, которым v1.33.0 заполняет `line`. Ровно те, что физически проходят через
+# `_emit_refs` (единственный call-site — внутри цикла по `_ATTR_CATEGORIES`) и
+# получают там `content_lines`. Всё остальное пишется своими коллекторами с жёстким
+# `None` и остаётся NULL.
+# ВАЖНО: `subsystem_content` в этот список НЕ входит. Подсистемы собирает отдельный
+# цикл, который аппендит ссылку с `None` напрямую и `_emit_refs` не зовёт;
+# Subsystems нет и в `_ATTR_CATEGORIES`.
+# `characteristic_type` через `_emit_refs` проходит, но резолвится лишь частично
+# (замер на боевых: заполнено 5 из 486), поэтому принудительно возвращается в None:
+# «заполнено у одного процента» — контракт хуже честного NULL.
+_ANCHORED_REF_KINDS: frozenset[str] = frozenset(
+    {
+        "attribute_type",
+        "owner",
+        "based_on",
+        "default_object_form",
+        "default_list_form",
+    }
+)
+
+_TAG_VALUE_RE_CACHE: dict[str, re.Pattern] = {}
 
 
-def _pointwise_name_re(name: str) -> re.Pattern:
-    pat = _POINTWISE_NAME_RE_CACHE.get(name)
+def _tag_value_re(value: str) -> re.Pattern:
+    """Точное значение внутри тега: ``>Document.X<`` или ``="Document.X"``.
+
+    Подстрочный поиск здесь запрещён: ``Document.Заказ`` нашёлся бы внутри
+    ``Document.ЗаказКлиента`` и дал бы чужую строку.
+    """
+    pat = _TAG_VALUE_RE_CACHE.get(value)
     if pat is None:
-        pat = re.compile(rf"<\s*[Nn]ame\s*>{re.escape(name)}<\s*/\s*[Nn]ame\s*>")
-        _POINTWISE_NAME_RE_CACHE[name] = pat
+        e = re.escape(value)
+        pat = re.compile(rf">\s*{e}\s*<|=\s*\"{e}\"")
+        _TAG_VALUE_RE_CACHE[value] = pat
     return pat
 
 
-def _line_for_ref_pointwise(ref: dict, content_lines: list[str] | None) -> int | None:
+_ANCHOR_KIND_BY_TAG = {
+    "attribute": "Attribute",
+    "attributes": "Attribute",
+    "dimension": "Dimension",
+    "dimensions": "Dimension",
+    "resource": "Resource",
+    "resources": "Resource",
+    "tabularsection": "TabularSection",
+    "tabularsections": "TabularSection",
+}
+
+
+class _RefAnchorIndex:
+    """Строки ссылок метаданных: один проход по файлу, резолв ПО КЛЮЧУ ВЛАДЕЛЬЦА + ССЫЛКЕ.
+
+    Почему не «монотонный курсор по файлу»: парсеры отдают ссылки НЕ в порядке
+    документа (у регистров <Resource> в файле раньше <Dimension>, а эмитится позже;
+    у документов <BasedOn> раньше <ChildObjects>, а эмитится позже), поэтому любой
+    позиционный резолвер промахивается или откатывается к началу файла — то есть
+    возвращает первое вхождение имени, а это ровно тот дефект, который тут чинится.
+
+    Почему ключ включает ref_object, а не только имя владельца: составной тип даёт по
+    ссылке на КАЖДЫЙ тип, и все они лежат на РАЗНЫХ строках внутри одного блока <Type>.
+    Максимум на боевых — 266 типов у одного реквизита, растянутых на 266 строк:
+    резолвер, отдающий всем строку контейнера <Type>, промахивается на сотни строк.
+
+    ``line_for`` отдаёт строку КОНКРЕТНОГО типа, если ссылка сопоставлена; иначе строку
+    открывающего <Type>; иначе строку объявления. ``None`` означает «якорь не найден»;
+    подставлять произвольную строку запрещено.
+    """
+
+    _TYPE_LOOKAHEAD = 60
+
+    def __init__(self, content_lines: list[str]) -> None:
+        self._lines = content_lines
+        # ключ владельца -> список экземпляров в порядке файла
+        self._owners: dict[tuple[str, str, str], list[dict]] = {}
+        # ключ владельца -> выбранный экземпляр (кеш: составной тип спрашивает многократно)
+        self._picked: dict[tuple[str, str, str], dict | None] = {}
+        self._plain: dict[tuple[str, str, str], int | None] = {}
+        self._spans: dict[tuple[str, ...], list[tuple[int, int]]] = {}
+        self._build()
+
+    def _collect_types(self, start: int) -> tuple[int | None, dict[str, int]]:
+        """От строки объявления найти блок типа и запомнить строку КАЖДОГО типа."""
+        lines = self._lines
+        block: int | None = None
+        for j in range(start, min(start + self._TYPE_LOOKAHEAD, len(lines))):
+            if _TYPE_BLOCK_OPEN_RE.search(lines[j]):
+                block = j + 1
+                break
+            if _ANCHOR_NAME_RE.search(lines[j]):
+                return None, {}  # начался следующий элемент — у этого типа нет
+        if block is None:
+            return None, {}
+        by_ref: dict[str, int] = {}
+        for j in range(block - 1, len(lines)):
+            for m in _TYPE_ITEM_RE.finditer(lines[j]):
+                canon = canonicalize_type_ref(m.group(1).strip())
+                if canon and canon not in by_ref:
+                    by_ref[canon] = j + 1
+            if j > block - 1 and _TYPE_BLOCK_CLOSE_RE.search(lines[j]):
+                break
+        return block, by_ref
+
+    def _build(self) -> None:
+        cur_kind: str | None = None
+        cur_ts = ""
+        in_ts = False
+        pending_ts_name = False
+        lines = self._lines
+        for idx, line in enumerate(lines):
+            if _TS_CLOSE_RE.search(line):
+                in_ts = False
+                cur_ts = ""
+                cur_kind = None
+            for m in _SECTION_OPEN_RE.finditer(line):
+                tag = _ANCHOR_KIND_BY_TAG.get(m.group(1).lower())
+                if tag == "TabularSection":
+                    in_ts = True
+                    pending_ts_name = True
+                    cur_kind = None
+                else:
+                    cur_kind = tag
+            nm = _ANCHOR_NAME_RE.search(line)
+            if nm is None:
+                continue
+            name = nm.group(1).strip()
+            if pending_ts_name:
+                cur_ts = name
+                pending_ts_name = False
+                continue
+            if cur_kind is None:
+                continue
+            block, by_ref = self._collect_types(idx + 1)
+            key = (cur_kind, cur_ts if in_ts else "", name)
+            self._owners.setdefault(key, []).append({"decl": idx + 1, "block": block, "by_ref": by_ref})
+            cur_kind = None  # один <Name> на секцию
+
+    @staticmethod
+    def _key(ref: dict) -> tuple[str, str, str] | None:
+        suffix = ref.get("used_in_suffix", "") or ""
+        if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
+            head, rest = suffix.split(".", 1)
+            return head, "", rest.split(".", 1)[0]
+        if suffix.startswith("TabularSection.") and ".Attribute." in suffix:
+            ts = suffix.split("TabularSection.", 1)[1].split(".", 1)[0]
+            name = suffix.split(".Attribute.", 1)[1].split(".", 1)[0]
+            return "Attribute", ts, name
+        return None
+
+    def line_for(self, ref: dict) -> int | None:
+        # Белый список видов — ЖЁСТКИЙ контракт, а не оптимизация (см. _ANCHORED_REF_KINDS).
+        if ref.get("ref_kind", "") not in _ANCHORED_REF_KINDS:
+            return None
+        key = self._key(ref)
+        if key is not None:
+            # Экземпляр владельца выбирается ОДИН раз и кешируется: составной тип
+            # спрашивает один и тот же ключ по разу на каждый тип (до 266 раз), и без
+            # кеша владелец «исчерпался» бы после первого обращения. Следствие: если
+            # один ключ (вид, табличная часть, имя) встречается в файле дважды — а в
+            # валидных метаданных 1С имена внутри секции уникальны, — все ссылки уедут
+            # в ПЕРВЫЙ экземпляр. На боевых конфигурациях такого входа не встретилось.
+            if key not in self._picked:
+                bucket = self._owners.get(key)
+                self._picked[key] = bucket.pop(0) if bucket else None
+            owner = self._picked[key]
+            if owner is None:
+                return None
+            canon = (ref.get("ref_object") or "").strip()
+            return owner["by_ref"].get(canon) or owner["block"] or owner["decl"]
+
+        # Виды без имени реквизита в суффиксе: owner, based_on,
+        # default_object_form, default_list_form.
+        # Якорь — ТОЧНОЕ значение внутри тега; и значение, и область поиска зависят от ВИДА.
+        kind = ref.get("ref_kind", "") or ""
+        suffix = ref.get("used_in_suffix", "") or ""
+        needle = self._plain_needle(ref)
+        if not needle:
+            return None
+        # Кеш ключуется ТРОЙКОЙ (вид, ПОЛНЫЙ суффикс, значение). Ни вида, ни пары
+        # (вид, значение) недостаточно: один объект бывает и владельцем, и основанием,
+        # а полный суффикс несёт имя элемента и разводит одноимённые роли.
+        ck = (kind, suffix, needle)
+        if ck in self._plain:
+            return self._plain[ck]
+        found = self._search_tag_value(kind, needle)
+        self._plain[ck] = found
+        return found
+
+    def _search_tag_value(self, kind: str, needle: str) -> int | None:
+        """Линейный поиск точного значения тега в пределах секции вида.
+
+        МИНА ДЛЯ ТОГО, КТО БУДЕТ РАСШИРЯТЬ ПОКРЫТИЕ. Это O(ссылок x строк).
+        Здесь это дёшево ТОЛЬКО потому, что якорятся исключительно виды из
+        ``_ANCHORED_REF_KINDS``: у них 2-3 ссылки на небольшой объектный XML.
+        Замер на боевых: 3122 ссылки на 1255 файлах — 4.4 с, и это БЫСТРЕЕ
+        одно-проходной карты (6.1 с): построить карту по каждому мелкому файлу
+        дороже, чем трижды его просканировать.
+
+        Как только сюда заведут ЛЮБОЙ объёмный вид (``role_rights``,
+        ``subsystem_content``, ``exchange_plan_content``, ``defined_type_content``),
+        линейный скан ОБЯЗАН быть заменён на одно-проходную карту
+        «значение тега -> первая строка». Замер, показывающий цену ошибки: боевой
+        файл прав на 1 162 203 строки и 105 282 ссылки — экстраполяция равномерной
+        выборки даёт ~8700 с резолва на ОДИН файл против ~0.9 с с картой при
+        идентичном результате.
+
+        Порядок секций у CF и EDT РАЗНЫЙ (в CF Owners раньше BasedOn, в EDT наоборот),
+        поэтому опираться на позицию нельзя — только на секцию.
+        """
+        pat = _tag_value_re(needle)
+        found: int | None = None
+        spans = self._kind_spans(kind)
+        if spans:
+            for a, b in spans:
+                for i in range(a, b + 1):
+                    if pat.search(self._lines[i]):
+                        found = i + 1
+                        break
+                if found is not None:
+                    break
+        else:
+            for i, line in enumerate(self._lines):
+                if pat.search(line):
+                    found = i + 1
+                    break
+        return found
+
+    def _kind_spans(self, kind: str) -> list[tuple[int, int]]:
+        """Границы секции, в которой обязана лежать ссылка данного вида (0-based, включая).
+
+        Пустой список -> ограничения нет, ищем по всему файлу.
+        """
+        tags = _KIND_SECTION_TAGS.get(kind)
+        if not tags:
+            return []
+        if tags in self._spans:
+            return self._spans[tags]
+        opens = [re.compile(rf"<\s*{t}\b") for t in tags]
+        closes = [re.compile(rf"</\s*{t}\s*>") for t in tags]
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        for i, line in enumerate(self._lines):
+            if start is None and any(o.search(line) for o in opens):
+                start = i
+                if any(c.search(line) for c in closes):
+                    spans.append((start, i))
+                    start = None
+                continue
+            if start is not None and any(c.search(line) for c in closes):
+                spans.append((start, i))
+                start = None
+        self._spans[tags] = spans
+        return spans
+
+    @staticmethod
+    def _plain_needle(ref: dict) -> str | None:
+        """Что именно искать в файле для видов без имени реквизита.
+
+        Для default_object_form / default_list_form ``ref_object`` — это САМ объект
+        (self-reference), а путь формы лежит в ``used_in_suffix`` ПОСЛЕ ``=``: парсеры
+        кладут туда ``DefaultObjectForm=Document.X.Form.ФормаДокумента``. Поиск по
+        ``ref_object`` попадает в ``<Name>ИмяОбъекта</Name>`` в шапке файла — верных
+        было бы НОЛЬ, а раньше там стоял честный NULL, то есть это был бы регресс.
+
+        Ключа ``used_in`` в словаре ref НЕТ — он собирается в ``_emit_refs`` /
+        ``_insert_references_for_object`` уже ПОСЛЕ вызова резолвера.
+        """
+        kind = ref.get("ref_kind", "") or ""
+        suffix = ref.get("used_in_suffix", "") or ""
+        if kind in ("default_object_form", "default_list_form"):
+            return suffix.split("=", 1)[1].strip() if "=" in suffix else None
+        return (ref.get("ref_object") or "").strip() or None
+
+
+class _NullAnchorIndex:
+    def line_for(self, ref: dict) -> int | None:  # noqa: ARG002
+        return None
+
+
+def _ref_anchor_index(content_lines: list[str] | None):
+    """Фабрика: ``None`` на входе -> индекс, всегда отдающий ``None``."""
     if content_lines is None:
-        return None
-    suffix = ref.get("used_in_suffix", "")
-    if not suffix:
-        return None
-    target_name: str | None = None
-    if suffix.startswith(("Attribute.", "Dimension.", "Resource.")):
-        parts = suffix.split(".")
-        if len(parts) >= 2:
-            target_name = parts[1]
-    elif suffix.startswith("TabularSection.") and ".Attribute." in suffix:
-        after = suffix.split(".Attribute.", 1)[1]
-        target_name = after.split(".", 1)[0]
-    if not target_name:
-        return None
-    pat = _pointwise_name_re(target_name)
-    for idx, line in enumerate(content_lines, start=1):
-        if pat.search(line):
-            return idx
-    return None
+        return _NullAnchorIndex()
+    return _RefAnchorIndex(content_lines)
 
 
 def _insert_references_for_object(
@@ -4014,12 +4321,14 @@ def _insert_references_for_object(
 
     Применяет _CATEGORY_TO_TYPE_PREFIX, пропускает refs без ref_object,
     собирает used_in (root + optional suffix), вычисляет line через
-    _line_for_ref_pointwise. Caller обязан проверить has_metadata_references_table.
+    _ref_anchor_index. Caller обязан проверить has_metadata_references_table.
     """
     if not parsed_refs:
         return
     type_prefix = _CATEGORY_TO_TYPE_PREFIX.get(source_category, source_category)
     used_in_root = f"{type_prefix}.{source_object}"
+    # Один индекс якорей на файл — см. _emit_refs.
+    anchor = _ref_anchor_index(content_lines)
     rows: list[tuple] = []
     for ref in parsed_refs:
         ref_object = ref.get("ref_object", "")
@@ -4027,7 +4336,7 @@ def _insert_references_for_object(
             continue
         suffix = ref.get("used_in_suffix", "")
         used_in = f"{used_in_root}.{suffix}" if suffix else used_in_root
-        line = _line_for_ref_pointwise(ref, content_lines)
+        line = anchor.line_for(ref)
         rows.append(
             (
                 source_object,
@@ -4403,6 +4712,149 @@ def _escape_for_sql_like(s: str) -> str:
     Backslashes are escaped FIRST so subsequent escape-prefixes are not double-escaped.
     """
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# ---------------------------------------------------------------------------
+# Bounded role detail (v1.34.0)
+# ---------------------------------------------------------------------------
+# `role_rights` на боевой конфигурации — сотни тысяч строк, поэтому детализация
+# «какое право к какому объекту» обязана быть ОГРАНИЧЕННОЙ по построению, а не
+# «обычно небольшой». Единица лимита — distinct-пара ``(object, right)``, а не
+# только объект: иначе один объект с тысячами синтетических right names всё равно
+# создал бы неограниченный вложенный список.
+_ROLE_DETAILS_DEFAULT = 20
+_ROLE_DETAILS_MAX = 100
+
+
+def _normalize_role_details_limit(value) -> tuple[int, str | None]:
+    """ТОТАЛЬНЫЙ нормализатор ``details_limit`` → ``(effective, warning|None)``.
+
+    Отдельно от общего ``_coerce_bound``: тот допускает ``±inf`` до ``int(value)``
+    и бросает ``OverflowError``. Здесь ``math.isfinite`` проверяется ТОЛЬКО для
+    ``float`` и ДО ``int``, а произвольно большой ``int`` сравнивается/clamp-ится
+    без float-конверсии. Числовая конвенция проекта сохранена: дробное усекается,
+    negative/``bool``/нечисло/``NaN`` дают default; ``+inf`` — превышение (clamp к
+    ``_ROLE_DETAILS_MAX``), ``-inf`` — нижняя ошибка (default).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _ROLE_DETAILS_DEFAULT, (
+            f"details_limit: недопустимое значение {value!r} — использую {_ROLE_DETAILS_DEFAULT}."
+        )
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return _ROLE_DETAILS_DEFAULT, f"details_limit: NaN — использую {_ROLE_DETAILS_DEFAULT}."
+        if value == float("inf"):
+            return _ROLE_DETAILS_MAX, f"details_limit: +inf — ограничил до {_ROLE_DETAILS_MAX}."
+        if value == float("-inf"):
+            return _ROLE_DETAILS_DEFAULT, f"details_limit: -inf — использую {_ROLE_DETAILS_DEFAULT}."
+        value = int(value)
+    if value < 0:
+        return _ROLE_DETAILS_DEFAULT, (f"details_limit: отрицательное {value!r} — использую {_ROLE_DETAILS_DEFAULT}.")
+    if value > _ROLE_DETAILS_MAX:
+        return _ROLE_DETAILS_MAX, f"details_limit: {value} превышает потолок — ограничил до {_ROLE_DETAILS_MAX}."
+    return int(value), None
+
+
+class _RoleGroupBuilder:
+    """Row-oriented группировка ролей с BOUNDED детализацией.
+
+    Legacy-поля (``role_name``/``object``/``rights``/``file``), их значения и
+    взаимный порядок НЕ меняются: ``object`` остаётся legacy query-or-first-match,
+    ``rights`` — прежним ПОЛНЫМ union прав роли. Additive-часть ограничена
+    ``details_limit`` distinct-парами на роль, поэтому размер сериализованного
+    результата равен ``O(roles * details_limit)``, а не ``O(role_rights)``.
+
+    Для детерминированного top-k используется bounded accumulator, а не полный
+    ``dict[object][right]``: точный счёт объектов/пар намеренно НЕ публикуется,
+    чтобы не потребовать unbounded ``seen``-set.
+
+    **v1.34.0 — accumulator ВЫТЕСНЯЮЩИЙ.** Удержание первых ``N`` пар делало бы
+    sample зависимым от порядка строк SQLite: у обоих ролевых SQL нет
+    ``ORDER BY``, поэтому две логически одинаковые базы, набранные в разном
+    порядке вставки, отдавали бы РАЗНЫЕ ``matched_objects`` — сортировка в
+    ``result()`` упорядочивает лишь уже удержанный префикс. Держим ``N``
+    МИНИМАЛЬНЫХ пар по тому же ключу, которым результат и сортируется; порядок
+    потока на выбор больше не влияет. ``ORDER BY`` в SQL для этого не годится:
+    broad-маршрут стримит ~346K строк, и сортировка потребовала бы temp b-tree
+    ровно там, где память и экономится. Вставка идёт в список ≤100 элементов,
+    поэтому стоимость на строку остаётся постоянной.
+
+    Legacy-поля ``object``/``file`` (query-or-first-match) от порядка потока
+    зависели и раньше — их семантика намеренно НЕ трогается.
+    """
+
+    __slots__ = ("_limit", "_order", "_groups")
+
+    def __init__(self, details_limit: int):
+        self._limit = max(0, int(details_limit))
+        self._order: list[str] = []
+        self._groups: dict[str, dict] = {}
+
+    def add(self, role_name, object_name, right_name, file) -> None:
+        slot = self._groups.get(role_name)
+        if slot is None:
+            slot = {
+                "role_name": role_name,
+                "object": object_name,
+                "rights": [],
+                "rights_set": set(),
+                "file": file,
+                # `pairs` — ОТСОРТИРОВАННЫЙ список sort-КЛЮЧЕЙ (object.casefold(),
+                # object, right.casefold(), right), а не самих пар: по нему идёт и
+                # вытеснение максимума, и итоговый порядок. `pairs_set` держит сами
+                # пары и нужен только для дедупа входного потока.
+                "pairs": [],
+                "pairs_set": set(),
+                "truncated": False,
+            }
+            self._groups[role_name] = slot
+            self._order.append(role_name)
+        if right_name not in slot["rights_set"]:
+            slot["rights_set"].add(right_name)
+            slot["rights"].append(right_name)
+        pair = (object_name, right_name)
+        if pair in slot["pairs_set"]:
+            return
+        if self._limit <= 0:
+            slot["truncated"] = True
+            return
+        key = (object_name.casefold(), object_name, right_name.casefold(), right_name)
+        if len(slot["pairs"]) >= self._limit:
+            # Ещё одна distinct-пара за границей sample — флаг усечения поднят
+            # в любом случае; вопрос лишь, ВЫТЕСНИТ ли она текущий максимум.
+            slot["truncated"] = True
+            if key >= slot["pairs"][-1]:
+                return
+            dropped = slot["pairs"].pop()
+            slot["pairs_set"].discard((dropped[1], dropped[3]))
+        slot["pairs_set"].add(pair)
+        insort(slot["pairs"], key)
+
+    def is_empty(self) -> bool:
+        return not self._groups
+
+    def result(self) -> list[dict]:
+        out: list[dict] = []
+        for role_name in self._order:  # порядок ПЕРВОГО появления роли — как раньше
+            slot = self._groups[role_name]
+            # Ключи накоплены УЖЕ отсортированными по (object.casefold(), object,
+            # right.casefold(), right) — тем же порядком, которым выбирался top-k.
+            pairs = [(k[1], k[3]) for k in slot["pairs"]]
+            by_object: dict[str, list[str]] = {}
+            for obj, right in pairs:
+                by_object.setdefault(obj, []).append(right)
+            out.append(
+                {
+                    "role_name": slot["role_name"],
+                    "object": slot["object"],
+                    "rights": slot["rights"],
+                    "file": slot["file"],
+                    "matched_objects": list(by_object.keys()),
+                    "rights_by_object": [{"object": obj, "rights": rights} for obj, rights in by_object.items()],
+                    "details_truncated": bool(slot["truncated"]),
+                }
+            )
+        return out
 
 
 def _insert_global_object(
@@ -4858,6 +5310,52 @@ _ADAPTED_REG_RE = re.compile(
     re.IGNORECASE,
 )  # ИмяРегистра = "RegName"
 
+
+# Прямое создание набора записей из ManagerModule:
+#   РегистрыСведений.X.СоздатьНаборЗаписей()  |  InformationRegisters.X.CreateRecordSet()
+# Наивное расширение `Движения.X` на менеджер давало 31-34% ложных срабатываний
+# (Движения.Количество / .Отбор / .Колонки — поля набора, а не имена регистров),
+# поэтому берётся только эта однозначная форма, и имя дополнительно
+# валидируется по каталогу регистров при вставке.
+_MANAGER_RECORDSET_RE = re.compile(
+    r"(?<![\w.])(?:\u0420\u0435\u0433\u0438\u0441\u0442\u0440\u044b(?:\u0421\u0432\u0435\u0434\u0435\u043d\u0438\u0439|\u041d\u0430\u043a\u043e\u043f\u043b\u0435\u043d\u0438\u044f|\u0411\u0443\u0445\u0433\u0430\u043b\u0442\u0435\u0440\u0438\u0438|\u0420\u0430\u0441\u0447\u0435\u0442\u0430)"
+    r"|(?:Information|Accumulation|Accounting|Calculation)Registers)"
+    r"\s*\.\s*(\w+)\s*\.\s*(?:\u0421\u043e\u0437\u0434\u0430\u0442\u044c\u041d\u0430\u0431\u043e\u0440\u0417\u0430\u043f\u0438\u0441\u0435\u0439|CreateRecordSet)\s*\(",
+    re.IGNORECASE,
+)  # РегистрыСведений.X.СоздатьНаборЗаписей( | InformationRegisters.X.CreateRecordSet(
+
+_REGISTER_CATALOG_DIRS = (
+    "InformationRegisters",
+    "AccumulationRegisters",
+    "AccountingRegisters",
+    "CalculationRegisters",
+)
+
+
+def _known_register_names(base: Path) -> frozenset[str]:
+    """Имена всех регистров конфигурации (нижний регистр) — по каталогам на диске.
+
+    Четыре ``iterdir``: дешевле и полнее, чем выборка из ``object_synonyms`` (у регистра
+    может не быть ни синонима, ни модуля). Нужен для отбраковки ложных имён,
+    извлечённых из ManagerModule: сам регекс однозначен, но сверка защищает от
+    мусорных имён на конфигурациях, которые мы не мерили.
+    """
+    names: set[str] = set()
+    for cat in _REGISTER_CATALOG_DIRS:
+        d = base / cat
+        if not d.is_dir():
+            continue
+        try:
+            for entry in d.iterdir():
+                if entry.is_dir():
+                    names.add(entry.name.lower())
+                elif entry.suffix.lower() in (".xml", ".mdo"):
+                    names.add(entry.stem.lower())
+        except OSError:
+            continue
+    return frozenset(names)
+
+
 # ---------------------------------------------------------------------------
 # Region parser (stack-based #Область/#КонецОбласти)
 # ---------------------------------------------------------------------------
@@ -4959,16 +5457,29 @@ def _extract_movements(
     info: BslFileInfo,
     rel_path: str,
 ) -> list[tuple[str, str, str]]:
-    """Extract register movements from Document modules (in-band, no extra I/O)."""
+    """Extract register movements from Document modules (in-band, no extra I/O).
+
+    v1.33.0: ни один регекс больше не работает по СЫРОМУ тексту.
+      * ``full`` — комментарии И строковые литералы погашены. По ней идут регексы,
+        читающие имя из КОДА: ``Движения.X``, ``ТекстЗапросаТаблицаX``. Иначе
+        ``// Движения.X`` и ``"Движения.X"`` попадали в таблицу как настоящая запись.
+      * ``comments_only`` — погашены только комментарии, литералы целы. По ней идут
+        ``_ERP_MECHANISM_RE`` и ``_ADAPTED_REG_RE``: они по замыслу читают имя ИЗ
+        литерала, полная маска убила бы сигнал. Работа по сырому тексту тащила
+        закомментированные ``//МеханизмыДокумента.Добавить("X")``.
+    """
     if info.category != "Documents":
         return []
     if info.module_type not in ("ObjectModule", "ManagerModule"):
         return []
 
     results: list[tuple[str, str, str]] = []
+    src_lines = content.splitlines()
+    full = "\n".join(mask_comments_and_strings(src_lines))
+    comments_only = "\n".join(mask_comments_and_strings(src_lines, keep_string_content=True))
 
     if info.module_type == "ObjectModule":
-        for m in _MOVEMENTS_RE.finditer(content):
+        for m in _MOVEMENTS_RE.finditer(full):
             reg = m.group(1)
             # Belt-and-suspenders: the lookahead already rejects Движения.Method(),
             # but a paren-less Движения.Записать would still capture — drop stop-set names.
@@ -4976,14 +5487,24 @@ def _extract_movements(
                 continue
             results.append((reg, "code", rel_path))
     elif info.module_type == "ManagerModule":
-        for m in _ERP_MECHANISM_RE.finditer(content):
+        for m in _ERP_MECHANISM_RE.finditer(comments_only):
             results.append((m.group(1), "erp_mechanism", rel_path))
-        for m in _MANAGER_TABLE_RE.finditer(content):
+        for m in _MANAGER_TABLE_RE.finditer(full):
             results.append((m.group(1), "manager_table", rel_path))
-        adapted_match = _ADAPTED_PROC_RE.search(content)
+        # ИЗВЕСТНАЯ ГРАНИЦА (не регресс v1.33.0): `_ADAPTED_PROC_RE` ищет границы функции
+        # по `comments_only`, где литералы целы, поэтому строка `"КонецФункции"` ВНУТРИ
+        # литерала обрывает блок раньше и следующие `ИмяРегистра = "X"` теряются. В v14
+        # поиск шёл по сырому тексту с тем же эффектом. Лечится разделением: границы
+        # функции искать по полной маске, а имя — по `comments_only`; на боевых
+        # конфигурациях случай не встретился, поэтому в этот релиз не входит.
+        adapted_match = _ADAPTED_PROC_RE.search(comments_only)
         if adapted_match:
             for m in _ADAPTED_REG_RE.finditer(adapted_match.group(1)):
                 results.append((m.group(1), "adapted", rel_path))
+        # Имя регистра берётся из КОДА, поэтому маска ``full``. Отбраковка по каталогу
+        # регистров идёт при ВСТАВКЕ: per-file экстрактор каталога не видит.
+        for m in _MANAGER_RECORDSET_RE.finditer(full):
+            results.append((m.group(1), "manager_code", rel_path))
 
     return results
 
@@ -5157,6 +5678,7 @@ def _iter_metadata_xml_files(
     base_path: str,
     *,
     categories: frozenset[str] | None = None,
+    _status: dict | None = None,
 ) -> list[tuple[str, str, str]]:
     """Discover layout-canonical metadata XML/MDO files for `_SYNONYM_CATEGORIES`.
 
@@ -5169,6 +5691,14 @@ def _iter_metadata_xml_files(
     locator list for XML-only ext objects without ``<Synonym>``).
 
     When *categories* is ``None`` (default) — all ``_SYNONYM_CATEGORIES`` are scanned.
+
+    ``_status`` (v1.34.0) — ПРИВАТНЫЙ optional sink, который прокидывает только
+    helper-путь. Без него legacy builder/delta/direct API, list-return, порядок и
+    прежняя exception-семантика не меняются. В status-aware режиме исключение
+    ОДНОГО category-worker изолируется в его outcome, уже полученные locator-batches
+    возвращаются в прежнем ``pool.map``-порядке, а traversal failure агрегируется
+    родителем: иначе поздний ``OSError`` discovery обрывал бы функцию до
+    candidate-workers, а внешний ``catch`` заменял бы ранние synonyms пустым списком.
 
     Returns list of (category, object_name, rel_path_posix).
     """
@@ -5282,10 +5812,24 @@ def _iter_metadata_xml_files(
         return all_results
 
     workers = min(os.cpu_count() or 4, 8)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for batch in pool.map(_collect_category, cats_list):
-            all_results.extend(batch)
+    if _status is None:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for batch in pool.map(_collect_category, cats_list):
+                all_results.extend(batch)
+        return all_results
 
+    def _collect_category_status(cat: str) -> tuple[list[tuple[str, str, str]], int]:
+        try:
+            return _collect_category(cat), 0
+        except Exception:
+            return [], 1
+
+    failures = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for batch, failed in pool.map(_collect_category_status, cats_list):
+            all_results.extend(batch)
+            failures += failed
+    _status["traversal_failures"] = int(_status.get("traversal_failures", 0)) + failures
     return all_results
 
 
@@ -5293,11 +5837,19 @@ def _collect_object_synonyms(
     base_path: str,
     *,
     categories: frozenset[str] | None = None,
+    _status: dict | None = None,
 ) -> list[tuple[str, str, str, str]]:
     """Collect object synonyms from metadata categories.
 
     When *categories* is ``None`` (default) — all ``_SYNONYM_CATEGORIES`` are scanned.
     When a specific frozenset is passed — only those categories are scanned.
+
+    ``_status`` (v1.34.0) — ПРИВАТНЫЙ optional sink helper-пути; второй обход XML НЕ
+    вводится. Кандидат успешен, когда файл прочитан, XML доказанно well-formed и
+    domain-parser штатно завершился — ВКЛЮЧАЯ валидный XML без ``<Synonym>``.
+    Read/parse failure успехом не считается: иначе «нет строк» и «не смогли
+    посмотреть» снова стали бы неразличимы. Builder/delta/direct callers сохраняют
+    прежний ``list``-return.
 
     Returns list of (object_name, category, prefixed_synonym, rel_path).
     """
@@ -5306,17 +5858,28 @@ def _collect_object_synonyms(
     base = Path(base_path)
     all_results: list[tuple[str, str, str, str]] = []
 
-    candidates = _iter_metadata_xml_files(base_path, categories=categories)
+    # Discovery входит в ту же failure-boundary: без sink поздний OSError оборвал бы
+    # функцию ДО candidate-workers, и внешний catch заменил бы ранние synonyms пустым
+    # списком — то есть выдал бы «не смогли посмотреть» за доказанный ноль.
+    candidates = _iter_metadata_xml_files(
+        base_path, categories=categories, **({"_status": _status} if _status is not None else {})
+    )
     if not candidates:
         return all_results
 
-    def _parse_one(entry: tuple[str, str, str]) -> tuple[str, str, str, str] | None:
+    def _parse_one_row(entry: tuple[str, str, str]) -> tuple[str, str, str, str] | None:
+        """ПРЕЖНИЙ до-релизный контракт: строка либо ``None``. Только этот вариант
+        исполняется на builder-пути (`_status is None`)."""
+        return _parse_one(entry)[0]
+
+    def _parse_one(entry: tuple[str, str, str]) -> tuple[tuple[str, str, str, str] | None, bool]:
+        """Returns ``(row_or_None, processed_ok)``."""
         cat, obj_name, rel = entry
         fp = base / rel
         try:
             content = fp.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
-            return None
+            return None, False
         try:
             parsed = parse_metadata_xml(content)
         except Exception as exc:
@@ -5326,7 +5889,7 @@ def _collect_object_synonyms(
                 type(exc).__name__,
                 exc,
             )
-            return None
+            return None, False
         if parsed is None:
             # parse_metadata_xml глотает ParseError в None (Finding #5) — сохраняем warning,
             # иначе битый XML тихо пропадёт в `if not parsed` ниже.
@@ -5334,21 +5897,48 @@ def _collect_object_synonyms(
                 "_collect_object_synonyms: skipping malformed XML %s",
                 fp,
             )
-            return None
+            return None, False
         if not parsed:
-            return None
+            return None, True
         raw_synonym = parsed.get("synonym") or ""
         if not raw_synonym:
-            return None
+            # Валидный XML БЕЗ <Synonym> — успешно обработанный кандидат, не failure.
+            return None, True
         prefix = _CATEGORY_RU.get(cat, cat)
         synonym = f"{prefix}: {raw_synonym}"
-        return (obj_name, cat, synonym, rel)
+        return (obj_name, cat, synonym, rel), True
 
     workers = min(os.cpu_count() or 4, 8)
+
+    if _status is None:
+        # BUILDER-ПУТЬ. Рамка релиза запрещает трогать билдер, а не «менять его так,
+        # чтобы выход совпал»: одинаковый выход доказывается только тестом, а тест
+        # детерминированную перестановку строк пропустить может. Поэтому без sink
+        # исполняется ДОСЛОВНО прежний цикл — тот же `pool.map` по тому же
+        # `_parse_one_row`, та же проверка, тот же порядок. Sink-ветка ниже —
+        # ОТДЕЛЬНАЯ и в билдер не попадает никогда.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for parsed_row in pool.map(_parse_one_row, candidates):
+                if parsed_row is not None:
+                    all_results.append(parsed_row)
+        return all_results
+
+    ok_count = 0
+    failed_count = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for parsed_row in pool.map(_parse_one, candidates):
+        # Sink агрегируется ТОЛЬКО в родительском цикле pool.map: общих mutable-счётчиков
+        # из потоков нет, порядок и старый список строк не меняются.
+        for parsed_row, processed_ok in pool.map(_parse_one, candidates):
+            if processed_ok:
+                ok_count += 1
+            else:
+                failed_count += 1
             if parsed_row is not None:
                 all_results.append(parsed_row)
+
+    _status["candidates"] = int(_status.get("candidates", 0)) + len(candidates)
+    _status["ok"] = int(_status.get("ok", 0)) + ok_count
+    _status["failed"] = int(_status.get("failed", 0)) + failed_count
 
     return all_results
 
@@ -5628,10 +6218,16 @@ def _collect_form_elements(base_path: str) -> list[tuple]:
                 )
             )
         for a in parsed.get("attributes", []):
-            extra = ""
+            # v1.33.0: parse_form_xml отдаёт types СПИСКОМ. Колонка element_type — TEXT,
+            # и передача списка дала бы sqlite3.InterfaceError на первой же форме.
+            # Формат хранения НЕ меняется (v14 и v15 идентичны): ", ".join — и он же
+            # единственный источник истины, дублировать types в extra_json не надо
+            # (замер: 455 912 XML-узлов типов, значений со встроенной запятой — 0).
+            types_list = a.get("types") or []
+            if isinstance(types_list, str):  # толерантность к старому shape
+                types_list = [t.strip() for t in types_list.split(",") if t.strip()]
             qt = a.get("query_text", "")
-            if qt:
-                extra = json.dumps({"query_text": qt}, ensure_ascii=False)
+            extra = json.dumps({"query_text": qt}, ensure_ascii=False) if qt else ""
             rows.append(
                 (
                     obj_name,
@@ -5640,7 +6236,7 @@ def _collect_form_elements(base_path: str) -> list[tuple]:
                     "attribute",
                     "",
                     a.get("name", ""),
-                    a.get("types", ""),
+                    ", ".join(types_list),
                     "",
                     "",
                     "",
@@ -6065,10 +6661,18 @@ class IndexBuilder:
             _insert_metadata_tables(conn, md_tables)
 
         # Level-3: register movements (in-band, already extracted)
+        # Строки source='manager_code' проходят через каталог регистров: извлечение
+        # из ManagerModule статически неоднозначно, и без сверки в таблицу попали бы
+        # имена полей набора записей.
+        known_registers = _known_register_names(base)
         all_movements: list[tuple[str, str, str, str]] = []
+        dropped_manager = 0
         for r in results:
             if r.movements and r.info.object_name:
                 for reg_name, source, file_path_str in r.movements:
+                    if source == "manager_code" and reg_name.lower() not in known_registers:
+                        dropped_manager += 1
+                        continue
                     all_movements.append((r.info.object_name, reg_name, source, file_path_str))
         if all_movements:
             conn.executemany(
@@ -6076,7 +6680,11 @@ class IndexBuilder:
                 all_movements,
             )
             conn.commit()
-            logger.info("Register movements: %d entries", len(all_movements))
+            logger.info(
+                "Register movements: %d entries (manager_code rows dropped by register catalog: %d)",
+                len(all_movements),
+                dropped_manager,
+            )
 
         # Level-3: role rights (parallel regex parsing)
         role_rights = _collect_role_rights(base_path)
@@ -6324,9 +6932,14 @@ class IndexBuilder:
         # NB: a plain version bump without this forced rebuild would route v13
         # DBs into the version-mismatch full *scan* below, which INSERTs into the
         # OLD schema (no callee_key column) and fails — so the rebuild is required.
+        #
+        # v15 — миграция СОДЕРЖИМОГО, а не схемы, но механизм тот же: полный СКАН
+        # считает дельту по mtime/size и нетронутые модули не перечитывает, поэтому
+        # без подъёма порога старые methods / register_movements / form_elements /
+        # metadata_references пережили бы бамп вместе с призраками из комментариев.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 14:
+        if old_version < 15:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -6633,23 +7246,36 @@ class IndexBuilder:
                     )
 
                 # Update register_movements for changed/added Document modules
-                if results:
-                    changed_doc_names = set()
-                    for r in results:
-                        if r.info.category == "Documents" and r.info.object_name:
-                            changed_doc_names.add(r.info.object_name)
-                    for doc_name in changed_doc_names:
+                # `or to_remove`: при ЧИСТОМ удалении модуля results пуст, и прежний
+                # guard `if results:` оставлял его движения в таблице сиротами навсегда.
+                if results or to_remove:
+                    # Удаление идёт по ФАЙЛУ, а не по имени документа. Удаление по
+                    # document_name сносило строки ОБОИХ модулей документа, а
+                    # восстанавливались только строки переобработанного: правка
+                    # ObjectModule стирала erp_mechanism/manager_table/adapted/manager_code
+                    # из НЕтронутого ManagerModule и наоборот. Дефект пре-существующий
+                    # (воспроизводится и на источниках v14), но с появлением manager_code
+                    # он стал массовым: у большинства документов с записью из менеджера
+                    # есть и ObjectModule. `to_remove` = removed | changed, поэтому
+                    # удалённый модуль тоже чистится, а нетронутый сосед остаётся цел.
+                    stale_files = set(to_remove) | {r.info.relative_path for r in results}
+                    for stale_rel in stale_files:
                         try:
                             conn.execute(
-                                "DELETE FROM register_movements WHERE document_name = ?",
-                                (doc_name,),
+                                "DELETE FROM register_movements WHERE file = ?",
+                                (stale_rel,),
                             )
                         except sqlite3.OperationalError:
                             pass
+                    # Каталог регистров считаем ОДИН раз перед циклом (тот же фильтр,
+                    # что и на полной сборке — иначе инкремент вернул бы мусорные имена).
+                    known_registers = _known_register_names(base)
                     new_movements: list[tuple[str, str, str, str]] = []
                     for r in results:
                         if r.movements and r.info.object_name:
                             for reg_name, source, fpath in r.movements:
+                                if source == "manager_code" and reg_name.lower() not in known_registers:
+                                    continue
                                 new_movements.append((r.info.object_name, reg_name, source, fpath))
                     if new_movements:
                         conn.executemany(
@@ -7146,23 +7772,35 @@ class IndexBuilder:
                         new_rel_paths,
                     )
 
-                if results:
-                    changed_doc_names = set()
-                    for r in results:
-                        if r.info.category == "Documents" and r.info.object_name:
-                            changed_doc_names.add(r.info.object_name)
-                    for doc_name in changed_doc_names:
+                # `or to_remove`: при ЧИСТОМ удалении модуля results пуст, и прежний
+                # guard `if results:` оставлял его движения в таблице сиротами навсегда.
+                if results or to_remove:
+                    # Удаление идёт по ФАЙЛУ, а не по имени документа. Удаление по
+                    # document_name сносило строки ОБОИХ модулей документа, а
+                    # восстанавливались только строки переобработанного: правка
+                    # ObjectModule стирала erp_mechanism/manager_table/adapted/manager_code
+                    # из НЕтронутого ManagerModule и наоборот. Дефект пре-существующий
+                    # (воспроизводится и на источниках v14), но с появлением manager_code
+                    # он стал массовым: у большинства документов с записью из менеджера
+                    # есть и ObjectModule. `to_remove` = removed | changed, поэтому
+                    # удалённый модуль тоже чистится, а нетронутый сосед остаётся цел.
+                    stale_files = set(to_remove) | {r.info.relative_path for r in results}
+                    for stale_rel in stale_files:
                         try:
                             conn.execute(
-                                "DELETE FROM register_movements WHERE document_name = ?",
-                                (doc_name,),
+                                "DELETE FROM register_movements WHERE file = ?",
+                                (stale_rel,),
                             )
                         except sqlite3.OperationalError:
                             pass
+                    # Каталог регистров считаем ОДИН раз перед циклом (см. полную сборку).
+                    known_registers = _known_register_names(base)
                     new_movements: list[tuple[str, str, str, str]] = []
                     for r in results:
                         if r.movements and r.info.object_name:
                             for reg_name, source, fpath in r.movements:
+                                if source == "manager_code" and reg_name.lower() not in known_registers:
+                                    continue
                                 new_movements.append((r.info.object_name, reg_name, source, fpath))
                     if new_movements:
                         conn.executemany(
@@ -7202,8 +7840,21 @@ class IndexBuilder:
         # --- Selective metadata refresh based on separate trigger sets ---
         # .xml/.mdo → category-based metadata tables, attrs, synonyms
         xml_mdo_changed = {p for p in git_changed if p.lower().endswith((".xml", ".mdo"))}
-        # .form → form_elements only
-        form_changed = {p for p in git_changed if p.lower().endswith(".form")}
+        # .form (EDT) ИЛИ */Ext/Form.xml (CF) → form_elements.
+        # v1.33.0: без CF-ветки обычная правка формы Конфигуратора не пересобирала
+        # form_elements ВООБЩЕ — такой путь попадает только в xml_mdo_changed, а
+        # пересборка идёт строго `if form_changed`. Form.xml остаётся и в
+        # xml_mdo_changed: он несёт и метаданные объекта.
+        # Сузить до `/Forms/<Имя>/Ext/Form.xml` нельзя: у CommonForms промежуточного
+        # `Forms/` НЕТ (`CommonForms/<Имя>/Ext/Form.xml`), и такой регекс пропускал бы
+        # 433 общие формы на боевом CF — их `main` и `types` замерзали бы навсегда.
+        # Признак `*/Ext/Form.xml` точен: на боевом CF 10 124 таких файла, и все до
+        # единого — формы (`Ext/Form.xml` вне каталога формы не встречается).
+        form_changed = {
+            p
+            for p in git_changed
+            if p.lower().endswith(".form") or re.search(r"(?:^|/)Ext/Form\.xml$", p, re.IGNORECASE)
+        }
         # .rights → role_rights only
         rights_changed = {p for p in git_changed if p.lower().endswith(".rights")}
         # .xdto → xdto_packages (via category detection from path)
@@ -9025,23 +9676,42 @@ class IndexReader:
             ]
 
     @_transient_safe(lambda: None)
-    def get_roles(self, object_name: str) -> list[dict] | None:
-        """Get roles that grant rights to a given object.
+    def get_roles(self, object_name: str, details_limit: int = _ROLE_DETAILS_DEFAULT) -> list[dict] | None:
+        """Get roles that grant rights to a given object (BROAD literal substring).
 
-        Returns list of {role_name, object_name, right_name, file} or None
-        if role_rights table is empty/missing.
+        Returns list of {role_name, object, rights, file, matched_objects,
+        rights_by_object, details_truncated} or None if role_rights table is
+        empty/missing.
+
+        **v1.34.0 — literal substring, а не SQL-wildcard.** Легальные ``_``/``%`` в
+        имени 1С (``тст_Смета``) раньше работали как SQL-метасимволы и давали
+        ложноположительный recall; теперь они экранируются так же, как в
+        ``get_roles_exact``. Регистровая семантика ветки не меняется
+        (``py_lower`` с обеих сторон), и это публикуется отдельным машинным полем
+        хелпера.
+
+        ``details_limit`` — bounded sample distinct-пар ``(object, right)``;
+        нормализуется тем же тотальным нормализатором, что и на helper-границе,
+        поэтому прямой вызов ридера не может обойти cap 0..100.
         """
+        effective, _warning = _normalize_role_details_limit(details_limit)
         with self._lock:
             try:
-                rows = self._conn.execute(
+                like_q = "%" + _escape_for_sql_like(object_name) + "%"
+                cursor = self._conn.execute(
                     "SELECT role_name, object_name, right_name, file FROM role_rights "
-                    "WHERE py_lower(object_name) LIKE py_lower(?)",
-                    (f"%{object_name}%",),
-                ).fetchall()
+                    "WHERE py_lower(object_name) LIKE py_lower(?) ESCAPE '\\'",
+                    (like_q,),
+                )
+                # Итерируем cursor вместо fetchall: broad-запрос на боевой базе
+                # даёт ~346K строк, и материализовать их в памяти незачем.
+                builder = _RoleGroupBuilder(effective)
+                for r in cursor:
+                    builder.add(r["role_name"], r["object_name"], r["right_name"], r["file"])
             except sqlite3.OperationalError:
                 return None
 
-            if not rows:
+            if builder.is_empty():
                 # Check if the table has any data at all
                 try:
                     cnt = self._conn.execute("SELECT COUNT(*) AS cnt FROM role_rights").fetchone()
@@ -9050,24 +9720,12 @@ class IndexReader:
                 except sqlite3.Error:
                     return None
 
-            # Group by role_name, deduplicate rights
-            role_map: dict[str, dict] = {}
-            for r in rows:
-                key = r["role_name"]
-                if key not in role_map:
-                    role_map[key] = {
-                        "role_name": r["role_name"],
-                        "object": r["object_name"],
-                        "rights": [],
-                        "file": r["file"],
-                    }
-                right = r["right_name"]
-                if right not in role_map[key]["rights"]:
-                    role_map[key]["rights"].append(right)
-            return list(role_map.values())
+            return builder.result()
 
     @_transient_safe(lambda: None)
-    def get_roles_exact(self, object_ref: str, include_members: bool = False) -> list[dict] | None:
+    def get_roles_exact(
+        self, object_ref: str, include_members: bool = False, *, details_limit: int = _ROLE_DETAILS_DEFAULT
+    ) -> list[dict] | None:
         """Roles granting rights to an EXACT object ref — no substring false-positives.
 
         Where ``get_roles`` matches ``object_name LIKE '%name%'`` (so ``Document.Заказ``
@@ -9086,6 +9744,7 @@ class IndexReader:
             ``get_roles``), or ``None`` if the ``role_rights`` table is empty/missing.
             ``[]`` when the table is present but no role grants the exact ref.
         """
+        effective, _warning = _normalize_role_details_limit(details_limit)
         with self._lock:
             try:
                 if include_members:
@@ -9094,21 +9753,31 @@ class IndexReader:
                     # near-homonym's member grants. The trailing '.%' stays the intended wildcard;
                     # the '=' branch is exact (no LIKE) and needs no escaping.
                     like_prefix = object_ref.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    rows = self._conn.execute(
+                    cursor = self._conn.execute(
                         "SELECT role_name, object_name, right_name, file FROM role_rights "
                         "WHERE object_name = ? COLLATE NOCASE OR object_name LIKE ? || '.%' ESCAPE '\\'",
                         (object_ref, like_prefix),
-                    ).fetchall()
+                    )
                 else:
-                    rows = self._conn.execute(
+                    cursor = self._conn.execute(
                         "SELECT role_name, object_name, right_name, file FROM role_rights "
                         "WHERE object_name = ? COLLATE NOCASE",
                         (object_ref,),
-                    ).fetchall()
+                    )
+                # v1.34.0 — итерируем cursor вместо `fetchall()`, ровно как это уже
+                # делает `get_roles`. Заявленная граница `O(roles * details_limit)`
+                # относится к СЕРИАЛИЗАЦИИ результата; пиковая память при `fetchall()`
+                # оставалась `O(role_rights)`, а `include_members=True` (его включает
+                # `get_object_profile(sections=["roles"])`) как раз и тянет ВСЕ
+                # member-гранты объекта — на боевой базе это сотни тысяч строк, и cap
+                # применялся только ПОСЛЕ их материализации.
+                builder = _RoleGroupBuilder(effective)
+                for r in cursor:
+                    builder.add(r["role_name"], r["object_name"], r["right_name"], r["file"])
             except sqlite3.OperationalError:
                 return None
 
-            if not rows:
+            if builder.is_empty():
                 # Distinguish empty table (→ None, caller marks unavailable) from
                 # "table has data but exact ref matched nothing" (→ [], authoritative).
                 try:
@@ -9118,20 +9787,7 @@ class IndexReader:
                 except sqlite3.Error:
                     return None
 
-            role_map: dict[str, dict] = {}
-            for r in rows:
-                key = r["role_name"]
-                if key not in role_map:
-                    role_map[key] = {
-                        "role_name": r["role_name"],
-                        "object": r["object_name"],
-                        "rights": [],
-                        "file": r["file"],
-                    }
-                right = r["right_name"]
-                if right not in role_map[key]["rights"]:
-                    role_map[key]["rights"].append(right)
-            return list(role_map.values())
+            return builder.result()
 
     @_transient_safe(lambda: None)
     def get_enum_values(self, enum_name: str) -> dict | None:
@@ -9210,6 +9866,97 @@ class IndexReader:
                 except (json.JSONDecodeError, TypeError):
                     return []
             return []
+
+    @_transient_safe(lambda: None)
+    def get_declared_base_path(self) -> str | None:
+        """База, которую индекс ЗАЯВЛЯЕТ о себе, — одним узким чтением ``index_meta``.
+
+        Отдельно от ``get_build_capabilities`` СОЗНАТЕЛЬНО: тот отдаёт ``None`` на
+        ЛЮБОЙ негодности переписи (нечитаемый ``built_at``, отсутствующий
+        ``bsl_count``, не-``0|1`` флаг), и тогда идентичность оставалась НЕсуженной —
+        хотя сам ``base_path`` при этом читается прекрасно. Принадлежность базе —
+        вопрос строго более простой, чем доказуемость поколения, и не должен зависеть
+        от исправности остальных ключей.
+
+        ``None`` = индекс базу не заявил (ключа нет либо он пуст) — это не
+        опровержение идентичности, а её отсутствие; судить по нему нельзя.
+        """
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM index_meta WHERE key = 'base_path'").fetchone()
+        value = row["value"] if row is not None else None
+        return value if isinstance(value, str) and value else None
+
+    @_transient_safe(lambda: None)
+    def get_build_capabilities(self) -> dict | None:
+        """Снимок доказуемости индекса: build-опции + фактическое поколение (v1.34.0).
+
+        Успешный SELECT НЕ является сертификатом того, что домен был включён при
+        build и покрывает фактический current root. Этот метод одним чтением
+        отдаёт то, чем такое доказательство только и может быть построено:
+
+        * ``has_synonyms`` / ``has_metadata`` — включённая build-ОПЦИЯ (не полнота);
+        * ``bsl_count`` — сколько BSL-файлов builder ОБНАРУЖИЛ;
+        * ``modules_count`` — сколько реально попало в ``modules``;
+        * ``base_path`` / ``built_at`` / ``build_in_progress`` — идентичность и
+          состояние сборки;
+        * ``data_version`` (``PRAGMA data_version``) — ловит writer, успевший
+          полностью завершиться между двумя снимками.
+
+        Схема, lock-файл, builder и ``get_statistics``/``get_index_info`` не
+        меняются. Метод НЕ кешируется: каждый public query-set, чьи строки
+        претендуют на exact/current-root coverage, обрамляется ДВУМЯ такими
+        чтениями. Транзиентный отказ (``@_transient_safe``) и невалидные строки
+        дают ``None`` — метод ничего не угадывает и не выпускает ``ValueError``.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM index_meta WHERE key IN "
+                "('has_synonyms','has_metadata','bsl_count','base_path','built_at','build_in_progress')"
+            ).fetchall()
+            meta = {r["key"]: r["value"] for r in rows}
+            modules_row = self._conn.execute("SELECT COUNT(*) AS n FROM modules").fetchone()
+            data_version_row = self._conn.execute("PRAGMA data_version").fetchone()
+
+        def _flag(key: str, default: bool) -> bool | None:
+            raw = meta.get(key)
+            if raw is None:
+                return default  # legacy-индекс без ключа — действующий дефолт
+            if raw in ("0", "1"):
+                return raw == "1"
+            return None  # присутствующее, но не 0|1 — не угадываем
+
+        has_synonyms = _flag("has_synonyms", True)
+        has_metadata = _flag("has_metadata", False)
+        if has_synonyms is None or has_metadata is None:
+            return None
+
+        raw_bsl = meta.get("bsl_count")
+        if raw_bsl is None:
+            return None
+        try:
+            bsl_count = int(raw_bsl)
+        except (TypeError, ValueError):
+            return None
+
+        base = meta.get("base_path")
+        built_at = meta.get("built_at")
+        if not base or built_at is None:
+            return None
+        try:
+            float(built_at)
+        except (TypeError, ValueError):
+            return None
+
+        return {
+            "has_synonyms": has_synonyms,
+            "has_metadata": has_metadata,
+            "bsl_count": bsl_count,
+            "modules_count": int(modules_row["n"]) if modules_row is not None else 0,
+            "base_path": base,
+            "built_at": str(built_at),
+            "build_in_progress": meta.get("build_in_progress"),
+            "data_version": (data_version_row[0] if data_version_row is not None else None),
+        }
 
     @_transient_safe(lambda: None)
     def get_all_modules(self) -> list[dict] | None:
@@ -9688,6 +10435,56 @@ class IndexReader:
                 return None
 
     @_transient_safe(lambda: None)
+    def count_objects(self, query: str, current_prefix: str | None = None) -> dict | None:
+        """COUNT по ТОМУ ЖЕ WHERE, что у ``search_objects`` (v1.34.0).
+
+        Образец — именно ``search_objects``, а НЕ соседний ``count_regions``:
+        последний ищет через ``LIKE '%' || py_lower(?) || '%'`` БЕЗ ``ESCAPE`` (и это
+        согласовано с его собственным ``search_regions``), а ``search_objects``
+        экранирует ``%``/``_``. Скопировав соседа «как принято в проекте», мы
+        получили бы расхождение count↔list на запросах с SQL-метасимволами.
+
+        ``limit`` на count не влияет — считается ПОЛНЫЙ набор, а не срез
+        ``ranked[:limit]``.
+
+        ``current_prefix`` (POSIX-relative component-prefix фактического
+        ``current_config_root``) делит СУЩЕСТВУЮЩУЮ колонку ``object_synonyms.file``
+        без материализации строк: колонки ``rel_path`` в этой таблице НЕТ. Предикат
+        границы — ``file = prefix OR file LIKE escaped(prefix) || '/%'`` с тем же
+        экранированием, что у остальных literal-LIKE маршрутов, поэтому ``ext`` не
+        матчится с ``ext2``. Split описывает только ФАКТИЧЕСКИЕ строки таблицы и
+        полноту НЕ сертифицирует.
+
+        Returns: ``{"total": int, "current_root": int|None}`` или ``None``.
+        """
+        with self._lock:
+            try:
+                params: list = []
+                if not query or not query.strip():
+                    where = "1=1"
+                else:
+                    like_q = f"%{_escape_for_sql_like(query.strip())}%"
+                    where = (
+                        "(py_lower(synonym) LIKE py_lower(?) ESCAPE '\\' "
+                        "OR py_lower(object_name) LIKE py_lower(?) ESCAPE '\\')"
+                    )
+                    params = [like_q, like_q]
+                row = self._conn.execute(f"SELECT COUNT(*) AS n FROM object_synonyms WHERE {where}", params).fetchone()
+                total = int(row["n"]) if row is not None else 0
+                current_root = None
+                prefix = (current_prefix or "").strip().strip("/")
+                if prefix:
+                    scoped = self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM object_synonyms "
+                        f"WHERE {where} AND (file = ? OR file LIKE ? ESCAPE '\\')",
+                        [*params, prefix, _escape_for_sql_like(prefix) + "/%"],
+                    ).fetchone()
+                    current_root = int(scoped["n"]) if scoped is not None else 0
+                return {"total": total, "current_root": current_root}
+            except sqlite3.OperationalError:
+                return None
+
+    @_transient_safe(lambda: None)
     def search_regions(self, query: str, limit: int = 200) -> list[dict] | None:
         """Search code regions (#Область) by name substring.
 
@@ -9792,6 +10589,52 @@ class IndexReader:
                         (query.strip(),),
                     ).fetchone()
                 return int(row[0]) if row is not None else 0
+            except sqlite3.OperationalError:
+                return None
+
+    @_transient_safe(lambda: None)
+    def group_regions(self, query: str = "", by: str = "name", limit: int = 200) -> dict | None:
+        """Топ-N областей, сгруппированных по ``name`` либо ``category``.
+
+        Зачем отдельный метод, а не срез выдачи: списочная ветка ``search_regions``
+        при пустом query идёт ``ORDER BY r.name``, поэтому ``limit`` даёт АЛФАВИТНЫЙ
+        префикс, а не выборку. Любая агрегация по такому срезу систематически неверна
+        (на боевой конфигурации топ-10 по 5000 строкам из 57 652 не пересекался с
+        истинным). Здесь считает SQLite по ПОЛНОМУ набору, а ``limit`` режет уже
+        готовые группы.
+
+        WHERE повторяет ``search_regions``/``count_regions`` слово в слово, поэтому
+        сумма COUNT по ВСЕМ группам равна ``count_regions(query)``.
+
+        Returns:
+            ``{"groups": [{"key", "count"}], "groups_total": N}`` (группы отсортированы
+            по убыванию count, при равенстве — по ключу), либо None если таблицы нет.
+        """
+        col = "m.category" if by == "category" else "r.name"
+        with self._lock:
+            try:
+                where = ""
+                params: tuple = ()
+                if query and query.strip():
+                    where = "WHERE py_lower(r.name) LIKE '%' || py_lower(?) || '%' "
+                    params = (query.strip(),)
+                rows = self._conn.execute(
+                    f"SELECT {col} AS k, COUNT(*) AS c "
+                    "FROM regions r JOIN modules m ON m.id = r.module_id "
+                    f"{where}"
+                    f"GROUP BY {col} ORDER BY c DESC, k LIMIT ?",
+                    (*params, limit),
+                ).fetchall()
+                total_row = self._conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM regions r JOIN modules m ON m.id = r.module_id "
+                    f"{where}"
+                    f"GROUP BY {col})",
+                    params,
+                ).fetchone()
+                return {
+                    "groups": [{"key": r["k"], "count": int(r["c"])} for r in rows],
+                    "groups_total": int(total_row[0]) if total_row is not None else 0,
+                }
             except sqlite3.OperationalError:
                 return None
 
