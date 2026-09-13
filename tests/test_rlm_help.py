@@ -175,7 +175,10 @@ def test_disambiguation_full(dispatch):
     res = dispatch(section="disambiguation")
     assert res["mode"] == "disambiguation"
     assert isinstance(res["result"], list)
-    assert len(res["result"]) == 12
+    # v1.36.0: +1 for (find_roles, find_role_objects), +1 for
+    # (get_object_full_structure, get_object_structures) — mirror of
+    # test_strategy_data.py::test_disambiguation_pairs_count.
+    assert len(res["result"]) == 14
 
 
 def test_disambiguation_filter_by_helpers(dispatch):

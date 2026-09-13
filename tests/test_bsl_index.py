@@ -1399,6 +1399,133 @@ class TestIncrementalUpdate:
 
 
 # =====================================================================
+# Metadata-only tree (XML, no .bsl) — v1.36.0
+#
+# Раньше `_build_into_conn` на `total_files == 0` уходил в ранний выход и
+# наполнял только file_paths, хотя почти весь индекс строится из XML. Дерево
+# метаданных без модулей (cfe с одними правами/подсистемами; выгрузка, куда
+# модули ещё не легли) получало индекс без синонимов/реквизитов/прав — и при
+# этом мета заявляла has_synonyms/has_metadata/has_fts = 1. Плюс methods_fts не
+# создавалась, и первый же update() после появления модуля падал.
+# =====================================================================
+
+_CATALOG_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core">
+\t<Catalog>
+\t\t<Properties>
+\t\t\t<Name>Контрагенты</Name>
+\t\t\t<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Контрагенты</v8:content></v8:item></Synonym>
+\t\t</Properties>
+\t\t<ChildObjects>
+\t\t\t<Attribute><Properties><Name>ИНН</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute>
+\t\t</ChildObjects>
+\t</Catalog>
+</MetaDataObject>
+"""
+
+_RIGHTS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Rights xmlns="http://v8.1c.ru/8.2/roles" xsi:type="Rights"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.12">
+\t<object>
+\t\t<name>Catalog.Контрагенты</name>
+\t\t<right><name>Read</name><value>true</value></right>
+\t\t<right><name>Update</name><value>true</value></right>
+\t</object>
+</Rights>
+"""
+
+
+@pytest.fixture
+def metadata_only_tree(tmp_path, monkeypatch):
+    """CF-дерево БЕЗ единого .bsl: справочник с синонимом и реквизитом + роль с правами."""
+    monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / ".index"))
+    (tmp_path / "Configuration.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n<MetaDataObject/>\n', encoding="utf-8"
+    )
+    # Раскладка Cat/Obj/Ext/<Type>.xml — та же, что у объектов с модулями в реальной
+    # выгрузке; только .bsl рядом не кладём.
+    cat_ext = tmp_path / "Catalogs" / "Контрагенты" / "Ext"
+    cat_ext.mkdir(parents=True)
+    (cat_ext / "Catalog.xml").write_text(_CATALOG_XML, encoding="utf-8")
+    role_ext = tmp_path / "Roles" / "ПолныеПрава" / "Ext"
+    role_ext.mkdir(parents=True)
+    (role_ext / "Rights.xml").write_text(_RIGHTS_XML, encoding="utf-8")
+    return tmp_path
+
+
+def _counts(db_path, *tables):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
+    finally:
+        conn.close()
+
+
+class TestMetadataOnlyTree:
+    def test_xml_derived_tables_are_populated_without_any_bsl(self, metadata_only_tree):
+        """Ни одного .bsl — но синонимы, реквизиты и права роли обязаны попасть в индекс."""
+        db_path = IndexBuilder().build(str(metadata_only_tree))
+
+        c = _counts(db_path, "modules", "methods", "object_synonyms", "object_attributes", "role_rights")
+        assert c["modules"] == 0 and c["methods"] == 0, "модулей нет — это нормально"
+        assert c["object_synonyms"] > 0, "синонимы берутся из XML и не зависят от наличия модулей"
+        assert c["object_attributes"] > 0, "реквизиты берутся из XML"
+        assert c["role_rights"] > 0, "права роли берутся из Rights.xml"
+
+    def test_reader_answers_instead_of_silently_returning_nothing(self, metadata_only_tree):
+        """Прежде search_objects отдавал пусто — неотличимо от «такого объекта нет»."""
+        db_path = IndexBuilder().build(str(metadata_only_tree))
+        reader = IndexReader(str(db_path))
+        try:
+            rows = reader.find_objects_by_criterion(name_like="Контрагент", limit=10)
+            assert rows is not None, "object_synonyms не пуста → None недопустим"
+            assert [r["object_name"] for r in rows] == ["Контрагенты"]
+            assert reader.get_role_objects("ПолныеПрава")
+        finally:
+            reader.close()
+
+    def test_meta_flags_do_not_outrun_reality(self, metadata_only_tree):
+        """has_fts=1 обязан означать, что methods_fts ДЕЙСТВИТЕЛЬНО существует."""
+        db_path = IndexBuilder().build(str(metadata_only_tree))
+        conn = sqlite3.connect(str(db_path))
+        try:
+            has_fts = conn.execute("SELECT value FROM index_meta WHERE key='has_fts'").fetchone()
+            fts_exists = conn.execute("SELECT name FROM sqlite_master WHERE name='methods_fts'").fetchone()
+            assert (has_fts is not None and has_fts[0] == "1") == bool(fts_exists)
+        finally:
+            conn.close()
+
+    def test_update_after_the_first_module_appears_does_not_crash(self, metadata_only_tree):
+        """Регрессия: update() падал с 'no such table: methods_fts', когда в дерево
+        метаданных клали ПЕРВЫЙ модуль (мета обещала FTS, таблицы не было)."""
+        db_path = IndexBuilder().build(str(metadata_only_tree))
+
+        ext = metadata_only_tree / "CommonModules" / "Сервис" / "Ext"
+        ext.mkdir(parents=True)
+        (ext / "Module.bsl").write_text("Процедура Первая() Экспорт\nКонецПроцедуры\n", encoding="utf-8-sig")
+
+        result = IndexBuilder().update(str(metadata_only_tree))  # не должно бросать
+
+        assert result["added"] == 1
+        c = _counts(db_path, "modules", "methods", "object_synonyms")
+        assert c["modules"] == 1 and c["methods"] == 1
+        assert c["object_synonyms"] > 0, "метаданные пережили инкрементальное обновление"
+
+    def test_rebuild_after_all_modules_removed_leaves_no_orphans(self, built_index):
+        """Ради чего ранний выход и писался: пересборка дерева, из которого удалили ВСЕ
+        модули, не должна оставлять сирот в modules/methods/calls."""
+        db_path, base_path = built_index
+        base = tmp_path_from_base(base_path)
+        for f in base.rglob("*.bsl"):
+            f.unlink()
+
+        IndexBuilder().build(base_path)
+
+        c = _counts(db_path, "modules", "methods", "calls")
+        assert c == {"modules": 0, "methods": 0, "calls": 0}
+
+
+# =====================================================================
 # Staleness / freshness tests
 # =====================================================================
 
@@ -2087,6 +2214,174 @@ class TestExactRefReaders:
         reader = IndexReader(str(db_path))
         try:
             assert reader.get_roles_exact("Document.НесуществующийДок") == []
+        finally:
+            reader.close()
+
+    def test_get_role_objects_reverse_lookup(self, tmp_path, monkeypatch):
+        """get_role_objects('РольА') — reverse of get_roles: role → its objects."""
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            rows = reader.get_role_objects("РольА")
+            assert len(rows) == 1, f"exactly one role must match by exact name; got {rows}"
+            row = rows[0]
+            assert row["role_name"] == "РольА"
+            assert set(row["rights"]) == {"Read", "Update"}
+            assert row["matched_objects"] == ["Document.ЗаказПоставщику"]
+            by_obj = {o["object"]: set(o["rights"]) for o in row["rights_by_object"]}
+            assert by_obj == {"Document.ЗаказПоставщику": {"Read", "Update"}}
+            assert row["details_truncated"] is False
+        finally:
+            reader.close()
+
+    def test_get_role_objects_case_insensitive_and_role_prefix_agnostic(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # COLLATE NOCASE on role_name — lower-case query still finds "РольB".
+            rows = reader.get_role_objects("рольb")
+            assert {r["role_name"] for r in rows} == {"РольB"}
+        finally:
+            reader.close()
+
+    def test_get_role_objects_does_not_cross_match_other_roles(self, tmp_path, monkeypatch):
+        """EXACT match: 'Роль' alone must NOT pull in 'РольА'/'РольB'/'РольC' (no substring)."""
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_role_objects("Роль") == []
+        finally:
+            reader.close()
+
+    def test_get_role_objects_empty_table_none_vs_no_match_empty(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        reader = IndexReader(str(db_path))
+        try:
+            # Empty role_rights table → None (caller marks 'unavailable').
+            assert reader.get_role_objects("РольА") is None
+        finally:
+            reader.close()
+        # Seed, then ask for a role name that doesn't exist → [] (authoritative empty).
+        self._seed(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.get_role_objects("НесуществующаяРоль") == []
+        finally:
+            reader.close()
+
+    def _seed_object_synonyms(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.executemany(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES (?, ?, ?, ?)",
+            [
+                ("ЗаказПоставщику", "Documents", "Заказ поставщику", "Documents/ЗаказПоставщику/Ext/ObjectModule.bsl"),
+                ("ЗаказПокупателя", "Documents", "Заказ покупателя", "Documents/ЗаказПокупателя/Ext/ObjectModule.bsl"),
+                ("Контрагенты", "Catalogs", "Контрагенты", "Catalogs/Контрагенты/Ext/ObjectModule.bsl"),
+                ("Номенклатура_50%", "Catalogs", "", "Catalogs/Номенклатура_50%/Ext/ObjectModule.bsl"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+    def test_find_objects_by_criterion_name_like_only(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            rows = reader.find_objects_by_criterion(name_like="заказ", limit=50)
+            names = {r["object_name"] for r in rows}
+            assert names == {"ЗаказПоставщику", "ЗаказПокупателя"}, f"substring+case-insensitive match; got {names}"
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_matches_synonym_too(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # "поставщику" only appears in the synonym text of ЗаказПоставщику, not
+            # (fully) in the object_name of ЗаказПокупателя — should match via OR on synonym.
+            rows = reader.find_objects_by_criterion(name_like="Заказ поставщику", limit=50)
+            names = {r["object_name"] for r in rows}
+            assert names == {"ЗаказПоставщику"}
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_category_only(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            rows = reader.find_objects_by_criterion(category="Catalogs", limit=50)
+            names = {r["object_name"] for r in rows}
+            assert names == {"Контрагенты", "Номенклатура_50%"}
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_combined_and_semantics(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # name_like="заказ" alone matches 2 Documents; category="Catalogs" matches
+            # neither of those → combined (AND) must be empty, not the union.
+            rows = reader.find_objects_by_criterion(name_like="заказ", category="Catalogs", limit=50)
+            assert rows == []
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_empty_both_lists_all(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            rows = reader.find_objects_by_criterion(limit=50)
+            assert len(rows) == 4
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_truncation_via_limit_plus_one(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # Caller pattern: request limit+1, then slice — verify the reader itself
+            # honors whatever LIMIT it's given (truncation logic lives in the caller).
+            rows = reader.find_objects_by_criterion(limit=2)
+            assert len(rows) == 2
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_escapes_percent_and_underscore(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            # Literal '%' in the object name must NOT act as an SQL wildcard: a
+            # search for "_50%" should only match the one object that literally
+            # contains that substring, not every row (which an unescaped '%' would).
+            rows = reader.find_objects_by_criterion(name_like="_50%", limit=50)
+            names = {r["object_name"] for r in rows}
+            assert names == {"Номенклатура_50%"}, f"escaping failed, got {names}"
+        finally:
+            reader.close()
+
+    def test_find_objects_by_criterion_empty_table_none_vs_no_match_empty(self, tmp_path, monkeypatch):
+        db_path = _minimal_index_with_meta(tmp_path, monkeypatch)
+        reader = IndexReader(str(db_path))
+        try:
+            # Empty object_synonyms table → None (caller marks 'unavailable').
+            assert reader.find_objects_by_criterion(name_like="заказ") is None
+        finally:
+            reader.close()
+        # Seed, then ask for something that matches nothing → [] (authoritative empty).
+        self._seed_object_synonyms(db_path)
+        reader = IndexReader(str(db_path))
+        try:
+            assert reader.find_objects_by_criterion(name_like="НесуществующийОбъект") == []
         finally:
             reader.close()
 

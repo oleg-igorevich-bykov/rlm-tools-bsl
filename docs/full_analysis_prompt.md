@@ -57,9 +57,9 @@ This prompt exercises all 45 BSL helpers (v1.10.0) without explicitly naming the
 | Call graph | `find_callers_context`, `find_call_hierarchy` |
 | XML parsing | `parse_object_xml`, `find_enum_values` |
 | Business analysis | `analyze_object`, `analyze_document_flow`, `analyze_subsystem` |
-| Composite | `get_object_full_structure`, `analyze_object`, `analyze_document_flow` |
+| Composite | `get_object_full_structure`, `get_object_structures`, `analyze_object`, `analyze_document_flow` |
 | Customizations | `find_custom_modifications`, `detect_extensions`, `find_ext_overrides` |
-| Infrastructure | `find_register_movements`, `find_register_writers`, `find_based_on_documents`, `find_event_subscriptions`, `find_scheduled_jobs`, `find_print_forms`, `find_functional_options`, `find_roles` |
+| Infrastructure | `find_register_movements`, `find_register_writers`, `find_based_on_documents`, `find_event_subscriptions`, `find_scheduled_jobs`, `find_print_forms`, `find_functional_options`, `find_roles`, `find_role_objects` |
 | Integration (v1.4.0) | `find_http_services`, `find_web_services`, `find_xdto_packages`, `find_exchange_plan_content` |
 | Strategy | Step 0 UNDERSTAND + business recipe (проведение/печать/интеграция/перечисления/ввод на основании/структура объекта) via `get_strategy(query=...)` |
 | Help | `help` |

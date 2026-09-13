@@ -100,11 +100,17 @@ from rlm_tools_bsl.format_detector import detect_format
 # Проза ужималась ПЕРВОЙ: длинные пояснения переехали в НЕбюджетируемый `recipe`
 # (rlm_help отдаёт его по запросу), из подписей убраны дубли и marketing-фразы.
 # Оставшееся неустранимо без удаления самих имён ключей.
+# v1.36.0 re-baseline (INTENTIONAL — по собственной инструкции этого теста).
+# Рост — агент-facing контракт новых возможностей релиза, не дрейф:
+#   * graph_bridge  → блок GRAPH (if available) в full-стратегии (+780) и
+#                     GRAPH_HELPER_SIGNATURES в available_functions;
+#   * find_role_objects / get_object_structures → новые сигнатуры + рецепты.
+# slim-ячейки НЕ трогаются: они в потолок укладываются.
 _BASELINES = {
     ("slim", ""): 7146,
     ("slim", "проведение"): 7990,
-    ("full", ""): 33858,
-    ("full", "проведение"): 35597,
+    ("full", ""): 37240,
+    ("full", "проведение"): 38979,
 }
 # Whole rlm_start payload baselines (strategy + available_functions + index +
 # extension_context) for a fixed minimal INDEXED config — the plan's real target.
@@ -119,7 +125,7 @@ _BASELINES = {
 # next edit trips the guard on its own merits rather than on inherited saturation.
 # v1.34.0: slim НЕ ре-бэйслайнится (см. пояснение к _BASELINES) — прежний потолок
 # 21725 держится. full двигается на измеренную величину.
-_PAYLOAD_BASELINES = {"slim": 20691, "full": 48037}
+_PAYLOAD_BASELINES = {"slim": 22317, "full": 52045}
 # Domain-matched whole-payload бэйслайны (v1.34.0). Заполняются измерением ниже —
 # см. test_domain_matched_rlm_start_payload_within_budget. «проведение» осознанно
 # фиксируется отдельно: там потолок +5% был превышен ещё ДО релиза.
@@ -127,13 +133,13 @@ _DOMAIN_PAYLOAD_BASELINES: dict[tuple[str, str], int] = {
     # «права» — рамка Задачи 8 (доменный рецепт инлайнится в стратегию и уезжает в
     # payload). Ре-бэйслайн осознанный, по ИЗМЕРЕННОЙ serialized delta.
     ("slim", "права"): 22308,
-    ("full", "права"): 48546,
+    ("full", "права"): 52593,
     # «проведение» фиксируется ОТДЕЛЬНО и осознанно: на этом маршруте объявленный
     # +5% был превышен ещё ДО v1.34.0 (пре-существующее состояние вне изменяемого
     # пути — Задачи 1/2 этот рецепт СОКРАЩАЮТ). Маскировать его общим ре-бэйслайном
     # ячеек «права» нельзя.
     ("slim", "проведение"): 22631,
-    ("full", "проведение"): 48864,
+    ("full", "проведение"): 52911,
 }
 
 _DRIFT = 1.05  # allow ≤5% growth before failing
@@ -193,7 +199,10 @@ def test_get_object_profile_signature_stays_compact():
 
 def test_helper_snapshot_count_locked():
     """Adding/removing a registered helper is an intentional change — update this number."""
-    assert len(build_helper_metadata_snapshot()) == 53
+    # v1.36.0: +1 for find_role_objects (role→objects reverse lookup, code-index
+    # comparison gap #8), +1 for get_object_structures (batch criterion-selector,
+    # code-index comparison gap #4).
+    assert len(build_helper_metadata_snapshot()) == 55
 
 
 @pytest.mark.parametrize("mode", ["slim", "full"])
@@ -279,7 +288,7 @@ def _run_payload_budget(monkeypatch, tmp_path, mode, query, baseline, require_gi
 # baseline; git — optional runtime capability, поэтому среда без него скипается тем
 # же способом, что и tests/test_sandbox_parity.py. Production coverage это не
 # ослабляет: там сама git-ветка недостижима, а non-git baseline выполняется всегда.
-_GIT_PAYLOAD_BASELINES = {"slim": 22814, "full": 49528}
+_GIT_PAYLOAD_BASELINES = {"slim": 22814, "full": 53575}
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git недоступен")

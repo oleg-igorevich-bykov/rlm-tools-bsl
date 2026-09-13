@@ -221,7 +221,12 @@ def test_multiple_extensions():
 
 
 def test_empty_dir_context():
-    with tempfile.TemporaryDirectory() as d:
+    # detect_extension_context сканирует родителя И деда. Без двух уровней своей
+    # вложенности дедом оказывается общий TMPDIR, и под -n/xdist сюда протекают
+    # cf-фикстуры ДРУГИХ тестов (nearby_main перестаёт быть None).
+    with tempfile.TemporaryDirectory() as root:
+        d = os.path.join(root, "nest", "empty")
+        os.makedirs(d)
         ctx = detect_extension_context(d)
         assert ctx.current.role == ConfigRole.UNKNOWN
         assert ctx.nearby_extensions == []
@@ -243,7 +248,9 @@ def test_warnings_main_with_extensions():
 
 def test_warnings_extension_standalone():
     """Extension without nearby main config."""
-    with tempfile.TemporaryDirectory() as parent:
+    with tempfile.TemporaryDirectory() as root:
+        # Два уровня вложенности — см. комментарий в test_empty_dir_context.
+        parent = os.path.join(root, "nest")
         ext_dir = os.path.join(parent, "ext")
         _write(os.path.join(ext_dir, "Configuration.xml"), _cf_extension_xml("Одиночка", "Customization", "о_"))
 

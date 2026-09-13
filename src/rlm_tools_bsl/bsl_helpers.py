@@ -3450,7 +3450,7 @@ def make_bsl_helpers(
         direction: str = "callers",
         depth: int = 2,
         module_hint: str = "",
-        include_triggers: bool = False,
+        include_triggers: bool = True,
     ) -> dict:
         """Build multi-level call hierarchy. Only direction='callers'
         (uses idx_calls_callee). callees/both → structured error-dict.
@@ -3459,13 +3459,21 @@ def make_bsl_helpers(
             name: Target procedure/function name.
             direction: 'callers' only.
             depth: Levels to traverse (1..3, default 2).
-            include_triggers: when True, annotate each tree node with a `triggers`
-                list — the NON-call inbound edges into that method (event
-                subscriptions, form-event handlers, scheduled jobs, CFE overrides)
-                via get_inbound_edges. Default False keeps the output byte-for-byte
-                identical (the `triggers` key is added ONLY when True). Triggers are
-                a leaf annotation, NOT new BFS targets — a subscription/job/form is
-                an ENTRY POINT, not a caller. Each trigger:
+            include_triggers: when True (DEFAULT since v1.36.0 — code-index
+                comparison found this off-by-default a live risk: "нет callers"
+                read as "dead code" for a form-event-only handler, the single
+                most dangerous class of false negative for refactoring), annotate
+                each tree node with a `triggers` list — the NON-call inbound edges
+                into that method (event subscriptions, form-event handlers,
+                scheduled jobs, CFE overrides) via get_inbound_edges. Pass False to
+                skip it (one extra get_inbound_edges call per visited node — up to
+                _HIERARCHY_VISITED_CAP=2000 on a wide/dense root; cheap on typical
+                depth=2 trees, but skip it for a quick shape-only look at a hot,
+                widely-called name). When enabled the `triggers` key is ALWAYS
+                present (=[] on the FS/no-index path), so the shape is reliable.
+                A procedure with an EMPTY `callers` list but a NON-empty `triggers`
+                list is still reachable — it is NOT dead code; do not report
+                "nobody calls this" without checking `triggers` too. Each trigger:
                 {edge_type, source_name, source_kind, detail, file, line,
                  caller_name, object_name, category, target_key, resolved}.
             module_hint: Optional disambiguator for the ROOT target — enables the
@@ -3663,7 +3671,7 @@ def make_bsl_helpers(
         max_depth: int = 4,
         from_hint: str = "",
         to_hint: str = "",
-        include_triggers: bool = False,
+        include_triggers: bool = True,
     ) -> dict:
         """Reachability over the CALL graph: can ``from_name`` transitively reach
         ``to_name`` through calls (``from → … → to``)?
@@ -3682,7 +3690,9 @@ def make_bsl_helpers(
                 method to one module. ``to_hint`` enables the exact-mode root;
                 ``from_hint`` makes the hit test pin ``from`` to its module.
             include_triggers: annotate each path node with its non-call inbound
-                edges via get_inbound_edges (see find_call_hierarchy).
+                edges via get_inbound_edges (see find_call_hierarchy). DEFAULT
+                True since v1.36.0 — pass False to skip it on a long/hot path
+                where the extra per-node lookup isn't needed.
 
         Returns:
             {found, from, to, path:[{name, module_path, call_line, triggers?}]|None,
@@ -5444,7 +5454,9 @@ def make_bsl_helpers(
 
         return None, None
 
-    def get_object_full_structure(name: str, category_hint: str | None = None) -> dict:
+    def get_object_full_structure(
+        name: str, category_hint: str | None = None, enum_values_limit: int = 50
+    ) -> dict:
         """Aggregating helper: full object structure in one call.
 
         Combines metadata from object_attributes / predefined_items / object_synonyms /
@@ -5515,10 +5527,34 @@ def make_bsl_helpers(
            attributes, tabular_sections:[{name, synonym, columns}],
            dimensions, resources, predefined_items,
            enum_values_for_typed_refs:{Enum.X:[...]},
+           enum_values_truncated:{Enum.X:{total, returned, has_more}},
            forms:[str],
            _meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}
+
+        ``enum_values_limit`` (v1.36.0, default 50): a single object can carry
+        SEVERAL enum-typed attributes/dimensions/resources/TS-columns, and each
+        referenced enum's FULL value list used to be embedded in
+        ``enum_values_for_typed_refs`` with no cap at all — every other section
+        here (attributes, predefined_items, ...) is already bounded, this was
+        the one unbounded corner (code-index comparison, gap #5). Each enum's
+        list in ``enum_values_for_typed_refs`` is now capped at this many
+        values; ``enum_values_truncated`` carries a ``{total, returned,
+        has_more}`` entry ONLY for refs that were actually cut (empty dict —
+        the common case, since most enums have far fewer than 50 values —
+        keeps the byte-for-byte shape it always had). This aggregate does not
+        paginate a truncated enum further: get the FULL list for one specific
+        enum via the standalone ``find_enum_values(name)`` (unbounded by
+        design — a single enum's own values are cheap even in the hundreds).
         """
         name = _strip_meta_prefix(name)
+        enum_values_limit, _ev_limit_warning = _coerce_bound(
+            enum_values_limit,
+            50,
+            "enum_values_limit",
+            "get_object_full_structure(name, category_hint=None, enum_values_limit=50)",
+            maximum=500,
+        )
+        _warn_bound(_ev_limit_warning)
 
         # --- Resolve (category, object_name) via metadata-first cascade ---
         # find_module() работает только по BSL-модулям, поэтому XML-only объекты
@@ -5548,6 +5584,7 @@ def make_bsl_helpers(
             "resources": [],
             "predefined_items": [],
             "enum_values_for_typed_refs": {},
+            "enum_values_truncated": {},
             "forms": [],
             "_meta": {
                 "index_used": False,
@@ -5920,10 +5957,134 @@ def make_bsl_helpers(
             except Exception:
                 continue
             if isinstance(ev, dict) and not ev.get("error"):
-                result["enum_values_for_typed_refs"][ref] = [
+                all_values = [
                     {"name": v.get("name", ""), "synonym": v.get("synonym", "") or ""} for v in (ev.get("values") or [])
                 ]
+                total = len(all_values)
+                if total > enum_values_limit:
+                    result["enum_values_for_typed_refs"][ref] = all_values[:enum_values_limit]
+                    result["enum_values_truncated"][ref] = {
+                        "total": total,
+                        "returned": enum_values_limit,
+                        "has_more": True,
+                    }
+                else:
+                    result["enum_values_for_typed_refs"][ref] = all_values
 
+        return result
+
+    def get_object_structures(
+        name_like: str = "",
+        category: str = "",
+        names_only: bool = False,
+        limit: int = 50,
+        enum_values_limit: int = 50,
+    ) -> dict:
+        """Batch structure fetch across SEVERAL matched objects in one call
+        (v1.36.0 — code-index comparison, gap #4: ``get_object_full_structure``/
+        ``get_object_profile`` are single-object only; the agent had to
+        enumerate matches via ``search_objects``/``find_module`` and call the
+        single-object aggregator once per hit — one round-trip per object for
+        something like "every register whose name contains Взаиморасчеты").
+
+        Two independent selectors narrow WHICH objects match — both optional,
+        combine with AND:
+          name_like: substring against object_name OR synonym (case-insensitive,
+              literal — same escaping as search_objects/find_roles). Empty = any name.
+          category:  exact category (e.g. 'Documents', 'AccumulationRegisters').
+              Empty = any category. Passing category alone (empty name_like)
+              means "every object in this category" — the common "list all
+              Documents" case.
+
+        ``names_only=True`` (default False) stops at the CHEAPEST answer: just
+        the passport of each match (object_name, category, synonym) — no
+        per-object structure fetch at all. Use this first to see HOW MANY
+        objects a criterion matches and decide whether the full batch is
+        worth the cost, mirroring code-index's own passport-only search mode.
+
+        ``names_only=False`` additionally calls ``get_object_full_structure``
+        for EACH matched object (bounded by ``limit``) and returns its full
+        result keyed by object_name; ``enum_values_limit`` is forwarded to
+        every one of those calls. One bad object does NOT sink the whole
+        batch — its slot gets ``{error}`` instead (same per-item isolation
+        convention as ``find_enum_values``'s list-overload).
+
+        Args:
+            name_like / category: see above.
+            names_only: passport-only mode (see above).
+            limit: max objects to expand (default 50, hard ceiling 200 — a
+                batch of full structures is heavier than a batch of passports,
+                so this stays index-only; without an index use
+                search_objects()/find_module() + get_object_full_structure()
+                per hit instead, which already works without one).
+            enum_values_limit: forwarded to get_object_full_structure per
+                object when names_only=False (see its own docstring).
+
+        Returns:
+            ``{criterion:{name_like, category}, total_matched, returned,
+            truncated, names_only, objects}`` where ``objects`` is
+            ``[{object_name, category, synonym}]`` when ``names_only=True``,
+            or ``{object_name: <get_object_full_structure result>|{error}}``
+            when ``False``. ``total_matched`` counts only up to ``limit + 1``
+            (cheap truncation check, not a full COUNT) — read it as "at least
+            this many", not an exact total, when ``truncated=True``.
+            ``{error, hint}`` (no other keys) if no index is available — this
+            batch selector is index-only by design (see ``limit`` above)."""
+        limit, _limit_warning = _coerce_bound(
+            limit, 50, "limit", "get_object_structures(name_like='', category='', limit=50)", maximum=200
+        )
+        _warn_bound(_limit_warning)
+        enum_values_limit, _ev_warning = _coerce_bound(
+            enum_values_limit,
+            50,
+            "enum_values_limit",
+            "get_object_structures(name_like='', category='', enum_values_limit=50)",
+            maximum=500,
+        )
+        _warn_bound(_ev_warning)
+
+        if idx_reader is None:
+            return {
+                "error": "get_object_structures требует SQLite-индекс",
+                "hint": "Без индекса перебирайте search_objects()/find_module() + "
+                "get_object_full_structure() по одному объекту — они работают и без индекса.",
+            }
+
+        rows = idx_reader.find_objects_by_criterion(name_like, category, limit + 1)
+        if rows is None:
+            return {
+                "error": "get_object_structures требует SQLite-индекс",
+                "hint": "Таблица object_synonyms недоступна/пуста — индекс не построен или устарел.",
+            }
+
+        truncated = len(rows) > limit
+        page = rows[:limit]
+
+        result: dict = {
+            "criterion": {"name_like": name_like, "category": category},
+            "total_matched": len(page) if not truncated else limit + 1,
+            "returned": len(page),
+            "truncated": truncated,
+            "names_only": names_only,
+        }
+
+        if names_only:
+            result["objects"] = [
+                {"object_name": r["object_name"], "category": r["category"], "synonym": r.get("synonym") or ""}
+                for r in page
+            ]
+            return result
+
+        objects: dict = {}
+        for r in page:
+            obj_name = r["object_name"]
+            try:
+                objects[obj_name] = get_object_full_structure(
+                    obj_name, category_hint=r["category"], enum_values_limit=enum_values_limit
+                )
+            except Exception as exc:
+                objects[obj_name] = {"error": f"{type(exc).__name__}: {exc}"}
+        result["objects"] = objects
         return result
 
     def _resolve_object_for_modules(name: str):
@@ -9491,7 +9652,7 @@ def make_bsl_helpers(
             posting_calls_offset=posting_calls_offset,
         )
 
-    def find_register_writers(register_name: str) -> dict:
+    def find_register_writers(register_name: str, limit: int = 200) -> dict:
         """Find static document references to a specific register.
 
         Отдаёт ВСЕ известные индексу источники записи, а не только прямые
@@ -9504,10 +9665,23 @@ def make_bsl_helpers(
 
         Args:
             register_name: Register name to search for.
+            limit: cap on ``writers`` (v1.36.0, default 200, потолок 2000). A
+                popular register (e.g. warehouse stock) can be written by
+                dozens–hundreds of document types on a large ERP — this was the
+                one unbounded corner of the reverse-lookup family (code-index
+                comparison, gap #1: every OTHER list-returning helper here is
+                already capped one way or another). ``total_writers`` stays the
+                TRUE total (unchanged, pre-existing field); new ``returned``/
+                ``has_more`` describe the ``writers`` page. Default is generous
+                enough that real configs essentially never see ``has_more=True``.
 
         Returns: dict with register, writers, total_documents_scanned, total_writers,
-                 runtime_filtered=False, and an interpretation hint."""
+                 returned, has_more, runtime_filtered=False, and an interpretation hint."""
         register_name = _strip_meta_prefix(register_name)
+        limit, _limit_warning = _coerce_bound(
+            limit, 200, "limit", "find_register_writers(register_name, limit=200)", maximum=2000
+        )
+        _warn_bound(_limit_warning)
         runtime_hint = (
             "Статические ссылки из кода/индекса: CFE-замены и Posting=Deny здесь не применяются. "
             "find_register_movements(document) применяет эти фильтры, но main-строки там остаются "
@@ -9518,13 +9692,17 @@ def make_bsl_helpers(
         if idx_reader is not None:
             idx_writers = idx_reader.get_register_writers(register_name)
             if idx_writers is not None:
+                all_writers = [
+                    {"document": w["document_name"], "source": w["source"], "file": w["file"]} for w in idx_writers
+                ]
+                page = all_writers[:limit]
                 return {
                     "register": register_name,
-                    "writers": [
-                        {"document": w["document_name"], "source": w["source"], "file": w["file"]} for w in idx_writers
-                    ],
+                    "writers": page,
                     "total_documents_scanned": 0,
-                    "total_writers": len(idx_writers),
+                    "total_writers": len(all_writers),
+                    "returned": len(page),
+                    "has_more": len(all_writers) > len(page),
                     "runtime_filtered": False,
                     "hint": runtime_hint,
                 }
@@ -9562,11 +9740,14 @@ def make_bsl_helpers(
                     }
                 )
 
+        page = writers[:limit]
         return {
             "register": register_name,
-            "writers": writers,
+            "writers": page,
             "total_documents_scanned": len(doc_modules),
             "total_writers": len(writers),
+            "returned": len(page),
+            "has_more": len(writers) > len(page),
             "runtime_filtered": False,
             "hint": runtime_hint,
         }
@@ -11289,6 +11470,108 @@ def make_bsl_helpers(
             "object": object_name,
             "roles": grouped_rows,
             "match": "substring",
+            "case_sensitive": True,
+        }
+
+    def find_role_objects(role_name: str, details_limit: int = _ROLE_DETAILS_DEFAULT) -> dict:
+        """Reverse of find_roles: what objects a role grants rights to — EXACT match.
+
+        ``find_roles`` answers "who has rights on object X" (BROAD substring on
+        the object side, see its docstring for why). This answers the other
+        direction: "what is role Y allowed to touch". Added v1.36.0 per the
+        code-index comparison (gap #8): the object→roles direction already
+        existed via ``find_roles``, but the reverse had no dedicated route and
+        required a raw ``bsl_sql`` scan of ``role_rights``.
+
+        Unlike object names, role names are simple identifiers with no member
+        nesting (no ``Role.X.Command.Y``), so this matches EXACTLY
+        (case-insensitive) rather than by substring — a broad match here would
+        only invite false positives, not useful recall. An optional leading
+        ``'Role.'`` prefix is stripped for convenience (mirrors how such prefixes
+        are accepted elsewhere); the index stores the bare name (folder under
+        ``Roles/``).
+
+        Args:
+            role_name: role name, with or without a leading ``'Role.'`` prefix,
+                e.g. ``'ПолныеПрава'`` or ``'Role.ПолныеПрава'``.
+            details_limit: bounded sample distinct-пар ``(object, right)`` — same
+                normalizer/cap as ``find_roles`` (0..100, default 20).
+
+        Returns: ``{role, roles: [...] (0 or 1 elements — role either exists or
+        it doesn't; same row shape as find_roles's 'roles': role_name, object,
+        rights, file, matched_objects, rights_by_object, details_truncated),
+        match, case_sensitive}``. An empty ``roles`` list means the role wasn't
+        found or grants no rights — it does NOT distinguish "role_rights index
+        missing entirely" from "this specific role has nothing"; if that
+        matters, call ``find_roles`` on any known object first (same table,
+        same emptiness contract).
+
+        ``case_sensitive`` follows the same convention as ``find_roles``: the
+        indexed branch compares case-insensitively, the live XML-parse fallback
+        case-sensitively (folder-name match against ``Roles/<name>/``)."""
+        role_name = role_name.strip()
+        if role_name.lower().startswith("role."):
+            role_name = role_name[len("role.") :]
+        effective_details, _details_warning = _normalize_role_details_limit(details_limit)
+        _warn_bound(_details_warning)
+
+        # Fast path: SQLite index
+        if idx_reader is not None:
+            idx_rows = idx_reader.get_role_objects(role_name, details_limit=effective_details)
+            if idx_rows is not None:
+                return {
+                    "role": role_name,
+                    "roles": idx_rows,
+                    "match": "exact",
+                    "case_sensitive": False,
+                }
+
+        # Fallback: glob + XML parse. Unlike find_roles' broad live-fallback (which
+        # scans EVERY role file and filters by object substring), here we know the
+        # role name up front — find the ONE matching folder, then parse its rights
+        # file UNFILTERED (parse_rights_xml's object_filter="" returns everything).
+        patterns = [
+            "**/Roles/*/Ext/Rights.xml",
+            "**/Roles/*/*.rights",
+        ]
+        found_files: list[str] = []
+        for p in patterns:
+            found_files.extend(glob_files_fn(p))
+        found_files = list(dict.fromkeys(found_files))
+
+        wanted = role_name.casefold()
+        rows: list[dict] = []
+        for f in found_files:
+            parts = f.replace("\\", "/").split("/")
+            file_role_name = ""
+            for i, part in enumerate(parts):
+                if part == "Roles" and i + 1 < len(parts):
+                    file_role_name = parts[i + 1]
+                    break
+            if file_role_name.casefold() != wanted:
+                continue
+            try:
+                content = read_file_fn(f)
+            except Exception:
+                continue
+            for r in parse_rights_xml(content):
+                rows.append({"object": r["object"], "rights": r["rights"], "file": f})
+            break  # role folders are unique by name — nothing else can match
+
+        builder = _RoleGroupBuilder(effective_details)
+        for r in rows:
+            for right in r["rights"]:
+                builder.add(role_name, r["object"], right, r["file"])
+        grouped_rows = builder.result()
+        for row in grouped_rows:
+            # Legacy `role_name` field: reflect the (possibly re-cased-by-caller)
+            # query name, byte-for-byte, matching find_roles' treatment of `object`.
+            row["role_name"] = role_name
+
+        return {
+            "role": role_name,
+            "roles": grouped_rows,
+            "match": "exact",
             "case_sensitive": True,
         }
 
@@ -14567,7 +14850,7 @@ def make_bsl_helpers(
     _reg(
         "find_call_hierarchy",
         find_call_hierarchy,
-        "find_call_hierarchy(name, direction='callers', depth=2, module_hint='', include_triggers=False) -> "
+        "find_call_hierarchy(name, direction='callers', depth=2, module_hint='', include_triggers=True) -> "
         "{root, direction, depth, tree:[{name, target_hint, target_key, "
         "meta:{exact_rows, fallback_rows, exact_available, target_exact}, "
         "callers:[{caller_name, module_path, category, object_name, line, is_export, level}], "
@@ -14595,8 +14878,9 @@ def make_bsl_helpers(
         "  #   Но ЧЕМ обработчик пишет движения, так не узнать: трассируй ДЕЛЕГАТА из его тела:\n"
         "  #     read_procedure(path, 'ОбработкаПроведения') -> имя делегата -> хелпер НА ДЕЛЕГАТЕ.\n"
         "  #   direction='callees' («куда уходит метод») НЕ поддержан — только читать тело.\n"
-        "  #   include_triggers ребра «его зовет платформа» НЕ добавит (такого edge_type нет), но\n"
-        "  #     ПОКАЖЕТ CFE-перехват самого обработчика (&Перед/&После/&Вместо) — это полезно.\n"
+        "  #   include_triggers (по умолчанию True) ребра «его зовет платформа» НЕ добавит (такого\n"
+        "  #     edge_type нет), но ПОКАЖЕТ CFE-перехват самого обработчика (&Перед/&После/&Вместо) —\n"
+        "  #     это полезно. Пустой callers НЕ значит мертвый код — проверь ещё и triggers ниже.\n"
         "  # depth=1..3 (по умолчанию 2). Только direction='callers'.\n"
         "  res = find_call_hierarchy('ОтразитьВУчете', direction='callers', depth=2)  # метод, который РЕАЛЬНО зовут из кода\n"
         "  if 'error' in res:\n"
@@ -14627,15 +14911,18 @@ def make_bsl_helpers(
         "  #   _meta.node_budget_exceeded=True — широкий корень упёрся в visited_cap, дерево частичное\n"
         "  #     (по уровням): передай module_hint, чтобы и сузить, и ускорить обход.\n"
         "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
-        "  # ТРИГГЕРЫ (include_triggers=True): метод вызывается не только из кода. Подмешивает на\n"
-        "  #   КАЖДЫЙ узел node['triggers'] — не-call ребра (подписки/события форм/рег.задания/CFE).\n"
-        "  #   Ключ triggers есть ТОЛЬКО при include_triggers=True; форма строки:\n"
+        "  # ТРИГГЕРЫ (include_triggers=True — ПО УМОЛЧАНИЮ с v1.36.0): метод вызывается не только\n"
+        "  #   из кода. Подмешивает на КАЖДЫЙ узел node['triggers'] — не-call ребра (подписки/события\n"
+        "  #   форм/рег.задания/CFE). Ключ triggers присутствует ВСЕГДА (=[] если нечего показать);\n"
+        "  #   передай include_triggers=False, если нужен дешёвый обход без него (широкий/горячий\n"
+        "  #   корень — на каждый посещённый узел лишний запрос к get_inbound_edges). Форма строки:\n"
         "  #   {edge_type, source_name, source_kind, detail, file, line, caller_name, object_name,\n"
         "  #    category, target_key, resolved}\n"
         "  #   Для ОбработкаПроведения из ТРИГГЕРОВ придет разве что CFE-перехват обработчика\n"
         "  #   расширением: ребра «его зовет платформа» не существует. (Явные BSL-вызовы, если\n"
         "  #   они есть, приходят обычными callers — триггеры к ним отношения не имеют.)\n"
-        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.X', include_triggers=True)\n"
+        "  #   ВАЖНО: пустой callers + непустой triggers — метод ДОСТИЖИМ, это НЕ мёртвый код.\n"
+        "  res = find_call_hierarchy('ОбработкаПроведения', module_hint='Документ.X', include_triggers=True)  # (по умолчанию и так True — указан явно для наглядности примера)\n"
         "  for node in res['tree']:\n"
         "      for t in node.get('triggers', []):\n"
         "          print(f\"  TRIGGER {t['edge_type']}: {t['source_name']} ({t['detail']}) resolved={t['resolved']}\")\n"
@@ -14644,7 +14931,7 @@ def make_bsl_helpers(
     _reg(
         "find_path",
         find_path,
-        "find_path(from_name, to_name, max_depth=4, from_hint='', to_hint='', include_triggers=False) -> "
+        "find_path(from_name, to_name, max_depth=4, from_hint='', to_hint='', include_triggers=True) -> "
         "{found, from, to, path:[{name, module_path, call_line, triggers?}]|None, depth, "
         "_meta:{max_depth, nodes_expanded, visited_cap, budget_exceeded, from_key, to_exact, to_key, "
         "precision:'exact'|'heuristic', direction:'callers-reverse'}} | "
@@ -14992,10 +15279,10 @@ def make_bsl_helpers(
     _reg(
         "get_object_full_structure",
         get_object_full_structure,
-        "get_object_full_structure(name) -> {object_name, category, synonym, posting, attributes, "
-        "tabular_sections:[{name, synonym, columns}], dimensions, resources, predefined_items, "
-        "enum_values_for_typed_refs:{Enum.X:[{name,synonym}]}, forms:[str], "
-        "_meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}",
+        "get_object_full_structure(name, enum_values_limit=50) -> {object_name, category, synonym, posting, "
+        "attributes, tabular_sections:[{name, synonym, columns}], dimensions, resources, predefined_items, "
+        "enum_values_for_typed_refs:{Enum.X:[{name,synonym}]}, enum_values_truncated:{Enum.X:{total,returned,has_more}}, "
+        "forms:[str], _meta:{index_used:bool, fallback_reason:str|None, ts_synonyms_available:bool}}",
         "composite",
         [
             "структура объекта",
@@ -15021,6 +15308,14 @@ def make_bsl_helpers(
         "  # Перечисления уже раскрыты:\n"
         "  for ref_type, values in s['enum_values_for_typed_refs'].items():\n"
         "      print(f\"  {ref_type}: {[v['name'] for v in values]}\")\n"
+        "  # enum_values_limit=50 (default) режет КАЖДЫЙ раскрытый Enum независимо; если у объекта\n"
+        "  #   несколько enum-типизированных полей, значения каждого урезаны по отдельности.\n"
+        "  #   Обрезка видна ТОЛЬКО в s['enum_values_truncated'] (пусто, если ничего не резалось —\n"
+        "  #   типичный случай, у большинства перечислений значений меньше 50):\n"
+        "  for ref_type, info in s['enum_values_truncated'].items():\n"
+        "      print(f\"  {ref_type}: показано {info['returned']} из {info['total']}\")\n"
+        "      # полный список ИМЕННО этого перечисления — find_enum_values(ref_type.split('.')[-1])\n"
+        "      #   (он не режет вовсе — единичный enum дёшев даже на сотнях значений)\n"
         "  # Для регистров — данные в dimensions/resources, attributes пустой:\n"
         "  reg = get_object_full_structure('ТоварыНаСкладах')  # AccumulationRegister\n"
         "  for d in reg.get('dimensions', []):\n"
@@ -15037,6 +15332,39 @@ def make_bsl_helpers(
         "  #     'category_without_attributes_filled_via_live_xml' |\n"
         "  #     'index_partially_enriched_from_live_xml' | 'parse_failed: ...' | None.\n"
         "  #   ts_synonyms_available — True ТОЛЬКО если хотя бы у одной ТЧ в результате непустой synonym.",
+    )
+    _reg(
+        "get_object_structures",
+        get_object_structures,
+        "get_object_structures(name_like='', category='', names_only=False, limit=50, enum_values_limit=50) -> "
+        "{criterion:{name_like,category}, total_matched, returned, truncated, names_only, "
+        "objects:[{object_name,category,synonym}]|{object_name:get_object_full_structure()|{error}}} | {error, hint}  "
+        "# БАТЧ по критерию вместо цикла по одному объекту; ТРЕБУЕТ индекс",
+        "composite",
+        [
+            "батч структур",
+            "несколько объектов",
+            "все документы категории",
+            "список объектов по имени",
+            "batch structure",
+            "по критерию",
+        ],
+        "BATCH OBJECT STRUCTURES (критерий вместо ручного цикла — ТРЕБУЕТ индекс, без него используй "
+        "search_objects()/find_module() + get_object_full_structure() по одному):\n"
+        "  # Сначала дёшево — сколько вообще совпадает (names_only=True, без раскрытия структур):\n"
+        "  passport = get_object_structures(name_like='Взаиморасчеты', names_only=True)\n"
+        "  print(passport['total_matched'], 'объектов, truncated=', passport['truncated'])\n"
+        "  for o in passport['objects']:\n"
+        "      print(f\"  {o['category']}.{o['object_name']} ({o['synonym']})\")\n"
+        "  # Полные структуры пачкой — objects[object_name] = get_object_full_structure(...) на КАЖДЫЙ:\n"
+        "  batch = get_object_structures(category='AccumulationRegisters', limit=20)\n"
+        "  for name, s in batch['objects'].items():\n"
+        "      if 'error' in s:\n"
+        "          continue  # один упавший объект не топит батч\n"
+        "      print(f\"  {name}: {len(s['dimensions'])} измерений, {len(s['resources'])} ресурсов\")\n"
+        "  # name_like И category комбинируются через AND; пустой name_like + category = «все объекты категории».\n"
+        "  # limit=50 (потолок 200) — батч структур тяжелее батча паспортов; truncated=True → total_matched\n"
+        "  #   это НЕ точный total, а 'минимум limit+1' (дешёвая проверка усечения, не COUNT).",
     )
     _reg(
         "get_object_modules",
@@ -15219,7 +15547,8 @@ def make_bsl_helpers(
     _reg(
         "find_register_writers",
         find_register_writers,
-        "find_register_writers(reg_name) -> {writers:[{document,source|lines,file}],runtime_filtered:false,hint}",
+        "find_register_writers(reg_name, limit=200) -> {writers:[{document,source|lines,file}],total_writers,"
+        "returned,has_more,runtime_filtered:false,hint}",
         "business",
         ["писатели регистра", "кто пишет", "register writer", "writer"],
         "FIND STATIC WRITER CANDIDATES:\n"
@@ -15231,7 +15560,9 @@ def make_bsl_helpers(
         "  #   во время исполнения, статически неразрешимы и сюда НЕ попадают.\n"
         "  for w in result['writers']:\n"
         "      detail = w.get('lines') or w.get('source', '')\n"
-        "      print(f\"  {w['document']} ({detail})\")",
+        "      print(f\"  {w['document']} ({detail})\")\n"
+        "  # limit=200 (default): популярный регистр может иметь сотни писателей на большой ERP.\n"
+        "  #   total_writers — ИСТИННЫЙ total; has_more=True — увеличь limit= (потолок 2000).",
     )
     _reg(
         "find_based_on_documents",
@@ -15312,6 +15643,28 @@ def make_bsl_helpers(
         "  # Точные маршруты — ТОЛЬКО с индексом: факт ссылки/членства —\n"
         "  # find_references_to_object('Документ.X', kinds=['role_rights']);\n"
         "  # точные ИМЕНА ПРАВ — get_object_profile('Документ.X', sections=['roles']).",
+    )
+    _reg(
+        "find_role_objects",
+        find_role_objects,
+        "find_role_objects(role_name, details_limit=20) -> {role, roles:[{role_name, rights, object, file, ...}], "
+        "match, case_sensitive}  # ОБРАТНОЕ к find_roles (роль→объекты), EXACT",
+        "business",
+        ["роль", "role", "прав", "right", "доступ", "access", "что разрешено", "объекты роли"],
+        "FIND ROLE OBJECTS (обратное к find_roles — что разрешено РОЛИ, а не кто имеет права на объект):\n"
+        "  result = find_role_objects('ПолныеПрава')  # префикс 'Role.' необязателен\n"
+        "  for row in result['roles']:  # 0 или 1 элемент — роль либо есть, либо нет\n"
+        "      for obj in row['rights_by_object']:\n"
+        "          print(f\"  {obj['object']}: {', '.join(obj['rights'])}\")\n"
+        "  # ЭТО EXACT по имени роли (не substring, как в find_roles): имена ролей —\n"
+        "  # простые идентификаторы без вложенности членов, широкий матч тут не нужен.\n"
+        "  # Пустой result['roles'] == [] — роли с таким именем нет ИЛИ у неё нет прав;\n"
+        "  # если непонятно, есть ли вообще индекс ролей — гляньте find_roles на любом\n"
+        "  # объекте: у обоих хелперов общая таблица role_rights и общий признак 'пустоты'.\n"
+        "  # details_limit=20 (жёсткий потолок 100) режет BOUNDED sample distinct-пар\n"
+        "  # (object, right) — тот же смысл, что и в find_roles, просто на ОДНОЙ роли;\n"
+        "  # details_truncated=True — объектов у роли больше, чем показано, сужайте нечем\n"
+        "  # (роль уже названа точно) — читайте это как «роль большая», не как ошибку.",
     )
 
     _reg(

@@ -633,6 +633,15 @@ find_roles(object_name) vs find_references_to_object(ref, kinds=['role_rights'])
     BOUNDED sample, details_truncated=True означает «сузь qualified object».
   Это ТРИ разных вопроса, а не расхождение хелперов. Bare-name в точных маршрутах запрещён.
 
+find_roles(object_name) vs find_role_objects(role_name):
+  - find_roles       → вход ОБЪЕКТ, выход РОЛИ («кто имеет права на этот объект»). BROAD substring.
+  - find_role_objects → вход РОЛЬ, выход ОБЪЕКТЫ («что разрешено этой роли»). EXACT match по
+    имени роли (роли — простые идентификаторы, substring не нужен); result['roles'] — 0 или 1
+    элемент. Добавлен v1.36.0: раньше обратного направления не было, ответ добывался ручным
+    bsl_sql по role_rights.
+  Известен объект → find_roles; известна роль → find_role_objects. Обе читают одну таблицу
+  role_rights и разделяют один bounded-sample контракт (details_limit/details_truncated).
+
 find_references_to_object(ref) vs find_code_usages(ref):
   - find_references_to_object → ДЕКЛАРАТИВНЫЕ ссылки из метаданных-XML: типы реквизитов,
     владелец, основание ввода, подсистемы, права, ФО, ПВХ, DefinedType. Код НЕ сканирует.
@@ -662,6 +671,15 @@ get_object_modules(name) vs get_object_full_structure(name):
   - get_object_modules → КОД-side: модули, области, методы/экспорты, перехваты.
   - get_object_full_structure → METADATA-side: реквизиты, ТЧ, измерения/ресурсы, предопределённые, перечисления, формы.
   Разные стороны объекта, дополняют друг друга — нужны обе стороны, зови оба (каждый дёшев на индексе).
+
+get_object_full_structure(name) vs get_object_structures(name_like='', category=''):
+  - get_object_full_structure → ОДИН объект, точное имя уже известно.
+  - get_object_structures → НЕСКОЛЬКО объектов по критерию (подстрока имени/синонима И/ИЛИ
+    категория) за один вызов; names_only=True сначала дёшево показывает, сколько и какие
+    совпали, без раскрытия структур. ТРЕБУЕТ индекс (в отличие от get_object_full_structure).
+  Имя уже точно известно → get_object_full_structure; нужны «все документы с ...» или
+  «все объекты категории X» → get_object_structures. Без индекса — вручную search_objects()/
+  find_module() + get_object_full_structure() в цикле.
 
 == BATCHING & OUTPUT ==
 ОБЗОР ОБЪЕКТА ЗА 1 ВЫЗОВ — Step 0 полного анализа объекта (вместо ~10 одиночных хелперов):

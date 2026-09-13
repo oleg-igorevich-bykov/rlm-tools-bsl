@@ -84,6 +84,7 @@ INSTANT (индексный путь, OK для batch 5-10 в одном rlm_exe
   find_event_subscriptions(obj)          → подписки на события (event_filter + limit опционально)
   find_scheduled_jobs(name='')           → регламентные задания
   find_roles(obj_name)                   → broad substring (члены/однокоренные); exact — qualified+index
+  find_role_objects(role_name)           → ОБРАТНОЕ к find_roles: что разрешено роли, EXACT match по имени роли
   find_defined_types(name)               → раскрытие ОпределяемогоТипа
   find_enum_values(enum_name)            → INSTANT с индексом; LIVE fallback на чтение Enum.xml без индекса
   get_object_full_structure(name)        → агрегат: реквизиты + ТЧ + предопределённые + перечисления + формы
@@ -305,11 +306,48 @@ DISAMBIGUATION_PAIRS: list[dict] = [
         "tags": ["roles", "rights", "references"],
     },
     {
+        "pair": ("find_roles", "find_role_objects"),
+        "summary": "две противоположные стороны одного вопроса о правах",
+        "when_a": (
+            "find_roles(object_name) — вход ОБЪЕКТ, выход РОЛИ: «кто имеет права на этот объект». "
+            "BROAD substring (см. пару выше), может вернуть много ролей."
+        ),
+        "when_b": (
+            "find_role_objects(role_name) — вход РОЛЬ, выход ОБЪЕКТЫ: «что разрешено этой роли». "
+            "EXACT match по имени роли (роли — простые идентификаторы, substring тут не нужен): "
+            "0 или 1 элемент в result['roles']. Добавлен v1.36.0 — раньше этого направления не "
+            "было вовсе, вопрос решался руками через bsl_sql по role_rights."
+        ),
+        "rule": (
+            "Известен объект → find_roles. Известна роль → find_role_objects. Обе читают одну и ту же "
+            "таблицу role_rights и разделяют один и тот же bounded-sample контракт "
+            "(details_limit/details_truncated/rights_by_object)."
+        ),
+        "tags": ["roles", "rights"],
+    },
+    {
         "pair": ("get_object_modules", "get_object_full_structure"),
         "summary": "код-side скелет vs metadata-side структура (композируются)",
         "when_a": "get_object_modules — КОД: модули, области, методы/экспорты, перехваты.",
         "when_b": "get_object_full_structure — МЕТАДАННЫЕ: реквизиты, ТЧ, измерения/ресурсы, предопределённые, раскрытые перечисления, формы.",
         "rule": "Разные стороны объекта, дополняют друг друга. Нужен код → get_object_modules; нужны реквизиты/ТЧ → get_object_full_structure; нужно и то и то → зови оба (каждый дёшев на индексе).",
         "tags": ["modules", "structure", "metadata", "composite"],
+    },
+    {
+        "pair": ("get_object_full_structure", "get_object_structures"),
+        "summary": "один объект по имени vs батч объектов по критерию",
+        "when_a": "get_object_full_structure(name) — ОДИН объект, точное имя известно заранее.",
+        "when_b": (
+            "get_object_structures(name_like='', category='', names_only=False) — НЕСКОЛЬКО объектов "
+            "по критерию (подстрока имени/синонима И/ИЛИ категория) за ОДИН вызов вместо цикла. "
+            "names_only=True — сначала дёшево узнать, сколько и какие совпали, без раскрытия структур. "
+            "ТРЕБУЕТ индекс (в отличие от get_object_full_structure, у которого есть live-fallback)."
+        ),
+        "rule": (
+            "Имя объекта уже известно точно → get_object_full_structure. Нужно «все документы с ...» "
+            "или «все объекты категории X» → get_object_structures. Без индекса батч недоступен — "
+            "перебирайте search_objects()/find_module() + get_object_full_structure() вручную."
+        ),
+        "tags": ["structure", "batch", "criterion"],
     },
 ]

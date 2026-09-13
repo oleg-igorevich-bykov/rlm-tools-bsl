@@ -11,7 +11,11 @@ from rlm_tools_bsl.bsl_strategy_data import DISAMBIGUATION_PAIRS, STRATEGY_SECTI
 
 
 def test_disambiguation_pairs_count():
-    assert len(DISAMBIGUATION_PAIRS) == 12
+    # v1.36.0: +1 for (find_roles, find_role_objects) — the new role→objects
+    # reverse lookup (code-index comparison gap #8). +1 for
+    # (get_object_full_structure, get_object_structures) — the new batch
+    # criterion-selector (code-index comparison gap #4).
+    assert len(DISAMBIGUATION_PAIRS) == 14
 
 
 _PAIR_ALIASES = {

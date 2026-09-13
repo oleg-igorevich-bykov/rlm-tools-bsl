@@ -1635,6 +1635,216 @@ def test_find_roles_not_found():
         assert len(result["roles"]) == 0
 
 
+def test_find_role_objects_live_fallback():
+    """Reverse of find_roles: role -> ALL its objects (RIGHTS_XML grants on two)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        role_dir = os.path.join(tmpdir, "Roles", "Менеджер", "Ext")
+        os.makedirs(role_dir)
+        with open(os.path.join(role_dir, "Rights.xml"), "w", encoding="utf-8") as f:
+            f.write(RIGHTS_XML)
+        result = bsl["find_role_objects"]("Менеджер")
+        assert result["role"] == "Менеджер"
+        assert len(result["roles"]) == 1
+        row = result["roles"][0]
+        assert row["role_name"] == "Менеджер"
+        assert set(row["rights"]) == {"Read", "Update"}  # View=false excluded
+        by_obj = {o["object"]: set(o["rights"]) for o in row["rights_by_object"]}
+        assert by_obj == {
+            "Document.ПриобретениеТоваров": {"Read", "Update"},
+            "Catalog.Номенклатура": {"Read"},
+        }
+
+
+def test_find_role_objects_role_prefix_stripped():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        role_dir = os.path.join(tmpdir, "Roles", "Менеджер", "Ext")
+        os.makedirs(role_dir)
+        with open(os.path.join(role_dir, "Rights.xml"), "w", encoding="utf-8") as f:
+            f.write(RIGHTS_XML)
+        result = bsl["find_role_objects"]("Role.Менеджер")
+        assert result["role"] == "Менеджер"
+        assert len(result["roles"]) == 1
+
+
+def test_find_role_objects_not_found():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        result = bsl["find_role_objects"]("НесуществующаяРоль")
+        assert result["roles"] == []
+
+
+# ---------------------------------------------------------------------------
+# get_object_structures — П.4 batch selector (name_like + category, names_only)
+# ---------------------------------------------------------------------------
+
+_STRUCT_DOC_TEMPLATE = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+    'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+    "<Document><Properties><Name>{name}</Name>"
+    "<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Син {name}</v8:content></v8:item></Synonym>"
+    "</Properties>"
+    "<ChildObjects>"
+    "<Attribute><Properties><Name>Комментарий</Name>"
+    "<Type><v8:Type>String</v8:Type></Type></Properties></Attribute>"
+    "</ChildObjects>"
+    "</Document>"
+    "</MetaDataObject>"
+)
+
+_STRUCT_CATALOG_TEMPLATE = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+    'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+    "<Catalog><Properties><Name>{name}</Name>"
+    "<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Син {name}</v8:content></v8:item></Synonym>"
+    "</Properties></Catalog>"
+    "</MetaDataObject>"
+)
+
+
+def _write_struct_document(base: str, name: str) -> None:
+    doc_dir = os.path.join(base, "Documents", name, "Ext")
+    os.makedirs(doc_dir)
+    with open(os.path.join(doc_dir, "Document.xml"), "w", encoding="utf-8") as f:
+        f.write(_STRUCT_DOC_TEMPLATE.format(name=name))
+    # Без .bsl IndexBuilder уходит в ветку total_files == 0 и не наполняет
+    # НИ ОДНУ XML-производную таблицу (synonyms/attributes/...).
+    with open(os.path.join(doc_dir, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+        f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+
+
+def _write_struct_catalog(base: str, name: str) -> None:
+    cat_dir = os.path.join(base, "Catalogs", name, "Ext")
+    os.makedirs(cat_dir)
+    with open(os.path.join(cat_dir, "Catalog.xml"), "w", encoding="utf-8") as f:
+        f.write(_STRUCT_CATALOG_TEMPLATE.format(name=name))
+    # Без .bsl IndexBuilder уходит в ветку total_files == 0 и не наполняет
+    # НИ ОДНУ XML-производную таблицу (synonyms/attributes/...).
+    with open(os.path.join(cat_dir, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+        f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+
+
+def _make_object_structures_fixture(tmpdir):
+    """Two Documents ('ЗаказА'/'ЗаказБ') + one Catalog ('Контрагенты'), indexed
+    with synonyms so get_object_structures() has an object_synonyms table to
+    query. Uses a real built index (not a stub) since find_objects_by_criterion
+    runs a genuine SQL query against it."""
+    from rlm_tools_bsl.bsl_index import IndexBuilder, IndexReader
+
+    _write_struct_document(tmpdir, "ЗаказА")
+    _write_struct_document(tmpdir, "ЗаказБ")
+    _write_struct_catalog(tmpdir, "Контрагенты")
+    with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+        f.write("<Configuration/>")
+
+    db_path = IndexBuilder().build(tmpdir, build_calls=False, build_metadata=True)
+    reader = IndexReader(str(db_path))
+    helpers, resolve_safe = make_helpers(tmpdir, idx_reader=reader)
+    bsl = make_bsl_helpers(
+        base_path=tmpdir,
+        resolve_safe=resolve_safe,
+        read_file_fn=helpers["read_file"],
+        grep_fn=helpers["grep"],
+        glob_files_fn=helpers["glob_files"],
+        format_info=detect_format(tmpdir),
+        idx_reader=reader,
+    )
+    return bsl, reader
+
+
+def test_get_object_structures_requires_index():
+    """No idx_reader at all → explicit error/hint, not a crash or empty result."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        result = bsl["get_object_structures"]("Заказ")
+        assert "error" in result
+        assert "hint" in result
+
+
+def test_get_object_structures_names_only():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_structures_fixture(tmpdir)
+        try:
+            result = bsl["get_object_structures"](name_like="Заказ", names_only=True)
+            assert result["names_only"] is True
+            assert result["truncated"] is False
+            names = {o["object_name"] for o in result["objects"]}
+            assert names == {"ЗаказА", "ЗаказБ"}
+            # names_only must NOT trigger a full get_object_full_structure call per item.
+            for o in result["objects"]:
+                assert "attributes" not in o
+        finally:
+            reader.close()
+
+
+def test_get_object_structures_full_batch_returns_structures():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_structures_fixture(tmpdir)
+        try:
+            result = bsl["get_object_structures"](name_like="Заказ", names_only=False)
+            assert set(result["objects"].keys()) == {"ЗаказА", "ЗаказБ"}
+            for obj_name, structure in result["objects"].items():
+                assert "error" not in structure, f"{obj_name}: {structure}"
+                assert structure["object_name"] == obj_name
+                attr_names = {a["name"] for a in structure["attributes"]}
+                assert "Комментарий" in attr_names
+        finally:
+            reader.close()
+
+
+def test_get_object_structures_category_and_name_like_combined_and_semantics():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_structures_fixture(tmpdir)
+        try:
+            # "Заказ" matches both Documents; category="Catalogs" matches neither of
+            # those two → combined filter (AND, not OR/union) must be empty.
+            result = bsl["get_object_structures"](name_like="Заказ", category="Catalogs", names_only=True)
+            assert result["objects"] == []
+            assert result["returned"] == 0
+
+            # category alone picks up the one Catalog.
+            result2 = bsl["get_object_structures"](category="Catalogs", names_only=True)
+            names = {o["object_name"] for o in result2["objects"]}
+            assert names == {"Контрагенты"}
+        finally:
+            reader.close()
+
+
+def test_get_object_structures_truncated_flag():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_structures_fixture(tmpdir)
+        try:
+            # 3 objects total (ЗаказА, ЗаказБ, Контрагенты) — cap at 2.
+            result = bsl["get_object_structures"](limit=2, names_only=True)
+            assert result["truncated"] is True
+            assert result["returned"] == 2
+            assert len(result["objects"]) == 2
+        finally:
+            reader.close()
+
+
+def test_get_object_structures_per_item_isolation_does_not_crash_batch():
+    """Each match is resolved via its OWN try/except inside the batch loop (see
+    get_object_structures in bsl_helpers.py) so one problematic item can never
+    take down the whole call. Full end-to-end fault injection isn't reachable
+    from outside the closure (the resolver is a local function, not a module
+    global), so this pins the structural invariant instead: every requested
+    name gets an entry, and each entry is always a dict (either a real
+    structure or an ``{"error": ...}`` shape) — never a raised exception."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_object_structures_fixture(tmpdir)
+        try:
+            result = bsl["get_object_structures"](name_like="Заказ", names_only=False)
+            assert set(result["objects"].keys()) == {"ЗаказА", "ЗаказБ"}
+            for obj_name, structure in result["objects"].items():
+                assert isinstance(structure, dict), f"{obj_name}: {structure!r}"
+        finally:
+            reader.close()
+
+
 def test_parse_cf_event_subscription():
     result = parse_event_subscription_xml(EVENT_SUB_CF_XML)
     assert result is not None
@@ -1889,6 +2099,48 @@ def test_find_register_writers_no_match():
         bsl, _ = _make_full_fixture(tmpdir)
         result = bsl["find_register_writers"]("НесуществующийРегистр")
         assert result["total_writers"] == 0
+
+
+def test_find_register_writers_caps_at_default_limit():
+    """gap #1 (code-index comparison, honest-truncation audit): 'writers' used to
+    have no cap at all — a popular register on a big ERP can have hundreds of
+    static writers. Default limit=200 caps the page; total_writers stays the
+    TRUE total (unchanged field), has_more/returned describe the new page."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        n_docs = 210
+        for i in range(n_docs):
+            doc_dir = os.path.join(tmpdir, "Documents", f"ДокПисатель{i}", "Ext")
+            os.makedirs(doc_dir)
+            with open(os.path.join(doc_dir, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
+                f.write(
+                    "Процедура ОбработкаПроведения(Отказ, Режим) Экспорт\n"
+                    "    Движения.ТоварыНаСкладах.Записать();\n"
+                    "КонецПроцедуры\n"
+                )
+        with open(os.path.join(tmpdir, "Configuration.xml"), "w") as f:
+            f.write("<Configuration/>")
+
+        helpers, resolve_safe = make_helpers(tmpdir)
+        format_info = detect_format(tmpdir)
+        bsl = make_bsl_helpers(
+            base_path=tmpdir,
+            resolve_safe=resolve_safe,
+            read_file_fn=helpers["read_file"],
+            grep_fn=helpers["grep"],
+            glob_files_fn=helpers["glob_files"],
+            format_info=format_info,
+        )
+
+        capped = bsl["find_register_writers"]("ТоварыНаСкладах")
+        assert capped["total_writers"] == n_docs
+        assert capped["returned"] == 200
+        assert len(capped["writers"]) == 200
+        assert capped["has_more"] is True
+
+        full = bsl["find_register_writers"]("ТоварыНаСкладах", limit=n_docs)
+        assert full["total_writers"] == n_docs
+        assert full["returned"] == n_docs
+        assert full["has_more"] is False
 
 
 def test_analyze_document_flow():

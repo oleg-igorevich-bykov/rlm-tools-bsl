@@ -1357,6 +1357,88 @@ def test_get_object_full_structure_enum_dot_prefix_recognized(bsl_env):
     )
     values = res["enum_values_for_typed_refs"]["Enum.ТестЕнум"]
     assert any(v["name"] == "Значение1" for v in values)
+    # v1.36.0: a single-value enum stays UNDER the default cap — enum_values_truncated
+    # must stay empty (the byte-for-byte shape this key always had before the cap existed).
+    assert res["enum_values_truncated"] == {}
+
+
+def _write_enum_with_n_values(bsl_env, enum_name: str, n: int) -> None:
+    enums_dir = bsl_env.path / "Enums" / enum_name
+    enums_dir.mkdir(parents=True)
+    child_values = "".join(f"<EnumValue><Properties><Name>Знач{i}</Name></Properties></EnumValue>" for i in range(n))
+    (enums_dir / f"{enum_name}.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+        'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+        "<Enum><Properties>"
+        f"<Name>{enum_name}</Name>"
+        "</Properties>"
+        "<ChildObjects>"
+        f"{child_values}"
+        "</ChildObjects>"
+        "</Enum>"
+        "</MetaDataObject>",
+        encoding="utf-8",
+    )
+
+
+def _write_doc_with_enum_attribute(bsl_env, doc_name: str, enum_name: str) -> None:
+    doc_dir = bsl_env.path / "Documents" / doc_name / "Ext"
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "Document.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+        'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+        f"<Document><Properties><Name>{doc_name}</Name></Properties>"
+        "<ChildObjects>"
+        "<Attribute><Properties>"
+        "<Name>Статус</Name>"
+        f"<Type><v8:Type>EnumRef.{enum_name}</v8:Type></Type>"
+        "</Properties></Attribute>"
+        "</ChildObjects>"
+        "</Document>"
+        "</MetaDataObject>",
+        encoding="utf-8",
+    )
+
+
+def test_get_object_full_structure_caps_enum_values_for_typed_refs(bsl_env):
+    """gap #5 (code-index comparison): enum_values_for_typed_refs used to have no
+    cap at all — every OTHER section of this aggregate (attributes,
+    predefined_items, ...) is bounded, this was the one unbounded corner. A
+    Document referencing one enum with 120 values must get only the first 50
+    (default enum_values_limit), with an honest enum_values_truncated entry."""
+    _write_enum_with_n_values(bsl_env, "БольшойЕнум", 120)
+    _write_doc_with_enum_attribute(bsl_env, "ДокБольшойЕнум", "БольшойЕнум")
+
+    bsl, _ = _make_bsl_fixture_with_catalog(str(bsl_env.path))
+    res = bsl["get_object_full_structure"]("ДокБольшойЕнум")
+    assert "error" not in res
+
+    values = res["enum_values_for_typed_refs"]["EnumRef.БольшойЕнум"]
+    assert len(values) == 50
+    assert res["enum_values_truncated"]["EnumRef.БольшойЕнум"] == {
+        "total": 120,
+        "returned": 50,
+        "has_more": True,
+    }
+
+
+def test_get_object_full_structure_enum_values_limit_param_overrides_default(bsl_env):
+    _write_enum_with_n_values(bsl_env, "СреднийЕнум", 30)
+    _write_doc_with_enum_attribute(bsl_env, "ДокСреднийЕнум", "СреднийЕнум")
+
+    bsl, _ = _make_bsl_fixture_with_catalog(str(bsl_env.path))
+    res = bsl["get_object_full_structure"]("ДокСреднийЕнум", enum_values_limit=10)
+    assert "error" not in res
+
+    values = res["enum_values_for_typed_refs"]["EnumRef.СреднийЕнум"]
+    assert len(values) == 10
+    assert res["enum_values_truncated"]["EnumRef.СреднийЕнум"] == {
+        "total": 30,
+        "returned": 10,
+        "has_more": True,
+    }
 
 
 # ============================================================================

@@ -6567,59 +6567,22 @@ class IndexBuilder:
         total_files = len(bsl_files)
         logger.info("Found %d .bsl files", total_files)
 
-        if total_files == 0:
-            # Empty rebuild — same in-place marker lifecycle; populate empty tables +
-            # file_paths + meta only (codex round 8: must NOT skip the cleanup, else stale
-            # modules/methods/calls would survive the now-unlink-free rebuild).
-            self._begin_inplace_rebuild(conn, opts)
-            fp_rows = _collect_file_paths(base_path)
-            _insert_file_paths(conn, fp_rows)
-            self._write_meta(
-                conn,
-                base_path,
-                0,
-                _paths_hash([]),  # round 21: NOT "" — else check_index_strict false STALE on a valid empty index
-                build_calls,
-                build_metadata,
-                build_fts=build_fts,
-                file_paths_count=len(fp_rows),
-                build_synonyms=build_synonyms,
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("has_extension_overrides", "0"),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("extension_overrides_count", "0"),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("has_form_elements", "0"),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                ("form_elements_count", "0"),
-            )
-            # Save git HEAD so first update can use git fast path
-            if _git_available(base_path):
-                head = _git_head_sha(base_path)
-                if head:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                        ("git_head_commit", head),
-                    )
-                    repo_info = _git_repo_info(base_path)
-                    if repo_info:
-                        _, pfx = repo_info
-                        # Fresh build: no prior snapshot to preserve. On unreliable
-                        # detection the flag forces a full scan on the first update.
-                        self._save_dirty_snapshot(conn, base_path, pfx, preserve_on_unreliable=False)
-            conn.commit()
-            self._finalize_build_best_effort(conn)
-            return db_path
+        # NB: `total_files == 0` НЕ имеет отдельной ветки. Прежний ранний выход исходил
+        # из «нет .bsl → индексировать нечего», но почти весь индекс строится из XML, а
+        # не из модулей: object_synonyms, object_attributes, role_rights,
+        # metadata_references/code_usages, form_elements, subsystem_content,
+        # http_services, scheduled_jobs, extension_overrides. На дереве метаданных без
+        # модулей (cfe с одними правами/подсистемами; выгрузка, куда модули ещё не
+        # легли) он отдавал индекс из одного file_paths, при этом записывая в мету
+        # has_synonyms/has_metadata/has_fts = 1 — то есть пустые таблицы выдавались за
+        # построенные. Хуже: methods_fts создаётся только ниже, и следующий update()
+        # на has_fts=1 падал с "no such table: methods_fts", как только в дерево клали
+        # ПЕРВЫЙ модуль. Общий путь корректно отрабатывает пустой results (bulk_insert
+        # с пустым батчем, FTS-таблица создаётся и наполняется пустой выборкой), даёт
+        # тот же in-place cleanup и ту же git-ветку — поэтому ветка не нужна.
 
-        # Compute paths hash
+        # Compute paths hash. Пустой список — НЕ "" (round 21): иначе check_index_strict
+        # объявил бы валидный индекс без модулей устаревшим.
         rel_paths = [Path(f).relative_to(base).as_posix() for f in bsl_files]
         paths_hash = _paths_hash(rel_paths)
 
@@ -9790,6 +9753,72 @@ class IndexReader:
             return builder.result()
 
     @_transient_safe(lambda: None)
+    def get_role_objects(
+        self, role_name: str, *, details_limit: int = _ROLE_DETAILS_DEFAULT
+    ) -> list[dict] | None:
+        """Reverse of get_roles/get_roles_exact: what objects an EXACT role grants
+        rights to (v1.36.0 — code-index comparison, gap #8: only the object→roles
+        direction existed; "what is this role allowed to do" had no dedicated route
+        and required a raw ``bsl_sql`` scan of ``role_rights``).
+
+        Unlike object names, role names are NOT compound (no ``Role.X.Command.Y``
+        member nesting), so this matches ``role_rights.role_name`` EXACTLY
+        (case-insensitive) rather than by substring — a broad match would be
+        surprising here and nothing downstream needs it. An optional ``Role.``
+        prefix (as accepted by ``get_role_rights``-style tools elsewhere) is the
+        caller's job to strip before calling; this reader takes the bare name as
+        stored in the index (folder name under ``Roles/``).
+
+        Reuses ``_RoleGroupBuilder`` — the SAME grouping/bounded-sample machinery
+        as ``get_roles``/``get_roles_exact``, just filtered by role instead of by
+        object. Because exactly one role can match, the builder produces AT MOST
+        one group; its ``rights_by_object``/``matched_objects`` fields ARE this
+        method's answer (no separate accumulator needed).
+
+        Args:
+            role_name: exact role name (folder under ``Roles/``), e.g.
+                ``'ПолныеПрава'``. Case-insensitive.
+            details_limit: bounded sample distinct-пар ``(object, right)``; same
+                normalizer/cap (0..100, default 20) as the object→roles direction.
+
+        Returns:
+            ``[{role_name, object, rights:[...], file, matched_objects,
+            rights_by_object:[{object, rights}], details_truncated}]`` — 0 or 1
+            elements (0 = role not found or grants nothing) — or ``None`` if the
+            ``role_rights`` table itself is empty/missing (index too old / never
+            built with roles).
+        """
+        effective, _warning = _normalize_role_details_limit(details_limit)
+        with self._lock:
+            try:
+                sql = "SELECT role_name, object_name, right_name, file FROM role_rights WHERE "
+                # Primary: NOCASE index seek on idx_rr_role (~ms even on ~350K rows).
+                rows = self._conn.execute(sql + "role_name = ? COLLATE NOCASE", (role_name,)).fetchall()
+                # Cyrillic rescan: builtin NOCASE folds ONLY ASCII, so a lowercase
+                # Cyrillic query ('рольb') misses the canonical 'РольB'. Pay one
+                # py_lower SCAN ONLY on an empty result with a non-ASCII name —
+                # same slow_fallback shape as find_method()/get_callers().
+                if not rows and not role_name.isascii():
+                    rows = self._conn.execute(sql + "py_lower(role_name) = py_lower(?)", (role_name,)).fetchall()
+                builder = _RoleGroupBuilder(effective)
+                for r in rows:
+                    builder.add(r["role_name"], r["object_name"], r["right_name"], r["file"])
+            except sqlite3.OperationalError:
+                return None
+
+            if builder.is_empty():
+                # Distinguish empty table (→ None, caller marks unavailable) from
+                # "table has data but this role doesn't exist / grants nothing" (→ []).
+                try:
+                    cnt = self._conn.execute("SELECT COUNT(*) AS cnt FROM role_rights").fetchone()
+                    if cnt and cnt["cnt"] == 0:
+                        return None
+                except sqlite3.Error:
+                    return None
+
+            return builder.result()
+
+    @_transient_safe(lambda: None)
     def get_enum_values(self, enum_name: str) -> dict | None:
         """Get enum definition from the index.
 
@@ -10483,6 +10512,83 @@ class IndexReader:
                 return {"total": total, "current_root": current_root}
             except sqlite3.OperationalError:
                 return None
+
+    @_transient_safe(lambda: None)
+    def find_objects_by_criterion(
+        self, name_like: str = "", category: str = "", limit: int = 50
+    ) -> list[dict] | None:
+        """Criterion-selector matching MULTIPLE objects in one query (v1.36.0 —
+        code-index comparison, gap #4: batch structure fetch across several
+        matched objects needed one call per object; there was no combined
+        name+category selector to feed it).
+
+        Unlike ``search_objects`` (name/synonym substring only, no category
+        filter — a client-side post-filter on ITS output would be WRONG here:
+        that method already caps to ``limit`` internally, so filtering by
+        category afterwards could silently drop real matches that existed
+        beyond the pre-filter cutoff), this applies BOTH predicates in ONE SQL
+        query — the category filter narrows the search SPACE, not the already
+        limited RESULT, so ``limit``/``truncated`` stay exact for the
+        (name_like, category) pair actually asked for.
+
+        Args:
+            name_like: substring against object_name OR synonym
+                (case-insensitive, literal — ``%``/``_`` escaped so a legal 1C
+                identifier containing them is never read as an SQL wildcard).
+                Empty = no name filter (every object in ``category``).
+            category: exact category filter (e.g. ``'Documents'``,
+                ``'Catalogs'``). Empty = no category filter.
+            limit: max rows returned (default 50, matches code-index's own
+                batch-selector cap; hard ceiling enforced by the caller's
+                ``_coerce_bound``, this reader trusts the value it's given).
+
+        Returns:
+            ``[{object_name, category, synonym, file}]`` ordered by
+            ``(category, object_name)``, or ``None`` if ``object_synonyms`` is
+            missing/empty. Caller determines ``truncated`` by requesting
+            ``limit + 1`` and checking ``len(rows) > limit``.
+        """
+        with self._lock:
+            try:
+                where = ["1=1"]
+                params: list = []
+                if name_like and name_like.strip():
+                    like_q = f"%{_escape_for_sql_like(name_like.strip())}%"
+                    where.append(
+                        "(py_lower(object_name) LIKE py_lower(?) ESCAPE '\\' "
+                        "OR py_lower(synonym) LIKE py_lower(?) ESCAPE '\\')"
+                    )
+                    params.extend([like_q, like_q])
+                if category and category.strip():
+                    where.append("category = ?")
+                    params.append(category.strip())
+                params.append(limit)
+                rows = self._conn.execute(
+                    "SELECT object_name, category, synonym, file FROM object_synonyms "
+                    f"WHERE {' AND '.join(where)} "
+                    "ORDER BY category, object_name LIMIT ?",
+                    params,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+
+            if not rows:
+                try:
+                    cnt = self._conn.execute("SELECT COUNT(*) AS cnt FROM object_synonyms").fetchone()
+                    if cnt and cnt["cnt"] == 0:
+                        return None
+                except sqlite3.Error:
+                    return None
+
+            return [
+                {
+                    "object_name": r["object_name"],
+                    "category": r["category"],
+                    "synonym": r["synonym"],
+                    "file": r["file"],
+                }
+                for r in rows
+            ]
 
     @_transient_safe(lambda: None)
     def search_regions(self, query: str, limit: int = 200) -> list[dict] | None:

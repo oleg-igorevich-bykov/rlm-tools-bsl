@@ -980,15 +980,21 @@ class TestCountOverridesByExtensionRoot:
 
 
 # ---------------------------------------------------------------------------
-# Fix 3: early-exit build without BSL writes meta keys
+# Сборка дерева БЕЗ .bsl пишет override-мету
+#
+# v1.36.0: отдельной ранней ветки `total_files == 0` больше нет — дерево без
+# модулей идёт общим путём, и ключи пишет он же. Значение теперь ИЗМЕРЕННОЕ, а
+# не захардкоженное, поэтому дерево обязано быть изолировано: _collect_extension_
+# overrides смотрит и на соседние каталоги, а под общим pytest-tmp туда попадают
+# расширения из фикстур ДРУГИХ тестов этого же файла.
 # ---------------------------------------------------------------------------
 
 
-class TestEarlyExitMeta:
+class TestNoBslBuildMeta:
     def test_build_no_bsl_writes_override_meta(self, tmp_path, monkeypatch):
         """Build with no .bsl files still writes has_extension_overrides meta."""
         monkeypatch.setenv("RLM_INDEX_DIR", str(tmp_path / "idx"))
-        cf = str(tmp_path / "cf")
+        cf = str(tmp_path / "nest" / "cf")  # свой уровень вложенности — см. комментарий выше
         # Only Configuration.xml, no BSL files
         _write(os.path.join(cf, "Configuration.xml"), _CF_MAIN_XML)
 

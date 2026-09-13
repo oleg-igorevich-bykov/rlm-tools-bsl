@@ -1,0 +1,155 @@
+--- a/src/rlm_tools_bsl/bsl_index.py
++++ b/src/rlm_tools_bsl/bsl_index.py
+@@ -9828,13 +9828,17 @@
+         effective, _warning = _normalize_role_details_limit(details_limit)
+         with self._lock:
+             try:
+-                cursor = self._conn.execute(
+-                    "SELECT role_name, object_name, right_name, file FROM role_rights "
+-                    "WHERE role_name = ? COLLATE NOCASE",
+-                    (role_name,),
+-                )
++                sql = "SELECT role_name, object_name, right_name, file FROM role_rights WHERE "
++                # Primary: NOCASE index seek on idx_rr_role (~ms even on ~350K rows).
++                rows = self._conn.execute(sql + "role_name = ? COLLATE NOCASE", (role_name,)).fetchall()
++                # Cyrillic rescan: builtin NOCASE folds ONLY ASCII, so a lowercase
++                # Cyrillic query ('рольb') misses the canonical 'РольB'. Pay one
++                # py_lower SCAN ONLY on an empty result with a non-ASCII name —
++                # same slow_fallback shape as find_method()/get_callers().
++                if not rows and not role_name.isascii():
++                    rows = self._conn.execute(sql + "py_lower(role_name) = py_lower(?)", (role_name,)).fetchall()
+                 builder = _RoleGroupBuilder(effective)
+-                for r in cursor:
++                for r in rows:
+                     builder.add(r["role_name"], r["object_name"], r["right_name"], r["file"])
+             except sqlite3.OperationalError:
+                 return None
+--- a/tests/test_bsl_helpers.py
++++ b/tests/test_bsl_helpers.py
+@@ -1683,7 +1683,9 @@
+     '<?xml version="1.0" encoding="UTF-8"?>\n'
+     '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+     'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+-    "<Document><Properties><Name>{name}</Name></Properties>"
++    "<Document><Properties><Name>{name}</Name>"
++    "<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Син {name}</v8:content></v8:item></Synonym>"
++    "</Properties>"
+     "<ChildObjects>"
+     "<Attribute><Properties><Name>Комментарий</Name>"
+     "<Type><v8:Type>String</v8:Type></Type></Properties></Attribute>"
+@@ -1696,7 +1698,9 @@
+     '<?xml version="1.0" encoding="UTF-8"?>\n'
+     '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" '
+     'xmlns:v8="http://v8.1c.ru/8.1/data/core">'
+-    "<Catalog><Properties><Name>{name}</Name></Properties></Catalog>"
++    "<Catalog><Properties><Name>{name}</Name>"
++    "<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Син {name}</v8:content></v8:item></Synonym>"
++    "</Properties></Catalog>"
+     "</MetaDataObject>"
+ )
+ 
+@@ -1706,6 +1710,10 @@
+     os.makedirs(doc_dir)
+     with open(os.path.join(doc_dir, "Document.xml"), "w", encoding="utf-8") as f:
+         f.write(_STRUCT_DOC_TEMPLATE.format(name=name))
++    # Без .bsl IndexBuilder уходит в ветку total_files == 0 и не наполняет
++    # НИ ОДНУ XML-производную таблицу (synonyms/attributes/...).
++    with open(os.path.join(doc_dir, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
++        f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+ 
+ 
+ def _write_struct_catalog(base: str, name: str) -> None:
+@@ -1713,6 +1721,10 @@
+     os.makedirs(cat_dir)
+     with open(os.path.join(cat_dir, "Catalog.xml"), "w", encoding="utf-8") as f:
+         f.write(_STRUCT_CATALOG_TEMPLATE.format(name=name))
++    # Без .bsl IndexBuilder уходит в ветку total_files == 0 и не наполняет
++    # НИ ОДНУ XML-производную таблицу (synonyms/attributes/...).
++    with open(os.path.join(cat_dir, "ObjectModule.bsl"), "w", encoding="utf-8") as f:
++        f.write("Процедура П() Экспорт\nКонецПроцедуры\n")
+ 
+ 
+ def _make_object_structures_fixture(tmpdir):
+--- a/tests/test_start_cost_budget.py
++++ b/tests/test_start_cost_budget.py
+@@ -100,11 +100,17 @@
+ # Проза ужималась ПЕРВОЙ: длинные пояснения переехали в НЕбюджетируемый `recipe`
+ # (rlm_help отдаёт его по запросу), из подписей убраны дубли и marketing-фразы.
+ # Оставшееся неустранимо без удаления самих имён ключей.
++# v1.36.0 re-baseline (INTENTIONAL — по собственной инструкции этого теста).
++# Рост — агент-facing контракт новых возможностей релиза, не дрейф:
++#   * graph_bridge  → блок GRAPH (if available) в full-стратегии (+780) и
++#                     GRAPH_HELPER_SIGNATURES в available_functions;
++#   * find_role_objects / get_object_structures → новые сигнатуры + рецепты.
++# slim-ячейки НЕ трогаются: они в потолок укладываются.
+ _BASELINES = {
+     ("slim", ""): 7146,
+     ("slim", "проведение"): 7990,
+-    ("full", ""): 33858,
+-    ("full", "проведение"): 35597,
++    ("full", ""): 37240,
++    ("full", "проведение"): 38979,
+ }
+ # Whole rlm_start payload baselines (strategy + available_functions + index +
+ # extension_context) for a fixed minimal INDEXED config — the plan's real target.
+@@ -119,7 +125,7 @@
+ # next edit trips the guard on its own merits rather than on inherited saturation.
+ # v1.34.0: slim НЕ ре-бэйслайнится (см. пояснение к _BASELINES) — прежний потолок
+ # 21725 держится. full двигается на измеренную величину.
+-_PAYLOAD_BASELINES = {"slim": 20691, "full": 48037}
++_PAYLOAD_BASELINES = {"slim": 22317, "full": 52045}
+ # Domain-matched whole-payload бэйслайны (v1.34.0). Заполняются измерением ниже —
+ # см. test_domain_matched_rlm_start_payload_within_budget. «проведение» осознанно
+ # фиксируется отдельно: там потолок +5% был превышен ещё ДО релиза.
+@@ -127,13 +133,13 @@
+     # «права» — рамка Задачи 8 (доменный рецепт инлайнится в стратегию и уезжает в
+     # payload). Ре-бэйслайн осознанный, по ИЗМЕРЕННОЙ serialized delta.
+     ("slim", "права"): 22308,
+-    ("full", "права"): 48546,
++    ("full", "права"): 52593,
+     # «проведение» фиксируется ОТДЕЛЬНО и осознанно: на этом маршруте объявленный
+     # +5% был превышен ещё ДО v1.34.0 (пре-существующее состояние вне изменяемого
+     # пути — Задачи 1/2 этот рецепт СОКРАЩАЮТ). Маскировать его общим ре-бэйслайном
+     # ячеек «права» нельзя.
+     ("slim", "проведение"): 22631,
+-    ("full", "проведение"): 48864,
++    ("full", "проведение"): 52911,
+ }
+ 
+ _DRIFT = 1.05  # allow ≤5% growth before failing
+@@ -282,7 +288,7 @@
+ # baseline; git — optional runtime capability, поэтому среда без него скипается тем
+ # же способом, что и tests/test_sandbox_parity.py. Production coverage это не
+ # ослабляет: там сама git-ветка недостижима, а non-git baseline выполняется всегда.
+-_GIT_PAYLOAD_BASELINES = {"slim": 22814, "full": 49528}
++_GIT_PAYLOAD_BASELINES = {"slim": 22814, "full": 53575}
+ 
+ 
+ @pytest.mark.skipif(not shutil.which("git"), reason="git недоступен")
+--- a/tests/test_extension_detector.py
++++ b/tests/test_extension_detector.py
+@@ -221,7 +221,12 @@
+ 
+ 
+ def test_empty_dir_context():
+-    with tempfile.TemporaryDirectory() as d:
++    # detect_extension_context сканирует родителя И деда. Без двух уровней своей
++    # вложенности дедом оказывается общий TMPDIR, и под -n/xdist сюда протекают
++    # cf-фикстуры ДРУГИХ тестов (nearby_main перестаёт быть None).
++    with tempfile.TemporaryDirectory() as root:
++        d = os.path.join(root, "nest", "empty")
++        os.makedirs(d)
+         ctx = detect_extension_context(d)
+         assert ctx.current.role == ConfigRole.UNKNOWN
+         assert ctx.nearby_extensions == []
+@@ -243,7 +248,9 @@
+ 
+ def test_warnings_extension_standalone():
+     """Extension without nearby main config."""
+-    with tempfile.TemporaryDirectory() as parent:
++    with tempfile.TemporaryDirectory() as root:
++        # Два уровня вложенности — см. комментарий в test_empty_dir_context.
++        parent = os.path.join(root, "nest")
+         ext_dir = os.path.join(parent, "ext")
+         _write(os.path.join(ext_dir, "Configuration.xml"), _cf_extension_xml("Одиночка", "Customization", "о_"))
+ 

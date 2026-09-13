@@ -96,7 +96,7 @@ def memory_mb() -> int:
 def ipc_max_bytes() -> int:
     """Максимальный размер одного IPC JSON frame (bytes).
 
-    Floor 256 KiB: init_ok несёт registry snapshot (53 хелпера с recipe) ~66 KiB —
+    Floor 256 KiB: init_ok несёт registry snapshot (55 хелперов с recipe) ~66 KiB —
     меньший лимит сделал бы worker незапускаемым.
     """
     return _int_env("RLM_SANDBOX_IPC_MAX_BYTES", 4 * 1024 * 1024, min_value=256 * 1024)

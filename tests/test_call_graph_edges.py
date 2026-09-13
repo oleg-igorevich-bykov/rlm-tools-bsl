@@ -384,11 +384,28 @@ def _indexed_helpers(cf, db_path):
     return bsl, reader
 
 
-def test_hierarchy_default_has_no_triggers_key(built):
+def test_hierarchy_default_has_triggers_key(built):
+    # v1.36.0: include_triggers default flipped True→ an agent that never
+    # passes the flag must still see the triggers annotation (empty callers +
+    # non-empty triggers is reachable, not dead code).
     _reader, cf, db = built
     bsl, reader2 = _indexed_helpers(cf, db)
     try:
         res = bsl["find_call_hierarchy"]("ПодпискаПриЗаписи", depth=1)
+        assert res["tree"], "root node expected"
+        root = next(n for n in res["tree"] if n["name"] == "ПодпискаПриЗаписи")
+        assert "triggers" in root
+        types = {t["edge_type"] for t in root["triggers"]}
+        assert "subscription" in types
+    finally:
+        reader2.close()
+
+
+def test_hierarchy_include_triggers_false_omits_key(built):
+    _reader, cf, db = built
+    bsl, reader2 = _indexed_helpers(cf, db)
+    try:
+        res = bsl["find_call_hierarchy"]("ПодпискаПриЗаписи", depth=1, include_triggers=False)
         assert res["tree"], "root node expected"
         for node in res["tree"]:
             assert "triggers" not in node
