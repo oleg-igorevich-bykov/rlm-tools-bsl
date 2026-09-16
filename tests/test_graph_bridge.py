@@ -155,12 +155,20 @@ def test_graph_search_routines_maps_to_search_bsl_routines():
     call = MagicMock(return_value="routine-hits")
     helpers = _helpers(call_tool_fn=call)
 
-    out = helpers["graph_search_routines"]("РассчитатьГрафик", limit=2)
+    out = helpers["graph_search_routines"]("name", search_text="РассчитатьГрафик", limit=2)
 
     assert out == "routine-hits"
     call.assert_called_once_with(
-        "search_bsl_routines", {"query": "РассчитатьГрафик", "limit": 2}
+        "search_bsl_routines", {"mode": "name", "limit": 2, "search_text": "РассчитатьГрафик"}
     )
+
+
+def test_graph_search_routines_requires_mode():
+    call = MagicMock(return_value="routine-hits")
+    helpers = _helpers(call_tool_fn=call)
+
+    with pytest.raises(ValueError):
+        helpers["graph_search_routines"]("")
 
 
 def test_graph_object_structure_maps_params():

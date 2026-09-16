@@ -202,13 +202,20 @@ def make_graph_helpers(
             raise ValueError("graph_search_code: 'query' cannot be empty")
         return call_tool_fn("search_bsl_code", {"query": query, "limit": limit, **filters})
 
-    def graph_search_routines(query: str, limit: int = 5, **filters) -> str:
-        """Search routines by name/signature/description (metacode: search_bsl_routines)."""
-        if not query:
-            raise ValueError("graph_search_routines: 'query' cannot be empty")
-        return call_tool_fn(
-            "search_bsl_routines", {"query": query, "limit": limit, **filters}
-        )
+    def graph_search_routines(mode: str, search_text: str | None = None, limit: int = 5, **filters) -> str:
+        """Search/list BSL routines (metacode: search_bsl_routines).
+
+        mode: 'description' | 'name' | 'signature' | 'unused' | 'exported'.
+        search_text обязателен для description/name/signature (см. полное
+        описание тула на graph-стороне — там же search_match/routine_type/
+        export/owner_categories/module_type и т.д., прокидываются через **filters).
+        """
+        if not mode:
+            raise ValueError("graph_search_routines: 'mode' cannot be empty")
+        params = {"mode": mode, "limit": limit, **filters}
+        if search_text is not None:
+            params["search_text"] = search_text
+        return call_tool_fn("search_bsl_routines", params)
 
     def graph_object_structure(object_ref: str, sections: list[str] | None = None, **params) -> str:
         """Indexed structure card of a metadata object (metacode: get_metadata_object_structure).
@@ -244,6 +251,6 @@ GRAPH_HELPER_SIGNATURES: tuple[str, ...] = (
     "graph_tools(refresh=False) -> [{name, description}] — список инструментов графового сервера",
     "graph_call(tool, **params) -> str — любой инструмент metacode по имени",
     "graph_search_code(query, limit=5, **filters) -> str — семантический поиск по ТЕЛУ кода (граф)",
-    "graph_search_routines(query, limit=5, **filters) -> str — поиск процедур по имени/сигнатуре/описанию (граф)",
+    "graph_search_routines(mode, search_text=None, limit=5, **filters) -> str — поиск/листинг процедур (граф); mode: description|name|signature|unused|exported",
     "graph_object_structure(object_ref, sections=None) -> str — индексированная структура объекта (граф)",
 )
