@@ -1088,7 +1088,36 @@ def test_reader_fixtures_smoke(request, fixture_name):
 # Порог двигается ТОЛЬКО после exact-теста соответствующей подписи и ровно на
 # заранее известную дельту:
 #   Task 0: 11928   Task 1: 12289 (+361)   Task 3: 12265 (-24)   Task 4: 12306 (+41)
-_SIG_SUM_BUDGET_WITHOUT_GIT = 12306
+#
+# v1.37.0 — ЛЕСТНИЦА по задачам, а не одна установка на финал. Порог, выставленный
+# сразу на конечное число, открыл бы окно на все прибавки релиза разом: задача
+# потратила бы больше своей статьи и прошла зелёной, а перебор вскрылся бы на
+# последней, когда резать пришлось бы уже написанное. Шаги (каждый — измеренный
+# факт после своей задачи, БЕЗ коэффициента):
+#   Task 0: 11478 (снято 819 прозы из sig в recipe — см. тесты ниже)
+#   Задачи 5, 1, 2, 8 подписей не трогают вовсе.
+#   Task 3: +31 (extension_file у get_overrides, статья 36)   -> 11509
+#   Task 4: +55 (unique_object_methods + граница, статья 60) -> 11564
+#   Task 6.2: +150 (delegates 43 + posting=None 50 + kinds 57; статья 160) -> 11714
+#   Task 7: +46 (метки 2, охват handler= 33, form_name 11; статья 57) -> 11760
+#   Task 6.1: +76 (безусловный via 41 + _meta провенанс 35; статья 80) -> 11836
+#
+# v1.38.0 — продолжение лестницы. Порог поднят РОВНО на сумму подписей
+# ТРЁХ НОВЫХ хелперов релиза (count_matches 270 + find_common_modules 128 +
+# find_templates 159 = 557), чтобы гард ПРОДОЛЖАЛ держать старые подписи на
+# прежнем уровне: факт по СТАРЫМ хелперам после всех задач — 11 515,
+# то есть НИЖЕ прежнего порога 11 836 (задача бюджета сняла 456 прозы,
+# а новые ключи вернули меньше).
+#   Task 0 (бюджет): −456 прозы из 8 подписей; новые ключи Задач 2/5/6/7/8/9/11/12.
+#   Три новых хелпера: +557                                     -> 12393
+_SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
+# v1.38.0 merge re-baseline: лестница выше — величина ЧИСТОГО upstream-дерева.
+# Форк несёт СВОИ 2 локальные подписи поверх (find_role_objects 174,
+# get_object_structures 357 = +531), а его же get_object_full_structure ужат
+# при слиянии (эта же ветка merge, тест test_long_sigs_are_trimmed) — обе
+# правки в измеренном факте, не разложены по отдельности намеренно: порог
+# снят ЦЕЛИКОМ на смерженном дереве, как остальные бэйслайны этого merge.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 12602
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -1144,6 +1173,50 @@ def test_trimmed_sigs_did_not_lose_a_single_key_name():
             "exact_rows",
             "fallback_rows",
         ],
+        # v1.37.0 (Задача 0) — надзор РАСШИРЕН на каждую фактически порезанную
+        # подпись. Перечень выше покрывал лишь подписи, которые резал v1.36.0;
+        # без этих строк резка вместе с именем ключа прошла бы зелёной.
+        "find_module": ["name", "module_type", "category", "limit", "path", "object_name", "owner"],
+        "extract_procedures": ["path", "object_name", "name", "line", "end_line", "is_export", "params"],
+        "find_callers": ["proc", "module_hint", "max_files", "file", "line", "text"],
+        "find_definition": [
+            "name",
+            "module_hint",
+            "limit",
+            "definitions",
+            "owner",
+            "total",
+            "truncated",
+            "partial",
+            "_meta",
+        ],
+        "get_object_profile": [
+            "sections",
+            "include_flow",
+            "include_code_usages",
+            "limit",
+            "structure",
+            "modules",
+            "registers",
+            "subscriptions",
+            "roles",
+            "functional_options",
+            "status",
+            "summary",
+            "items",
+            "_meta",
+        ],
+        "analyze_object": ["name", "category", "metadata", "modules", "module_type", "procedures", "exports"],
+        "analyze_document_flow": [
+            "document",
+            "metadata",
+            "event_subscriptions",
+            "register_movements",
+            "related_scheduled_jobs",
+            "based_on",
+            "print_forms",
+            "is_postable",
+        ],
     }
     for helper, keys in required.items():
         sig = snap[helper]["sig"]
@@ -1169,18 +1242,38 @@ def test_moved_prose_landed_in_the_unbudgeted_recipe():
     assert "exact_rows" in snap["find_callers_context"]["recipe"]
     assert "fallback_rows" in snap["find_callers_context"]["recipe"]
 
+    # v1.37.0 (Задача 0): перенос — это ПЕРЕНОС и для новых порезанных подписей.
+    # Каждая фраза ниже жила в `sig` до релиза; её отсутствие в `recipe` означало
+    # бы, что знание удалено, а не перенесено.
+    assert "любой модуль" in snap["find_module"]["recipe"]
+    assert "НЕ релевантность" in snap["find_module"]["recipe"]
+    assert "get_module_outline" in snap["extract_procedures"]["recipe"]
+    assert "ValueError" in snap["extract_procedures"]["recipe"]
+    assert "find_callers_context" in snap["find_callers"]["recipe"]
+    assert "module_hint" in snap["find_definition"]["recipe"]
+    assert "live" in snap["find_definition"]["recipe"].casefold()
+    assert "unavailable" in snap["get_object_profile"]["recipe"]
+    assert "include_code_usages" in snap["get_object_profile"]["recipe"]
+    assert "extract_procedures" in snap["analyze_object"]["recipe"]
+    assert "find_register_movements" in snap["analyze_document_flow"]["recipe"]
+
 
 def test_analyze_subsystem_registered_sig_exact():
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
     sig = build_helper_metadata_snapshot()["analyze_subsystem"]["sig"]
-    assert len(sig) == 427
+    # v1.38.0 (Задача 2): 427 -> 420. Хвост «content=matched(index)» больше неверен
+    # — обратный вопрос решают ОБЕ ветки. Число правится ВМЕСТЕ с подписью.
+    # v1.38.0: 420 -> 396. Добавлен live_scan, срезана проза «direct=row-full;
+    # content=matched» (форма строки описана в recipe и HELPERS.md).
+    assert len(sig) == 396
     for marker in (
         "subsystems_found",
         "content_truncated",
         "reverse_lookup_supported",
         "extensions_included",
-        "direct=row-full",
+        # v1.38.0: `live_scan` — бюджет живого обратного прохода; он БЕЗУСЛОВНЫЙ.
+        "live_scan",
         "total_objects=row-total",
         "found>len(subsystems)=>14K.",
     ):
@@ -1261,7 +1354,9 @@ def test_analyze_subsystem_goes_live_instead_of_publishing_a_rebuild_window(buil
     bsl = _make_bsl(built_index_env.root, idx_reader=reader)
     res = bsl["analyze_subsystem"]("ПодсистемаА")
     assert res["_meta"]["source"] == "live"
-    assert res["_meta"]["reverse_lookup_supported"] is False
+    # v1.38.0 (Задача 2): обратный вопрос решают ОБЕ ветки.
+    assert res["_meta"]["reverse_lookup_supported"] is True
+    assert res["_meta"]["live_scan"] is not None
     (row,) = res["subsystems"]
     assert row["total_objects"] == 2
     assert set(row["raw_content"]) == {"CommonModule.ПодсистемаАСервер", "Document.ЧужоеИмя"}
@@ -1439,24 +1534,48 @@ class TestAnalyzeSubsystemSingleShape:
         b = sorted(s["name"] for s in idx["analyze_subsystem"]("Почта")["subsystems"] if s["match"] == "name")
         assert a == b == ["Почта"]
 
-    def test_live_branch_declares_that_it_cannot_do_reverse_lookup(self, cf_indexed):
-        """Живая ветка ищет XML подсистемы ПО ИМЕНИ ФАЙЛА, поэтому запрос по имени
-        входящего объекта не найдёт ничего НИКОГДА. Это обязано быть ОБЪЯВЛЕНО,
-        а не выглядеть как «объект ни в одну подсистему не входит»."""
+    def test_live_branch_answers_the_reverse_question_too(self, cf_indexed):
+        """v1.38.0 (Задача 2): живая ветка отвечает на ОБА вопроса одним проходом.
+
+        До релиза XML подсистемы искался ПО ИМЕНИ ФАЙЛА, поэтому запрос по имени
+        входящего объекта не находил ничего НИКОГДА, и пустой ответ ничего не
+        доказывал. Теперь перед разбором стоит подстрочный префильтр по сырому
+        тексту — надмножественный тест, ложных отрицаний дать не может.
+        """
         live = _make_bsl(cf_indexed.root)  # без ридера
         direct = live["analyze_subsystem"]("ПодсистемаА")
-        assert direct["_meta"]["reverse_lookup_supported"] is False
+        assert direct["_meta"]["reverse_lookup_supported"] is True
         assert all(s["match"] == "name" for s in direct["subsystems"])
         reverse = live["analyze_subsystem"]("ЧужоеИмя")
-        # Пустой ответ на обратный вопрос СОПРОВОЖДЁН объяснением, а не молчит,
-        # и _meta есть даже на нём (иначе агент не отличит «нет» от «не искали»).
-        assert "error" in reverse
-        assert reverse["_meta"]["reverse_lookup_supported"] is False
-        # Текст проверяется ПО СМЫСЛУ, а не по факту наличия: прежний hint обещал
-        # обратный поиск и на живой ветке, то есть подтверждал ложный вывод.
-        assert "не поддержан" in reverse["hint"]
-        assert "match='content'" not in reverse["hint"], "hint живой ветки не имеет права обещать то, чего она не умеет"
-        assert "rlm_index build" in reverse["hint"], "нужен исполнимый выход"
+        assert "error" not in reverse, reverse
+        assert [s["match"] for s in reverse["subsystems"]] == ["content"], reverse["subsystems"]
+        assert reverse["_meta"]["reverse_lookup_supported"] is True
+        # Бюджет прохода ОБЪЯВЛЕН, а не подразумевается.
+        scan = reverse["_meta"]["live_scan"]
+        assert set(scan) == {"files_total", "files_read", "files_parsed", "failed_files", "truncated"}
+        assert scan["files_total"] >= 1 and scan["truncated"] is False
+
+    def test_live_and_index_branches_return_the_same_row_set(self, cf_indexed):
+        """Гард против нового расхождения форм: одно дерево — один НАБОР строк."""
+        live = _make_bsl(cf_indexed.root)
+        idx = _make_bsl(cf_indexed.root, idx_reader=cf_indexed.reader)
+
+        def _rows(bsl, query):
+            res = bsl["analyze_subsystem"](query)
+            return sorted(
+                (s["name"], (s["file"] or "").replace("\\", "/"), s["match"]) for s in res.get("subsystems", [])
+            )
+
+        for query in ("ПодсистемаА", "ЧужоеИмя"):
+            assert _rows(live, query) == _rows(idx, query), query
+
+    def test_index_route_does_not_pay_for_the_reverse_scan(self, cf_indexed):
+        """Индексный маршрут своего поведения НЕ меняет: прохода не было."""
+        idx = _make_bsl(cf_indexed.root, idx_reader=cf_indexed.reader)
+        res = idx["analyze_subsystem"]("ПодсистемаА")
+        assert res["_meta"]["source"] == "index"
+        # Ключ ЕСТЬ всегда (правило безусловного ключа), но равен None.
+        assert "live_scan" in res["_meta"] and res["_meta"]["live_scan"] is None
 
     def test_index_empty_hint_does_not_turn_has_metadata_into_coverage(self, cf_indexed):
         """Пустая таблица — ноль среди разобранных строк, не сертификат всех XML."""
@@ -1501,7 +1620,7 @@ class TestAnalyzeSubsystemSingleShape:
         bsl = _make_bsl(cf_indexed.root, idx_reader=reader)
         res = bsl["analyze_subsystem"]("ПодсистемаА")
         assert res["_meta"]["source"] == "live"
-        assert res["_meta"]["reverse_lookup_supported"] is False
+        assert res["_meta"]["reverse_lookup_supported"] is True
 
     def test_synonym_match_on_both_branches(self, cf_synonym):
         """R52: `Спецодежда` при имени `ктнСпецодежда` и синониме `Спецодежда` —
@@ -1529,6 +1648,8 @@ class TestAnalyzeSubsystemSingleShape:
             "source": "index",
             "limit": 200,
             "reverse_lookup_supported": True,
+            # v1.38.0: ключ присутствует ВСЕГДА; None = живого прохода не было.
+            "live_scan": None,
             "extensions_included": False,
         }
 
@@ -1712,11 +1833,15 @@ class TestAnalyzeSubsystemSingleShape:
             "parse_metadata_xml",
             lambda *_: pytest.fail("validation обязана быть раньше XML"),
         )
-        for bsl, source, reverse in ((indexed, "index", True), (live, "live", False)):
+        for bsl, source in ((indexed, "index"), (live, "live")):
             res = bsl["analyze_subsystem"](query)
             assert "error" in res and "непуст" in res["hint"].lower()
             assert res["_meta"]["source"] == source
-            assert res["_meta"]["reverse_lookup_supported"] is reverse
+            # v1.38.0: значение больше не выводится из доступности индексного
+            # маршрута — обратный вопрос решают ОБЕ ветки.
+            assert res["_meta"]["reverse_lookup_supported"] is True
+            # Validation отработала ДО любого прохода: ключ есть, значения нет.
+            assert res["_meta"]["live_scan"] is None
             assert len(json.dumps(res, ensure_ascii=False)) <= 14_000
 
     def test_overlong_query_fails_bounded_without_echo(self, cf_indexed):
@@ -1745,7 +1870,7 @@ class TestAnalyzeSubsystemSingleShape:
             bsl = _make_bsl(cf_indexed.root, idx_reader=reader)
             res = bsl["analyze_subsystem"]("X" * 20_000)
             assert res["_meta"]["source"] == "live"
-            assert res["_meta"]["reverse_lookup_supported"] is False
+            assert res["_meta"]["reverse_lookup_supported"] is True
         finally:
             reader.close()
 
@@ -1768,7 +1893,7 @@ class TestAnalyzeSubsystemSingleShape:
         res = bsl["analyze_subsystem"](query)
         assert "error" in res
         assert res["_meta"]["source"] == "live"
-        assert res["_meta"]["reverse_lookup_supported"] is False
+        assert res["_meta"]["reverse_lookup_supported"] is True
 
     def test_foreign_reader_never_publishes_another_roots_subsystems(self, cf_foreign_subsystem_index, monkeypatch):
         """Два статичных корня: reader B не является данными current-root A.
@@ -1797,7 +1922,7 @@ class TestAnalyzeSubsystemSingleShape:
         alien = bsl["analyze_subsystem"]("ТолькоБ")
         assert "error" in alien
         assert alien["_meta"]["source"] == "live"
-        assert alien["_meta"]["reverse_lookup_supported"] is False
+        assert alien["_meta"]["reverse_lookup_supported"] is True
         own = bsl["analyze_subsystem"]("ТолькоА")
         assert own["_meta"]["source"] == "live"
         assert [r["name"] for r in own["subsystems"]] == ["ТолькоА"]
@@ -2079,11 +2204,21 @@ class TestBasedOnDedup:
         assert len(types) == 2  # фикстура: 3 совпадения на 2 типа
 
     def test_key_set_of_a_row_is_unchanged(self, cf_two_branch_filling):
-        """Дедуп — это ТОЛЬКО дедуп: новых ключей в строке не появляется."""
+        """Дедуп — это ТОЛЬКО дедуп: новых ключей в строке не появляется.
+
+        v1.37.0: `via` стал БЕЗУСЛОВНЫМ ключом КАЖДОЙ строки — правило «отсутствие
+        поля означает direct» жило только в докстринге, то есть было ключом,
+        которого никто не читает. Набор ужесточён, а не ослаблен: теперь он ТОЧНЫЙ
+        и включает `via`, и у прямых строк значение обязано быть именно 'direct'.
+        """
         bsl = _make_bsl(cf_two_branch_filling.root)
         res = bsl["find_based_on_documents"]("ЦелевойДок")
         for r in res["can_be_created_from"]:
-            assert set(r) == {"type", "file"}
+            # v1.38.0 (Задача 9): набор ужесточён ДВУМЯ ключами — `declared`
+            # (объявлена ли связь платформой) и `line` (строка фактического
+            # вызова). `via` при этом НЕ переопределяется: это провенанс СКАНА.
+            assert set(r) == {"type", "file", "via", "declared", "line"}
+            assert r["via"] == "direct", r
 
     def test_first_occurrence_order_and_spelling_preserved(self, cf_two_branch_filling):
         """Ключ дедупа считается по lower(), но в ответ уезжает ПЕРВОЕ написание:
@@ -2123,8 +2258,9 @@ class TestBasedOnDedup:
         same_documents = [r for r in res["can_create_from_here"] if r["document"] == "ОбщаяЦель"]
         assert len(same_types) == 1
         assert len(same_documents) == 1
-        assert set(same_types[0]) == {"type", "file"}
-        assert set(same_documents[0]) == {"document", "file"}
+        assert set(same_types[0]) == {"type", "file", "via", "declared", "line"}
+        assert set(same_documents[0]) == {"document", "category", "file", "via", "declared", "line"}
+        assert same_types[0]["via"] == "direct" and same_documents[0]["via"] == "direct"
 
     def test_metadata_union_seed_still_sees_deduped_direct_rows(self, cf_indexed_basedon):
         """Соседний metadata-дедуп засевается из can_create_from_here — он обязан
@@ -2142,7 +2278,7 @@ class TestBasedOnDedup:
         assert len(keys) == len(set(keys))
         target_rows = [r for r in res["can_create_from_here"] if r["document"].lower() == "цель"]
         assert len(target_rows) == 1
-        assert "via" not in target_rows[0], "первой сохраняется direct-строка"
+        assert target_rows[0]["via"] == "direct", "первой сохраняется direct-строка"
 
     def test_document_flow_embeds_the_same_deduped_contract(self, cf_two_branch_filling):
         """Непосредственный consumer не должен восстановить дубли либо изменить
@@ -2349,7 +2485,20 @@ class TestFunctionalOptionsShape:
     def test_legacy_top_level_key_set_unchanged(self, cf_fo):
         bsl = _make_bsl(cf_fo.root, idx_reader=cf_fo.reader)
         res = bsl["find_functional_options"]("ТестДок", include_code=False)
-        assert set(res) == {"object", "xml_options", "code_options", "total", "xml_total", "code_total"}
+        # v1.37.0: `_meta` стал БЕЗУСЛОВНЫМ (провенанс XML-корзины есть ВСЕГДА, а
+        # прежний гейт по `include_code` делал ФОРМУ ответа зависящей от аргумента).
+        # Это ВТОРАЯ, независимая заморозка того же набора — она обновляется вместе с
+        # `test_arg_guards.test_functional_options_without_limit_keep_legacy_key_set`.
+        assert set(res) == {
+            "object",
+            "xml_options",
+            "code_options",
+            "total",
+            "xml_total",
+            "code_total",
+            "_meta",
+        }
+        assert res["_meta"]["code_source"] == "not_requested", res["_meta"]
 
     def test_include_content_false_does_not_poison_the_live_cache(self, cf_fo):
         bsl = _make_bsl(cf_fo.root)  # live-ветка, кеш _ensure_functional_options
@@ -2377,11 +2526,16 @@ def test_functional_options_registered_sig_exact():
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
     sig = build_helper_metadata_snapshot()["find_functional_options"]["sig"]
-    assert len(sig) == 412
+    # v1.37.0 (Задача 6.1): 412 -> 447 — объявлены три ключа провенанса. Число
+    # правится ВМЕСТЕ с подписью: заморозка длины на то и заведена.
+    # v1.38.0 (Задача 0, бюджет): 447 -> 384 — проза переехала в
+    # небюджетируемый `recipe` (имена ключей ниже не тронуты).
+    assert len(sig) == 384
     for marker in (
         "include_content=True",
         "synonym,location,file,content?|content_size?",
         "code_options:[{name,option_name,file,line}]",
+        "_meta:{source,xml_source,code_source",
     ):
         assert marker in sig
 
@@ -3253,15 +3407,16 @@ def test_agent_facing_routes_match_subsystem_and_fo_contracts():
     subsystem_route = (
         "No recipe? → analyze_subsystem('Подсистема'); current-root; uncut "
         "known rows:all direct:!content_truncated&"
-        "subsystems_found==len(subsystems);live:no reverse"
+        "subsystems_found==len(subsystems)"
     )
     # Байтовый гард ЯЧЕЙКИ (R127): «BUSINESS RECIPE? Follow it.» (27) + перевод
-    # строки + маршрут (156) = 184 при прежних 186. Держатся ОБЕ строки и их
-    # соседство, а не только вторая. Отступ секции в два пробела учтён явно.
+    # строки + маршрут. Держатся ОБЕ строки и их соседство, а не только
+    # вторая. v1.38.0 (Задача 2): 156 -> 140, хвост «;live:no reverse» ушёл —
+    # обратный вопрос решают обе ветки, и утверждать обратное больше нельзя.
     import re
 
     recipe_line = "BUSINESS RECIPE? Follow it."
-    assert (len(recipe_line), len(subsystem_route)) == (27, 156)
+    assert (len(recipe_line), len(subsystem_route)) == (27, 140)
     pair = re.compile(re.escape(recipe_line) + r"\n[ \t]*" + re.escape(subsystem_route))
     for text in (slim_workflow, full):
         assert pair.search(text), "пара Step 0 обязана остаться СОСЕДНИМИ строками"
@@ -3287,11 +3442,21 @@ def test_agent_facing_routes_match_subsystem_and_fo_contracts():
     rights_full = "\n".join(K._BUSINESS_RECIPES["права"]["full"])
     assert "find_functional_options('',include_code=False,include_content=False,limit=50)" in rights_full
 
+    # Пофайловый гард ДЛИНЫ четырёх `full`-рецептов, сжатых в v1.36.0: он не даёт им
+    # отрасти обратно. Потолки стоят ВПЛОТНУЮ к факту (запас 14 / 2 / 10 / 0), то есть
+    # любая прибавка обязана быть осознанной и названной.
+    #
+    # v1.37.0: «права» 1118 → 1160, ровно на +42 — правило синхронизации текстов
+    # (docs/MODULE_MAP.md) требует обновить домен вместе с контрактом хелпера, а
+    # `find_functional_options` объявил провенанс смешанного источника
+    # (`_meta.xml_source`/`code_source`). Прибавка ужата: она дописана в УЖЕ
+    # существующую строку про ФО, а не отдельным пунктом списка (тот стоил бы 92).
+    # Остальные три потолка не двигаются — их домены релиз не правит.
     old_full_lengths = {
         "себестоимость": 612,
         "распределение": 573,
         "печать": 465,
-        "права": 1118,
+        "права": 1160,
     }
     for domain, ceiling in old_full_lengths.items():
         assert sum(map(len, K._BUSINESS_RECIPES[domain]["full"])) <= ceiling

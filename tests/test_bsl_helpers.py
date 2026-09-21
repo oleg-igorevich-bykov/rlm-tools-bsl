@@ -2021,12 +2021,43 @@ def test_find_event_subscriptions_all():
 
 
 def test_find_event_subscriptions_filtered():
+    """v1.38.0: адресный вопрос НЕ тащит весь список источников.
+
+    Раньше строка ехала с полным ``source_types`` (на боевых до 1376 элементов),
+    и ответ обрезался по ``max_output_chars`` ДО измерительной строки. Теперь по
+    умолчанию едут только ``matched_types`` — типы, ИЗ-ЗА которых строка подобрана,
+    — плюс прежний ``source_count``; полный список отдаётся по явному флагу.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, _ = _make_full_fixture(tmpdir)
         result = bsl["find_event_subscriptions"]("АвансовыйОтчет")
         assert len(result) >= 1
-        # With filter, source_types should be included
-        assert "source_types" in result[0]
+        exact = [r for r in result if r["scope"] == "exact"]
+        assert exact, "точная подписка на документ обязана найтись"
+        row = exact[0]
+        assert "source_types" not in row
+        assert "source_type_sets" not in row
+        assert row["matched_types"], "не названы типы, из-за которых строка подобрана"
+        assert row["matched_via"] == "type"
+        assert row["source_count"] >= len(row["matched_types"])
+
+        full = bsl["find_event_subscriptions"]("АвансовыйОтчет", include_source_types=True)
+        full_exact = [r for r in full if r["scope"] == "exact"]
+        assert "source_types" in full_exact[0]
+        # Режется ТОЛЬКО сериализация: набор строк не изменился.
+        assert [r["name"] for r in full] == [r["name"] for r in result]
+
+
+def test_find_event_subscriptions_overview_is_unchanged():
+    """Безадресный вызов формы не менял: ни scope, ни source_types, ни наборов."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, _ = _make_full_fixture(tmpdir)
+        result = bsl["find_event_subscriptions"]()
+        assert len(result) >= 1
+        for row in result:
+            assert "source_types" not in row
+            assert "source_type_sets" not in row
+            assert "scope" not in row
 
 
 def test_find_event_subscriptions_no_match():
@@ -2475,7 +2506,8 @@ def test_find_based_on_documents_document_input_unaffected_by_homonym_gate():
                 result = bsl["find_based_on_documents"](inp)
                 hits = {(d["document"], d.get("via")) for d in result["can_create_from_here"]}
                 # direct-скан ManagerModule документа отработал (via отсутствует → None)
-                assert ("ЗаказКлиента", None) in hits, (inp, result["can_create_from_here"])
+                # v1.37.0: `via` безусловен — у прямой строки он равен 'direct'.
+                assert ("ЗаказКлиента", "direct") in hits, (inp, result["can_create_from_here"])
                 # …и Catalog-основание (ref=Catalog.Контрагент) НЕ подмешалось
                 assert "ЗаявкаКлиента" not in {d["document"] for d in result["can_create_from_here"]}
                 assert any(d["type"] == "ДокументСсылка.Основание" for d in result["can_be_created_from"]), result[
@@ -2678,13 +2710,19 @@ def test_find_module_optional_filters(bsl_env):
     assert all(m["module_type"] == mt for m in filtered)
     # Case-insensitive.
     assert len(fm("МойМодуль", module_type=mt.upper())) == len(filtered)
-    # Nonexistent type → empty (no error).
-    assert fm("МойМодуль", module_type="НесуществующийТип") == []
+    # v1.38.0 (Задача 4): НЕСУЩЕСТВУЮЩЕЕ значение — НАЗВАННЫЙ отказ с перечнем
+    # допустимых, а не молчаливый ноль. Молчаливый ноль неотличим от честного
+    # «таких модулей нет», и агент делал из него ложный отрицательный вывод.
+    with pytest.raises(ValueError) as exc:
+        fm("МойМодуль", module_type="НесуществующийТип")
+    assert "ObjectModule" in str(exc.value)
 
     # Category filter likewise.
     by_cat = fm("МойМодуль", category=cat)
     assert by_cat and all(m["category"] == cat for m in by_cat)
-    assert fm("МойМодуль", category="НетТакойКатегории") == []
+    with pytest.raises(ValueError) as exc:
+        fm("МойМодуль", category="НетТакойКатегории")
+    assert "CommonModules" in str(exc.value)
 
     # Filter-only call WITHOUT a positional name must NOT raise (Codex finding):
     # find_module(module_type=...) is the exact agent guess. name is optional.
@@ -4339,15 +4377,19 @@ def test_profile_exact_ref_no_collision():
 
 
 def test_profile_subscriptions_summary_split_and_exact_first():
-    """#2 (v1.28.0): subscriptions.summary раскладывает exact/universal; exact-first
-    сортировка гарантирует, что явные подписки видны в items даже при малом limit."""
+    """#2 (v1.28.0): subscriptions.summary раскладывает exact/set/universal; exact-first
+    сортировка гарантирует, что явные подписки видны в items даже при малом limit.
+
+    v1.38.0: третий ключ `set` (подписка на НАБОР типов). Без него сумма
+    exact+universal перестала бы сходиться с `subscriptions` на конфигурации с
+    наборами, то есть сводка молча теряла бы часть собственных строк."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, reader = _make_profile_fixture(tmpdir, with_index=True)
         try:
             subs = bsl["get_object_profile"]("РеализацияТоваров")["sections"]["subscriptions"]
             assert subs["status"] == "ok"
             # summary раскладывает: 1 exact (ПодпискаРеализация) + 1 universal (ПодпискаUniversal).
-            assert subs["summary"] == {"subscriptions": 2, "exact": 1, "universal": 1}
+            assert subs["summary"] == {"subscriptions": 2, "exact": 1, "set": 0, "universal": 1}
             assert subs["total"] == 2
             # каждый item несёт scope.
             assert {i["scope"] for i in subs["items"]} == {"exact", "universal"}
@@ -4358,7 +4400,7 @@ def test_profile_subscriptions_summary_split_and_exact_first():
             assert subs1["items"][0]["name"] == "ПодпискаРеализация"
             assert subs1["items"][0]["scope"] == "exact"
             # но summary остаётся полным (счёт по всем rows, не по усечённым items).
-            assert subs1["summary"] == {"subscriptions": 2, "exact": 1, "universal": 1}
+            assert subs1["summary"] == {"subscriptions": 2, "exact": 1, "set": 0, "universal": 1}
         finally:
             if reader:
                 reader.close()
@@ -9667,3 +9709,234 @@ def test_parse_form_types_is_list_on_index_backed_path(form_bsl):
     for a in attrs:
         assert isinstance(a["types"], list), f"index-backed отдал {type(a['types'])}: {a}"
     assert any(a["main"] for a in attrs), "MainAttribute не доехал до index-backed выдачи"
+
+
+# ---------------------------------------------------------------------------
+# v1.37.0 (Задача 6.2) — _meta.delegates: имена делегатов машинно, не только прозой
+# ---------------------------------------------------------------------------
+
+
+def _many_delegates_module(count: int) -> str:
+    calls = "\n".join(f"    Делегат{i}.Метод{i}(Движения);" for i in range(count))
+    return f"Процедура ОбработкаПроведения(Отказ, Режим)\n{calls}\nКонецПроцедуры\n"
+
+
+def test_delegates_are_published_as_a_bounded_first_page():
+    """`code_registers=0` при делегировании читается как «движений нет».
+
+    `posting_handler_present=True` уже есть, но ИМЕНА делегатов, разобранные машинно,
+    жили только прозой внутри `hint`.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _DELEGATED})
+        try:
+            res = bsl["find_register_movements"]("ТестДок")
+            assert res["posting_handler_present"] is True
+            meta = res["_meta"]
+            assert meta["delegates_total"] >= 1, meta
+            assert meta["delegates_truncated"] is False, meta
+            names = {f"{d['receiver']}.{d['method']}" for d in meta["delegates"]}
+            assert f"{_DELEGATE_MODULE}.{_DELEGATE}" in names, meta["delegates"]
+            # Форма — ФАКТИЧЕСКАЯ: `line` не считается нигде, поэтому его тут нет.
+            row = meta["delegates"][0]
+            for key in ("receiver", "method", "kind", "homonym_module", "stale_homonym_module"):
+                assert key in row, sorted(row)
+            assert "line" not in row, row
+        finally:
+            reader.close()
+
+
+def test_delegates_page_is_bounded_and_reports_the_full_total():
+    """Публикация «как есть» отменила бы существующую границу рендера: обработчик с
+    сотнями `Модуль.Метод()` повторил бы их все и упёрся в max_output_chars."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _many_delegates_module(40)})
+        try:
+            meta = bsl["find_register_movements"]("ТестДок")["_meta"]
+            assert meta["delegates_total"] >= 20, meta["delegates_total"]
+            assert meta["delegates_truncated"] is True, meta
+            assert 0 < len(meta["delegates"]) <= 6, len(meta["delegates"])
+            # Пагинация НЕ обещается: посторонней оси в ответе нет.
+            assert "delegates_offset" not in meta and "delegates_next_offset" not in meta, meta
+        finally:
+            reader.close()
+
+
+def test_oversized_first_delegate_cannot_bypass_the_serialized_page_cap():
+    """Одна тяжёлая строка не получает исключение из char-cap.
+
+    Получатель-цепочка синтаксически допустим и разбирается как один delegate. Резать
+    его имя нельзя: обрезанный receiver выглядел бы исполнимым, но адресовал бы уже
+    другой объект. Поэтому oversized-строка целиком остаётся за границей первой
+    страницы, а ``delegates_total``/``delegates_truncated`` честно это называют.
+
+    v1.38.0: литерал ``1200`` заменён ИМПОРТОМ вынесенной на уровень модуля
+    константы — дублирование литерала и было причиной, по которой гард протух при
+    подъёме потолка. Плюс явное утверждение, что oversized-строка всё ещё НЕ
+    помещается: без него тест молча стал бы вакуумным при следующем подъёме.
+    """
+    from rlm_tools_bsl.bsl_helpers import _DELEGATES_PAGE_CHARS
+
+    receiver = ".".join(f"ДлинныйПолучатель{i:03d}" for i in range(100))
+    module = (
+        "Процедура ОбработкаПроведения(Отказ, РежимПроведения)\n"
+        f"    {receiver}.ЗаписатьДвижения(ЭтотОбъект, Отказ);\n"
+        "КонецПроцедуры\n"
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": module})
+        try:
+            meta = bsl["find_register_movements"]("ТестДок")["_meta"]
+            serialized = json.dumps(meta["delegates"], ensure_ascii=False, sort_keys=True, default=str)
+            assert len(serialized) <= _DELEGATES_PAGE_CHARS, len(serialized)
+            assert meta["delegates"] == [], meta["delegates"]
+            assert meta["delegates_total"] >= 1, meta
+            assert meta["delegates_truncated"] is True, meta
+        finally:
+            reader.close()
+
+    # Гард против ВАКУУМА: строка обязана оставаться НЕвместимой. Иначе тест
+    # продолжал бы проходить, ничего не проверяя.
+    oversized_row = [
+        {
+            "receiver": receiver,
+            "method": "ЗаписатьДвижения",
+            "kind": "unresolved",
+            "homonym_module": None,
+            "stale_homonym_module": None,
+            "platform_method_name": None,
+        }
+    ]
+    assert len(json.dumps(oversized_row, ensure_ascii=False, sort_keys=True, default=str)) > _DELEGATES_PAGE_CHARS, (
+        "oversized-строка стала помещаться в страницу — тест вакуумный, пересоберите фикстуру"
+    )
+
+
+def test_six_manager_module_delegates_with_erp_length_names_fit_the_page():
+    """v1.38.0 (Задача 1): счётный и символьный потолки СОГЛАСОВАНЫ.
+
+    До релиза первым всегда срабатывал символьный (1200), и заявленные «до шести»
+    делегатов были недостижимы в принципе: строка `manager_module` на реальных
+    ERP-именах сериализуется в ~281 символ вместе с `module_path`, то есть шесть
+    строк давали 1698 при потолке 1200 — помещалось ЧЕТЫРЕ.
+    """
+    from rlm_tools_bsl.bsl_helpers import _DELEGATES_PAGE_CHARS, _DELEGATES_PAGE_MAX
+
+    # Имена ERP-длины: «ОтражениеДокументовВРегламентированномУчетеСервер» и т.п.
+    modules = {f"ОтражениеДокументовВРегламентированномУчетеСервер{i}": "" for i in range(_DELEGATES_PAGE_MAX)}
+    calls = "\n".join(
+        f"    {name}.ОтразитьДокументВРегламентированномУчете{i}(ЭтотОбъект, Отказ);" for i, name in enumerate(modules)
+    )
+    body = f"Процедура ОбработкаПроведения(Отказ, РежимПроведения)\n{calls}\nКонецПроцедуры\n"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": body}, extra_common_modules=modules)
+        try:
+            meta = bsl["find_register_movements"]("ТестДок")["_meta"]
+            assert meta["delegates_total"] == _DELEGATES_PAGE_MAX, meta
+            assert len(meta["delegates"]) == _DELEGATES_PAGE_MAX, meta["delegates"]
+            assert meta["delegates_truncated"] is False, meta
+            # Гард против вакуума: на ПРЕЖНЕМ потолке (1200) эта же страница НЕ
+            # помещалась — иначе тест ничего не доказывал бы о подъёме.
+            serialized = json.dumps(meta["delegates"], ensure_ascii=False, sort_keys=True, default=str)
+            assert len(serialized) > 1200, (
+                f"страница сериализуется в {len(serialized)} символов — фикстура стала помещаться "
+                "в прежний потолок, и тест больше не доказывает согласование потолков"
+            )
+            assert len(serialized) <= _DELEGATES_PAGE_CHARS, len(serialized)
+        finally:
+            reader.close()
+
+
+def test_get_object_profile_does_not_grow_a_delegates_key():
+    """Публикует `find_register_movements`; профиль берёт ТОЛЬКО текст — его форма и
+    `sig` не меняются, бюджета на них не выдано."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _DELEGATED})
+        try:
+            prof = bsl["get_object_profile"]("ТестДок")
+            dumped = json.dumps(prof, ensure_ascii=False, default=str)
+            assert '"delegates"' not in dumped, "секция профиля не должна отращивать delegates"
+        finally:
+            reader.close()
+
+
+def test_analyze_document_flow_inherits_the_bounded_delegates_page():
+    """Транзитивный потребитель: композит кладёт в ответ ЦЕЛИКОМ dict хелпера.
+
+    Существующий тест сравнивает объекты на равенство и остался бы зелёным — то есть
+    изменение проехало бы молча.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _many_delegates_module(40)})
+        try:
+            flow = bsl["analyze_document_flow"]("ТестДок")
+            meta = flow["register_movements"]["_meta"]
+            assert meta["delegates_truncated"] is True, meta
+            assert 0 < len(meta["delegates"]) <= 6, len(meta["delegates"])
+            assert meta == bsl["find_register_movements"]("ТестДок")["_meta"]
+        finally:
+            reader.close()
+
+
+def test_posting_hint_text_is_unchanged_by_the_facts_channel():
+    """Канал ФАКТОВ не смеет менять ТЕКСТ hint: его шаги тест ИСПОЛНЯЕТ."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _DELEGATED})
+        try:
+            res = bsl["find_register_movements"]("ТестДок")
+            steps = _hint_steps(res["hint"])
+            assert "1" in steps and "read_procedure(" in steps["1"], steps
+        finally:
+            reader.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.37.0 (Задача 6.2) — kinds_requested / kinds_applied
+# ---------------------------------------------------------------------------
+
+
+def test_kinds_requested_and_applied_are_always_present():
+    """`kind='owner'` возвращал 0 и НЕ попадал в `unsupported_kinds`: на индексном
+    маршруте список обнуляется конструкцией, потому что это capability-карта LIVE."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _DELEGATED})
+        try:
+            default = bsl["find_references_to_object"]("Документ.ТестДок")["_meta"]
+            assert default["kinds_requested"] == []
+            assert default["kinds_applied"], default
+
+            empty = bsl["find_references_to_object"]("Документ.ТестДок", kinds=[])["_meta"]
+            # `kinds=[]` == `kinds=None` == ВСЕ виды — контракт СОХРАНЁН.
+            assert empty["kinds_requested"] == []
+            assert empty["kinds_applied"] == default["kinds_applied"]
+
+            one = bsl["find_references_to_object"]("Документ.ТестДок", kinds=["attribute_type"])["_meta"]
+            assert one["kinds_requested"] == ["attribute_type"]
+            assert one["kinds_applied"] == ["attribute_type"]
+
+            mixed = bsl["find_references_to_object"]("Документ.ТестДок", kinds=["attribute_type", "нетТакогоВида"])[
+                "_meta"
+            ]
+            assert mixed["kinds_requested"] == ["attribute_type", "нетТакогоВида"]
+            assert mixed["kinds_applied"] == ["attribute_type"], mixed
+        finally:
+            reader.close()
+
+
+def test_kinds_applied_on_the_live_branch_names_only_what_live_can_do():
+    """Заявить применёнными виды, недоступные ЖИВОЙ ветке, — прямая ложь.
+
+    `owner` живой ветке доступен, `role_rights` — НЕТ; `unsupported_kinds` относится
+    к LIVE и на `source='index'` всегда пуст.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bsl, reader = _make_posting_env(tmpdir, {"ТестДок": _DELEGATED}, no_index=True)
+        try:
+            meta = bsl["find_references_to_object"]("Документ.ТестДок", kinds=["owner", "role_rights"])["_meta"]
+            assert meta["source"] == "live", meta
+            assert meta["kinds_requested"] == ["owner", "role_rights"]
+            assert "role_rights" not in meta["kinds_applied"], meta
+            assert "role_rights" in meta["unsupported_kinds"], meta
+        finally:
+            if reader is not None:
+                reader.close()

@@ -11,11 +11,14 @@ from rlm_tools_bsl.bsl_strategy_data import DISAMBIGUATION_PAIRS, STRATEGY_SECTI
 
 
 def test_disambiguation_pairs_count():
-    # v1.36.0: +1 for (find_roles, find_role_objects) — the new role→objects
-    # reverse lookup (code-index comparison gap #8). +1 for
-    # (get_object_full_structure, get_object_structures) — the new batch
-    # criterion-selector (code-index comparison gap #4).
-    assert len(DISAMBIGUATION_PAIRS) == 14
+    # v1.36.0 (fork-local, not upstream): +1 for (find_roles, find_role_objects)
+    # — the new role→objects reverse lookup (code-index comparison gap #8).
+    # +1 for (get_object_full_structure, get_object_structures) — the new
+    # batch criterion-selector (code-index comparison gap #4).
+    # v1.37.0 (upstream): +4 new pairs (based_on vs find_based_on_documents,
+    # find_references_to_object vs find_functional_options x2, event
+    # subscriptions scope).
+    assert len(DISAMBIGUATION_PAIRS) == 18
 
 
 _PAIR_ALIASES = {
