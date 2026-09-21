@@ -1856,6 +1856,25 @@ def _sanitize_grep_excludes(exclude_path) -> list[str] | None:
 # сообщали бы агенту не тот предел, который реально срезал строки.
 _GIT_GREP_DEFAULT_MAX_PER_FILE = 50
 
+# Некоторые сборки git (напр. 2.34.x без backport'а) не знают `-m` у `grep` вовсе
+# и отвечают rc=129 "unknown switch `m'" — ДО чтения pattern, т.е. без него
+# git_search не работает НИКАК, хотя `-m` тут только ускоряющий пробник: сам
+# пофайловый упор считается ПОСЛЕ, построчно, в Python (`per_file_counts` ниже),
+# и без флага просто читает из файла больше строк перед тем, как их отбросить.
+# Once-детекция кешируется на модуль: пробовать `-m` на каждом вызове заново,
+# когда он уже провалился, значило бы платить лишний процесс за каждый поиск.
+_git_grep_m_unsupported = False
+
+
+def _stderr_rejects_dash_m(stderr: str) -> bool:
+    """True только для git-овского "я не знаю флag -m", не для любой rc!=0/1.
+
+    Проверяется ДОСЛОВНАЯ формулировка git ("unknown switch `m'"), а не факт
+    присутствия `-m` в команде — иначе сюда провалился бы и честный отказ
+    (битый repo, таймаут), который обязан остаться на прежнем пути `_fail("rc", …)`.
+    """
+    return "unknown switch" in stderr and "`m'" in stderr
+
 
 def _classify_grep_path(base_path: str, san_path: str) -> str:
     """Трёхзначная классификация узла: ``file`` | ``directory`` | ``indeterminate``.
@@ -2166,7 +2185,9 @@ def _git_grep(
     # неотличим от честного «столько и было», и 51 совпадение в одном файле при
     # общем max_results=200 возвращалось как 50 строк БЕЗ признака усечения.
     per_file_probe = mode == "lines" and bool(max_per_file) and max_per_file > 0
-    if per_file_probe:
+    global _git_grep_m_unsupported
+    use_dash_m = per_file_probe and not _git_grep_m_unsupported
+    if use_dash_m:
         grep_cmd += ["-m", str(max_per_file + 1)]
     grep_cmd.append("-E" if regex else "-F")
     grep_cmd += ["-e", pattern, "--", *pathspecs]
@@ -2180,6 +2201,26 @@ def _git_grep(
         logger.info("_git_grep: %s", type(exc).__name__)
         kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "spawn_failed"
         return _fail(kind, detail=f"{type(exc).__name__}: {exc}")
+
+    # Once-фолбэк: ЭТА git-сборка не знает `-m` вовсе (rc=129 ДО чтения pattern).
+    # Пофайловый упор всё равно считается построчно в Python ниже (per_file_probe
+    # остаётся True) — без `-m` git просто не обрежет вывод одного файла заранее,
+    # а лишние строки отбросит тот же Python-счётчик. Кэшируем вердикт на модуль
+    # и повторяем ЭТОТ ЖЕ запрос без флага, чтобы текущий вызов не терялся.
+    if use_dash_m and r.returncode not in (0, 1) and _stderr_rejects_dash_m(r.stderr or ""):
+        _git_grep_m_unsupported = True
+        logger.info("_git_grep: git не поддерживает -m, повтор без пофайлового пробника")
+        # Удаляем ИМЕННО пару ``-m <value>`` по позиции, а не любым вхождением её
+        # значения: паттерн поиска или pathspec МОГ БЫ случайно совпасть со
+        # строкой ``str(max_per_file + 1)`` дальше в argv.
+        m_idx = grep_cmd.index("-m")
+        del grep_cmd[m_idx : m_idx + 2]
+        try:
+            r = run_git(grep_cmd, timeout=t)
+        except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+            logger.info("_git_grep: %s", type(exc).__name__)
+            kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "spawn_failed"
+            return _fail(kind, detail=f"{type(exc).__name__}: {exc}")
 
     rc = r.returncode
     if rc == 1:

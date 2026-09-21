@@ -728,7 +728,15 @@ class TestCallsitesAndLogs:
         # файлов для `count_matches`): выход ограничен числом ФАЙЛОВ, в отличие от
         # построчного `_git_grep`. Число правится ТОЛЬКО вместе с новым callsite —
         # в этом и смысл гарда: появление Git-вызова обязано быть намеренным.
-        assert run_git_calls == 9, f"ожидалось 9 Git-callsite через run_git, найдено {run_git_calls}"
+        #
+        # merge fix: 9 → 10. Десятый — retry в `_git_grep` БЕЗ `-m`, когда git
+        # его не знает (rc=129 "unknown switch `m'", напр. git < 2.36 без нужного
+        # backport'а): пофайловый упор всё равно считается построчно в Python
+        # (`per_file_counts`), `-m` — только ускоряющий пробник, а без него та же
+        # команда просто повторяется без флага, one-shot и с кэшем на модуль
+        # (`_git_grep_m_unsupported`), чтобы не платить лишний процесс на
+        # каждый последующий вызов.
+        assert run_git_calls == 10, f"ожидалось 10 Git-callsite через run_git, найдено {run_git_calls}"
 
     def test_git_grep_log_does_not_leak_pattern_path_or_stderr(self, tmp_path, monkeypatch, caplog):
         from rlm_tools_bsl import bsl_index
