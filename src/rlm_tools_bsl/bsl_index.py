@@ -104,7 +104,7 @@ def _row_type_sets(row) -> list[str]:
     return _json_list(raw)
 
 
-BUILDER_VERSION = 16
+BUILDER_VERSION = 17
 
 
 _active_locks: dict[str, "_BuildLock"] = {}
@@ -874,6 +874,20 @@ CREATE TABLE IF NOT EXISTS object_synonyms (
 );
 CREATE INDEX IF NOT EXISTS idx_synonyms_object ON object_synonyms(object_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_synonyms_synonym ON object_synonyms(synonym COLLATE NOCASE);
+
+-- v17: реестр объектов метаданных (существование + свойства для проверки запросов).
+-- Одна строка на объект ЛЮБОЙ индексируемой категории, даже без синонима и реквизитов.
+-- props_json: {"ts": [имена табличных частей], "reg": {свойства регистра}} — только там,
+-- где файл разбирается (категории с реквизитами); иначе "{}".
+CREATE TABLE IF NOT EXISTS metadata_objects (
+    id INTEGER PRIMARY KEY,
+    category TEXT NOT NULL,
+    object_name TEXT NOT NULL,
+    props_json TEXT NOT NULL DEFAULT '{}',
+    source_file TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mo_object ON metadata_objects(object_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_mo_category ON metadata_objects(category);
 
 -- Level-7: regions and module headers (semantic context)
 CREATE TABLE IF NOT EXISTS regions (
@@ -3828,11 +3842,17 @@ def _collect_metadata_tables(
         cat_dir = base / category
         if not cat_dir.is_dir():
             continue
-        for obj_dir in sorted(cat_dir.iterdir()):
-            if not obj_dir.is_dir():
-                continue
-            obj_name = obj_dir.name
-
+        # Объект без каталога (регистр без модулей и форм — только `Имя.xml` рядом) тоже
+        # объект: точечный путь `_refresh_object` его уже понимает, а полная сборка
+        # пропускала — на БСП это около пятой части регистров, и проверка запросов
+        # получала бы «объект есть, реквизитов нет».
+        _obj_dirs: dict[str, Path] = {}
+        for entry in sorted(cat_dir.iterdir()):
+            if entry.is_dir():
+                _obj_dirs[entry.name] = entry
+            elif entry.suffix.lower() == ".xml":
+                _obj_dirs.setdefault(entry.stem, cat_dir / entry.stem)
+        for obj_name, obj_dir in _obj_dirs.items():
             xml_path = _find_metadata_xml(obj_dir, category)
             if xml_path is None:
                 continue
@@ -6925,6 +6945,72 @@ def _iter_metadata_xml_files(
     return all_results
 
 
+def _collect_metadata_objects(base_path: str) -> list[tuple[str, str, str, str]]:
+    """Реестр объектов метаданных: (category, object_name, props_json, rel_path).
+
+    Существование берётся из ``_iter_metadata_xml_files`` (все категории, без разбора
+    XML). Файл РАЗБИРАЕТСЯ только у категорий с реквизитами (``_ATTR_CATEGORIES``): там
+    нужны имена табличных частей и свойства регистров. Битый или нечитаемый файл не
+    выбрасывает объект из реестра — существование доказано самим файлом, теряются
+    только свойства (``props_json`` = ``{}``).
+    """
+    from rlm_tools_bsl.bsl_xml_parsers import parse_metadata_xml
+
+    base = Path(base_path)
+    attr_cats = frozenset(_ATTR_CATEGORIES)
+    candidates = _iter_metadata_xml_files(base_path)
+    # Общие реквизиты (разделители и т.п.) добавляют поле ко МНОГИМ объектам, и в составе
+    # каждого объекта их нет: проверка запросов без списка их имён объявляла бы такие поля
+    # несуществующими. Только существование, без разбора файла.
+    candidates = candidates + _iter_metadata_xml_files(base_path, categories=frozenset({"CommonAttributes"}))
+    if not candidates:
+        return []
+
+    def _row(entry: tuple[str, str, str]) -> tuple[str, str, str, str]:
+        cat, obj_name, rel = entry
+        props: dict = {}
+        if cat in attr_cats:
+            try:
+                content = (base / rel).read_text(encoding="utf-8-sig", errors="replace")
+                parsed = parse_metadata_xml(content)
+            except Exception:  # noqa: BLE001 — существование важнее свойств
+                parsed = None
+            if parsed:
+                props["ts"] = [ts.get("name", "") for ts in parsed.get("tabular_sections") or [] if ts.get("name")]
+                reg = parsed.get("register_props")
+                if reg:
+                    props["reg"] = reg
+        return (cat, obj_name, json.dumps(props, ensure_ascii=False), rel)
+
+    workers = min(os.cpu_count() or 4, 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_row, candidates))
+
+
+def _rebuild_metadata_objects(conn: sqlite3.Connection, base_path: str) -> int:
+    """Полная пересборка ``metadata_objects`` (DELETE + INSERT). Возвращает число строк.
+
+    Одна точка записи на все пути (полная сборка и любое обновление, затронувшее
+    XML/MDO): реестр мал, а точечное обновление строки без своей инвалидации — ровно
+    тот класс молчаливого устаревания, от которого защищают таблицы v16.
+    """
+    try:
+        conn.execute("DELETE FROM metadata_objects")
+    except sqlite3.OperationalError:
+        return 0
+    rows = _collect_metadata_objects(base_path)
+    if rows:
+        conn.executemany(
+            "INSERT INTO metadata_objects (category, object_name, props_json, source_file) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+        ("has_metadata_objects", "1"),
+    )
+    return len(rows)
+
+
 def _collect_object_synonyms(
     base_path: str,
     *,
@@ -7812,6 +7898,13 @@ class IndexBuilder:
                 conn.commit()
                 logger.info("Object synonyms: %d entries", len(synonyms))
 
+        # v17: реестр объектов метаданных (проверка запросов). Только при has_metadata:
+        # без метаданных нет и object_attributes, и «объект существует» доказать нечем.
+        if build_metadata:
+            mo_count = _rebuild_metadata_objects(conn, base_path)
+            conn.commit()
+            logger.info("Metadata objects: %d entries", mo_count)
+
         # Level-8: extension overrides
         override_rows = _collect_extension_overrides(base_path, conn)
         if override_rows:
@@ -8022,9 +8115,15 @@ class IndexBuilder:
         # event_subscriptions.source_type_sets, role_flags, common_module_props,
         # constants, templates и declared_register_records остались бы пустыми, и
         # `index info` отрапортовал бы успех.
+        #
+        # v17 — реестр `metadata_objects` (таблица + колонки-свойства регистров), ПРОИЗВОДНЫЙ
+        # ОТ XML, и исправленный обход объектов без каталога в `object_attributes`. Порог по
+        # той же причине: без полной пересборки на индексе v16 таблицы нет вовсе, а нетронутые
+        # XML `update` не перечитывает — реестр остался бы пустым, и `check_query_metadata`
+        # объявил бы «объекта нет» о каждом объекте.
         meta_row = conn.execute("SELECT value FROM index_meta WHERE key = 'builder_version'").fetchone()
         old_version = int(meta_row["value"]) if meta_row else 0
-        if old_version < 16:
+        if old_version < 17:
             # Need disk scan for the return count
             bsl_files = sorted(base.rglob("*.bsl"))
             logger.info(
@@ -9037,6 +9136,11 @@ class IndexBuilder:
                         "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES (?, ?, ?, ?)",
                         synonyms,
                     )
+
+        # v17: реестр объектов — полная пересборка при любой правке XML/MDO, ПОСЛЕ
+        # pointwise/selective-путей: один сборщик на все пути, паритет с bulk по построению.
+        if obj_meta_changed and has_metadata:
+            _rebuild_metadata_objects(conn, base_path)
 
         # role_rights: only if .rights files or Roles/.xml changed
         if rights_changed or (obj_meta_changed and "Roles" in changed_categories):
@@ -12918,6 +13022,96 @@ class IndexReader:
                     }
                 )
             return results
+
+    @_transient_safe(lambda: None)
+    def get_metadata_object(self, category: str, object_name: str) -> dict | None:
+        """Точный (регистронезависимый, включая кириллицу) поиск объекта в реестре v17.
+
+        Returns ``None`` — таблицы нет (индекс старее v17, вопрос не решён);
+        ``{}`` — таблица есть, объекта в ней нет; иначе
+        ``{"category", "object_name", "props": {"ts": [...], "reg": {...}}, "source_file"}``.
+        """
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT category, object_name, props_json, source_file FROM metadata_objects "
+                    "WHERE category = ? AND py_lower(object_name) = py_lower(?) LIMIT 1",
+                    (category, object_name),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+            if row is None:
+                return {}
+            try:
+                props = json.loads(row["props_json"]) if row["props_json"] else {}
+            except (ValueError, TypeError):
+                props = {}
+            return {
+                "category": row["category"],
+                "object_name": row["object_name"],
+                "props": props if isinstance(props, dict) else {},
+                "source_file": row["source_file"],
+            }
+
+    @_transient_safe(lambda: None)
+    def metadata_registry_state(self) -> dict | None:
+        """Пригоден ли реестр v17 для проверки запросов.
+
+        ``{"has_metadata": bool, "has_registry": bool}``; ``None`` — не удалось прочитать.
+        Реестр без ``has_metadata`` пуст ПО ПОСТРОЕНИЮ (индекс собран ``--no-metadata``), и
+        принимать его пустоту за «объектов нет» нельзя.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT key, value FROM index_meta WHERE key IN ('has_metadata', 'has_metadata_objects')"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+        meta = {r["key"]: r["value"] for r in rows}
+        return {
+            "has_metadata": meta.get("has_metadata") == "1",
+            "has_registry": meta.get("has_metadata_objects") == "1",
+        }
+
+    @_transient_safe(lambda: None)
+    def get_metadata_object_names(self, category: str) -> list[str] | None:
+        """Имена всех объектов категории (для подсказок «ближайшие имена»); None — таблицы нет."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT object_name FROM metadata_objects WHERE category = ?", (category,)
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            return [r["object_name"] for r in rows]
+
+    @_transient_safe(lambda: None)
+    def get_object_fields(self, category: str, object_name: str) -> list[dict] | None:
+        """Точный состав реквизитов/измерений/ресурсов объекта (без подстрочного поиска).
+
+        ``object_name`` должен быть КАНОНИЧЕСКИМ именем из ``get_metadata_object``:
+        сравнение идёт по индексу ``idx_oa_object`` (NOCASE), а он сворачивает только ASCII.
+        Returns ``None`` — таблицы нет.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT attr_name, attr_kind, ts_name, source_file FROM object_attributes "
+                    "WHERE object_name = ? COLLATE NOCASE AND category = ?",
+                    (object_name, category),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+            return [
+                {
+                    "attr_name": r["attr_name"],
+                    "attr_kind": r["attr_kind"],
+                    "ts_name": r["ts_name"],
+                    "source_file": r["source_file"],
+                }
+                for r in rows
+            ]
 
     @_transient_safe(lambda: None)
     def get_predefined_items(

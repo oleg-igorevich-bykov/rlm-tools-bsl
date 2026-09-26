@@ -699,6 +699,18 @@ def _ref_each(raw: str):
             yield canon
 
 
+# Вид регистра → (ключ результата и EDT-элемент, CF-элемент). Ключ совпадает с
+# именем EDT-элемента, поэтому один список обслуживает оба формата.
+_REGISTER_PROP_TAGS: dict[str, tuple[tuple[str, str], ...]] = {
+    "InformationRegister": (
+        ("periodicity", "InformationRegisterPeriodicity"),
+        ("writeMode", "WriteMode"),
+    ),
+    "AccumulationRegister": (("registerType", "RegisterType"),),
+    "AccountingRegister": (("correspondence", "Correspondence"),),
+}
+
+
 def _parse_cf_xml(root) -> dict:
     """Parse CF-format metadata XML (Platform Export / Конфигуратор)."""
     ns = _NS_CF
@@ -738,6 +750,15 @@ def _parse_cf_xml(root) -> dict:
         "name": _xml_find_text(props, "md:Name", ns) if props is not None else "",
         "synonym": _cf_find_synonym(props, ns) if props is not None else "",
     }
+
+    # Свойства регистров, нужные проверке запросов (виртуальные таблицы). CF пишет
+    # значения всегда явно; отсутствие свойства даёт None («неизвестно»).
+    if props is not None and meta_tag in _REGISTER_PROP_TAGS:
+        reg_props: dict = {}
+        for key, cf_tag in _REGISTER_PROP_TAGS[meta_tag]:
+            val = _xml_find_text(props, f"md:{cf_tag}", ns)
+            reg_props[key] = val or None
+        result["register_props"] = reg_props
 
     references: list[dict] = []
 
@@ -1042,6 +1063,13 @@ def _parse_mdo_xml(root) -> dict:
         "name": _xml_direct_text(root, "name"),
         "synonym": _mdo_find_synonym(root),
     }
+
+    # EDT опускает значения по умолчанию, поэтому отсутствие элемента даёт None
+    # («неизвестно»), а НЕ значение по умолчанию: потребитель молчит, а не гадает.
+    if meta_tag in _REGISTER_PROP_TAGS:
+        result["register_props"] = {
+            key: (_xml_direct_text(root, key) or None) for key, _cf_tag in _REGISTER_PROP_TAGS[meta_tag]
+        }
 
     references: list[dict] = []
 

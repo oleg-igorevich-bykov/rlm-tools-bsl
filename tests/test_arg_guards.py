@@ -155,6 +155,7 @@ def test_fixture_actually_saturates_caps(guarded_bsl):
         pytest.param(lambda b: b["search"]("Обработать", "methods", None), id="search_methods_scope"),
         pytest.param(lambda b: b["find_attributes"]("Организация", "", "", "", None), id="find_attributes"),
         pytest.param(lambda b: b["find_predefined"]("", "", None), id="find_predefined"),
+        pytest.param(lambda b: b["check_query_metadata"]("ВЫБРАТЬ 1", "", None), id="check_query_metadata"),
         pytest.param(lambda b: b["find_callers"]("ЦелеваяПроцедура", "", None), id="find_callers"),
         pytest.param(lambda b: b["safe_grep"]("ЦелеваяПроцедура", "", None), id="safe_grep"),
     ],
@@ -181,6 +182,15 @@ def test_offset_none_does_not_raise(guarded_bsl):
 def test_limit_none_uses_documented_default(guarded_bsl):
     assert len(guarded_bsl["search_regions"]("Служебные", None)) == 200
     assert len(guarded_bsl["find_callers_context"]("ЦелеваяПроцедура", "", 0, None)["callers"]) == 50
+
+
+def test_check_query_metadata_limit_garbage_keeps_result_bounded(guarded_bsl):
+    """limit=None/-1 не роняет хелпер и не снимает потолок: возвращается документированный
+    дефолт (100), а не «всё»."""
+    for bad in (None, -1, "мусор"):
+        r = guarded_bsl["check_query_metadata"]("ВЫБРАТЬ 1", "", bad)
+        assert "error" not in r
+        assert len(r["findings"]) <= 100 and len(r["skipped"]) <= 100
 
 
 def test_limit_negative_is_not_unbounded(guarded_bsl):

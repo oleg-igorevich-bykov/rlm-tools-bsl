@@ -1118,6 +1118,10 @@ _SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
 # правки в измеренном факте, не разложены по отдельности намеренно: порог
 # снят ЦЕЛИКОМ на смерженном дереве, как остальные бэйслайны этого merge.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 12602
+# v1.39.0 (fork-local): порог поднят РОВНО на добавленные подписи, как в v1.38.0 —
+# check_query_metadata 148 + рост extract_queries (+text) 25. Старые подписи не тронуты:
+# до релиза сумма стояла ровно на 12602.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 12602 + 148 + 25
 
 
 def test_sig_budget_headroom_freed_for_release():

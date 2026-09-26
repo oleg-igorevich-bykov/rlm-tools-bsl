@@ -89,6 +89,19 @@ def test_strategy_contains_critical_warning():
     assert "23,000" in text or "23000" in text or "timeout" in text.lower()
 
 
+def test_check_query_metadata_is_documented_in_both_strategy_copies():
+    """v1.39.0: хелпер назван в ОБЕИХ копиях стратегии (bsl_knowledge и bsl_strategy_data)."""
+    from rlm_tools_bsl.bsl_strategy_data import STRATEGY_SECTIONS
+
+    assert "check_query_metadata" in get_strategy("medium", None)
+    slim = (
+        "\n".join(str(v) for v in STRATEGY_SECTIONS.values())
+        if isinstance(STRATEGY_SECTIONS, dict)
+        else str(STRATEGY_SECTIONS)
+    )
+    assert "check_query_metadata" in slim
+
+
 def test_strategy_contains_helper_signatures():
     text = get_strategy("medium", None)
     assert "find_module" in text

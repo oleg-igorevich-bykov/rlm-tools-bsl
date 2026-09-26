@@ -269,7 +269,8 @@ def test_helper_snapshot_count_locked():
     # criterion-selector, code-index comparison gap #4).
     # v1.37.0 (upstream): no new sandbox helper.
     # v1.38.0 (upstream): +3 for count_matches, find_common_modules, find_templates.
-    assert len(build_helper_metadata_snapshot()) == 58
+    # v1.39.0 (fork-local): +1 for check_query_metadata.
+    assert len(build_helper_metadata_snapshot()) == 59
 
 
 @pytest.mark.parametrize("mode", ["slim", "full"])

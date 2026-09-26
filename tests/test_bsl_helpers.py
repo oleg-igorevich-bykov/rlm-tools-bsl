@@ -9203,12 +9203,17 @@ def test_assignment_branch_is_byte_for_byte_unchanged(tmp_path):
         "КонецПроцедуры\n",
     )
     assert len(q) == 1
-    assert q[0] == {
+    # v1.39.0 аддитивно добавил `text`/`text_line`: прежние ключи не изменились байт в байт
+    legacy = {k: v for k, v in q[0].items() if k not in ("text", "text_line")}
+    assert legacy == {
         "procedure": "Тест",
         "line": 3,
         "tables": ["Документ.Заказ"],
         "text_preview": 'ВЫБРАТЬ * ИЗ Документ.Заказ КАК З";',
     }
+    # а новый `text` — чистый текст запроса БЕЗ исторического хвоста
+    assert q[0]["text"] == "ВЫБРАТЬ * ИЗ Документ.Заказ КАК З"
+    assert q[0]["text_line"] == 3
 
 
 def test_assignment_and_ctor_are_both_returned_in_source_order(tmp_path):

@@ -482,6 +482,7 @@ Step 1 — DISCOVER: find what you need
   NOTE: search() = broad first pass; specialized helpers = precise follow-up when you need specific fields
   parse_object_xml(path) → attributes, tabular sections, dimensions, resources
   find_attributes('ИмяРеквизита')        → INSTANT: attribute name → type(s)
+  check_query_metadata(query=... | path=модуль) → INSTANT: есть ли объекты/ТЧ/виртуальные таблицы/поля из запроса 1С в метаданных (findings + skipped с причиной; partial=True — проверить нечем, это не «ошибок нет»)
   find_predefined('ИмяПредопределённого') → INSTANT: predefined item → type(s)
   find_references_to_object('Справочник.Имя') → все места использования объекта (analogue of "Найти ссылки → В свойствах")
   find_defined_types('Имя')              → раскрытие ОпределяемогоТипа в список реальных типов

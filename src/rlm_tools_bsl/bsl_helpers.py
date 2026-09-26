@@ -12410,12 +12410,21 @@ def make_bsl_helpers(
                     continue
                 seen.add(key)
                 object_path = f"{cat}/{obj_name}"
+                # Файл расширения берётся по ТОЧНОМУ пути из `_extension_metadata_xml`.
+                # `_resolve_object_xml("Cat/Имя")` для ЗАИМСТВОВАННОГО объекта (то же имя есть
+                # в основной конфигурации) отдавал файл ОСНОВНОЙ конфигурации: реквизиты
+                # расширения к существующему объекту терялись, а в кэш попадал чужой состав.
                 try:
-                    resolved = _resolve_object_xml(object_path)
+                    resolved = _rel
                     content = _ext_read_file(resolved)
                     parsed = parse_metadata_xml(content)
                 except Exception:
-                    continue
+                    try:
+                        resolved = _resolve_object_xml(object_path)
+                        content = _ext_read_file(resolved)
+                        parsed = parse_metadata_xml(content)
+                    except Exception:
+                        continue
                 if not parsed:
                     continue
 
@@ -12573,6 +12582,52 @@ def make_bsl_helpers(
                 out.append(row)
         return out
 
+    def _merge_ext_rows_for_object(
+        main_rows: list[dict], name: str, object_name: str, category: str, kind: str
+    ) -> list[dict]:
+        """Добавить к строкам основной конфигурации реквизиты расширения того же объекта.
+
+        Сопоставление объекта — по той же подстроке, что и у индекса (``LIKE %имя%``), чтобы
+        обе стороны отвечали на один и тот же ``object_name``. Строка основной конфигурации
+        при совпадении ключа выигрывает: заимствованный объект расширения повторяет свои же
+        реквизиты, и дубль — шум, а не данные.
+        """
+        _build_ext_attrs_cache()
+        obj_l = object_name.lower()
+        cat_l = category.lower() if category else ""
+        name_l = name.lower() if name else ""
+        seen = {
+            (
+                (r.get("category") or "").lower(),
+                (r.get("object_name") or "").lower(),
+                (r.get("attr_name") or "").lower(),
+                r.get("attr_kind"),
+                r.get("ts_name") or "",
+            )
+            for r in main_rows
+        }
+        out = list(main_rows)
+        for (cat_lower, obj_lower), rows in _ext_attrs_cache.items():
+            if obj_l not in obj_lower or (cat_l and cat_l != cat_lower):
+                continue
+            for row in rows:
+                if kind and kind != row["attr_kind"]:
+                    continue
+                if name_l and name_l not in row["attr_name"].lower() and name_l not in row["attr_synonym"].lower():
+                    continue
+                key = (
+                    cat_lower,
+                    obj_lower,
+                    row["attr_name"].lower(),
+                    row["attr_kind"],
+                    row.get("ts_name") or "",
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(row)
+        return out
+
     def _live_predefined_in_extensions(name: str, limit: int) -> list[dict]:
         """Return ext-side predefined items matching the name-only query.
 
@@ -12633,7 +12688,16 @@ def make_bsl_helpers(
         v1.34.0: каждая строка несёт ``owner`` (``"main"`` | ``"extension:<Имя>"``).
         Name-only index+live merge уже смешивает main и CFE, а провенанс раньше
         приходилось выковыривать из ``source_file`` регуляркой."""
-        return _attr_rows_with_owner(_find_attributes_core(name, object_name, category, kind, limit))
+        rows = _find_attributes_core(name, object_name, category, kind, limit)
+        bare = _strip_meta_prefix(object_name) if object_name else ""
+        if bare and "/" not in bare and _extension_metadata_xml:
+            # v1.39.0: реквизиты, добавленные РАСШИРЕНИЕМ к объекту основной конфигурации.
+            # Ядро считает непустой ответ индекса полным, и расширение к существующему
+            # объекту молча терялось (слияние было только у name-only ветки). Слияние
+            # здесь, а не в ядре: обёртка видит результат ВСЕХ веток (индекс, живой разбор).
+            lim, _w = _coerce_bound(limit, 500, "limit", "find_attributes(...)")
+            rows = _merge_ext_rows_for_object(rows, name, bare, category, kind.lower() if kind else "")[:lim]
+        return _attr_rows_with_owner(rows)
 
     def _find_attributes_core(
         name: str = "", object_name: str = "", category: str = "", kind: str = "", limit: int = 500
@@ -14924,8 +14988,9 @@ def make_bsl_helpers(
         tokens.append(("code", "".join(code_buf)))
         return tokens, comment_spans
 
-    def _extract_lexed_queries(tokens: list[tuple]) -> list[tuple[int, str]]:
-        """``[(line, query_text)]`` для форм, невидимых построчному скану ветки присваивания:
+    def _extract_lexed_queries(tokens: list[tuple]) -> list[tuple[int, str, int]]:
+        """``[(line, query_text, text_line)]`` (``text_line`` — строка начала самого литерала,
+        у перенесённой формы она позже ``line``) для форм, невидимых построчному скану ветки присваивания:
         конструктор ``Новый Запрос("...")`` / ``New Query("...")`` и присваивание
         ``Запрос.Текст =`` с литералом на СЛЕДУЮЩЕЙ строке.
 
@@ -14964,10 +15029,31 @@ def make_bsl_helpers(
             # line — строка НАЧАЛА выражения (`Новый` / `Запрос.Текст`), а не строки-литерала:
             # они расходятся, когда литерал перенесён на следующую строку.
             expr_line = tok[2] - code_before[m.start() :].count("\n")
-            out.append((expr_line, tok[1]))
+            out.append((expr_line, tok[1], tok[2]))
         return out
 
-    def extract_queries(path: str) -> list[dict]:
+    def _query_literal_text(raw: str) -> str:
+        """Текст запроса из «сырого» хвоста присваивания: до закрывающей кавычки литерала.
+
+        Внутри литерала BSL удвоенная кавычка ``""`` — это одна кавычка запроса, одиночная
+        кавычка закрывает литерал. Всё после неё (``;``, ``+ Хвост``, комментарий) — не запрос.
+        """
+        out: list[str] = []
+        i = 0
+        n = len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch == '"':
+                if i + 1 < n and raw[i + 1] == '"':
+                    out.append('"')
+                    i += 2
+                    continue
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def extract_queries(path: str, include_text: bool = True) -> list[dict]:
         """Extract embedded 1C queries from a BSL module.
 
         Находит присваивания ``Запрос.Текст = "..."`` / ``ТекстЗапроса = "..."`` (в том числе
@@ -14995,7 +15081,14 @@ def make_bsl_helpers(
         У перенесённой формы и у конструкторов ``text_preview`` чистый: лексер отдаёт сам
         литерал, со снятыми continuation-``|``.
 
-        Returns: list of dicts {procedure, line, tables: [str], text_preview}."""
+        v1.39.0: у каждой записи есть ``text`` — ПОЛНЫЙ текст запроса (для проверки по
+        метаданным: ``check_query_metadata``); ``text_preview`` не изменился. Чтобы не тащить
+        тексты в контекст, когда они не нужны, передай ``include_text=False``.
+
+        ``text_line`` — строка модуля, с которой начинается ``text`` (у литерала, перенесённого
+        на следующую строку, она позже ``line``).
+
+        Returns: list of dicts {procedure, line, tables: [str], text_preview, text, text_line}."""
         content = _ext_read_file(path)
         lines = content.splitlines()
         procs = extract_procedures(path)
@@ -15082,14 +15175,16 @@ def make_bsl_helpers(
             if len(query_text) > 200:
                 preview += "..."
 
-            queries.append(
-                {
-                    "procedure": proc_name,
-                    "line": line_num,
-                    "tables": tables,
-                    "text_preview": preview,
-                }
-            )
+            entry = {
+                "procedure": proc_name,
+                "line": line_num,
+                "tables": tables,
+                "text_preview": preview,
+            }
+            if include_text:
+                entry["text"] = _query_literal_text(query_text)
+                entry["text_line"] = line_num
+            queries.append(entry)
             i = j
 
         # Конструкторы и присваивания-с-переносом собираются ОТДЕЛЬНЫМ проходом. У ветки
@@ -15098,7 +15193,7 @@ def make_bsl_helpers(
         # хвостом строки) — она получила только source-aware отбраковку: совпадения в
         # комментариях и внутри литералов отбрасываются, а сбор продолжений не выходит за
         # конец своего литерала. Для модуля без этих патологий результат прежний байт в байт.
-        for expr_line, query_text in _extract_lexed_queries(tokens):
+        for expr_line, query_text, text_line in _extract_lexed_queries(tokens):
             tables = list(dict.fromkeys(m2.group(1) for m2 in _QUERY_TABLE_RE.finditer(query_text)))
             proc_name = ""
             for p in procs:
@@ -15108,20 +15203,189 @@ def make_bsl_helpers(
             preview = query_text[:200].strip()
             if len(query_text) > 200:
                 preview += "..."
-            queries.append(
-                {
-                    "procedure": proc_name,
-                    "line": expr_line,
-                    "tables": tables,
-                    "text_preview": preview,
-                }
-            )
+            entry = {
+                "procedure": proc_name,
+                "line": expr_line,
+                "tables": tables,
+                "text_preview": preview,
+            }
+            if include_text:
+                entry["text"] = query_text
+                entry["text_line"] = text_line
+            queries.append(entry)
 
         # Порядок — по источнику. Сортировка стабильная, поэтому при совпадении строк
         # присваивания идут перед конструкторами, а внутри каждой группы порядок обхода
         # сохраняется.
         queries.sort(key=lambda q: q["line"])
         return queries
+
+    # ── Проверка запросов по метаданным (v1.39.0) ────────────────
+
+    def check_query_metadata(query: str = "", path: str = "", limit: int = 100) -> dict:
+        """Проверить, что объекты метаданных и поля в запросе 1С существуют в индексе.
+
+        Вход — ровно ОДИН из двух: ``query`` (текст запроса, пакет с ``;`` допустим) или
+        ``path`` (модуль ``.bsl``: проверяются все найденные ``extract_queries`` запросы,
+        ``line`` в находках — строка модуля).
+
+        Ловит: несуществующий объект (``missing_object``), табличную часть
+        (``missing_tabular_section``), виртуальную таблицу регистра
+        (``missing_virtual_table``) и поле таблицы, указанной верно (``missing_field``).
+        Всё, что нельзя разрешить однозначно (временные таблицы, вложенные запросы,
+        параметры, неизвестные псевдонимы, категории с неразобранным составом), НЕ ошибка, а
+        ``skipped`` с причиной: ложное замечание хуже пропуска.
+
+        Работает только по индексу v17+ (реестр ``metadata_objects``); реквизиты расширений
+        учитываются (``owner``). Без пригодного индекса ответ ``partial=True`` и без находок.
+
+        Returns: {checked: {queries, tables, objects, aliases, fields, by_owner},
+                  findings: [{kind, severity, object, table, alias, field, line,
+                              query_index, owner, message, uncertain}],
+                  skipped: [{reason, alias_or_table, field, line, query_index}],
+                  partial, truncated?, findings_total?, skipped_total}."""
+        from rlm_tools_bsl.bsl_query_check import ObjInfo, QueryEnv, check_query
+
+        sig = "check_query_metadata(query='', path='', limit=100)"
+        limit, _w = _coerce_bound(limit, 100, "limit", sig)
+        _warn_bound(_w)
+
+        checked = {"queries": 0, "tables": 0, "objects": 0, "aliases": 0, "fields": 0, "by_owner": {}}
+
+        def _result(findings, skipped, partial, note=""):
+            out: dict = {
+                "checked": checked,
+                "findings": findings[:limit],
+                "skipped": skipped[:limit],
+                "partial": partial,
+                "skipped_total": len(skipped),
+            }
+            if len(findings) > limit:
+                out["truncated"] = True
+                out["findings_total"] = len(findings)
+            if note:
+                out["note"] = note
+            return out
+
+        if not isinstance(query, str) or not isinstance(path, str) or bool(query.strip()) == bool(path.strip()):
+            return {
+                "error": f"{sig}: передай ровно один вход — query='<текст запроса>' ИЛИ path='<модуль .bsl>'",
+                **_result([], [], True),
+            }
+
+        # --- пригодность индекса
+        state = None
+        if idx_reader is not None and getattr(idx_reader, "builder_version", 0) >= 17:
+            state = idx_reader.metadata_registry_state()
+        if not state or not state.get("has_metadata") or not state.get("has_registry"):
+            reason = (
+                "индекса нет"
+                if idx_reader is None
+                else "индекс собран версией без реестра объектов метаданных (нужен builder_version >= 17) "
+                "или без метаданных (--no-metadata); пересоберите индекс"
+            )
+            return _result([], [{"reason": reason, "alias_or_table": "", "field": "", "line": 0}], True, reason)
+
+        # --- сведения об объектах: основной индекс + расширения
+        ext_objects: dict[tuple[str, str], tuple[str, str, str]] = {}
+        if _ext_roots_resolved:
+            _ensure_index()  # заполняет _extension_metadata_xml
+        if _extension_metadata_xml:
+            _build_ext_attrs_cache()
+            for _cat, _obj, _rel in _extension_metadata_xml:
+                ext_objects.setdefault((_cat.lower(), _obj.lower()), (_cat, _obj, _rel))
+        fields_table_missing = [False]
+
+        def _add_field(info: ObjInfo, row: dict, owner: str) -> None:
+            nm = row.get("attr_name") or ""
+            if not nm:
+                return
+            kind = row.get("attr_kind")
+            ts_name = row.get("ts_name")
+            if kind == "ts_attribute":
+                if ts_name:
+                    info.ts_fields.setdefault(ts_name.lower(), {}).setdefault(nm.lower(), nm)
+                    if ts_name not in info.tabular_sections and ts_name.lower() not in {
+                        t.lower() for t in info.tabular_sections
+                    }:
+                        info.tabular_sections.append(ts_name)
+                return
+            if nm.lower() in info.fields:
+                return  # основная конфигурация выигрывает у повтора в расширении
+            info.fields[nm.lower()] = (nm, kind or "attribute")
+            if owner != info.owner:
+                info.field_owner[nm.lower()] = owner
+
+        lookup_cache: dict[tuple[str, str], ObjInfo | None] = {}
+
+        def _lookup(category: str, name: str) -> ObjInfo | None:
+            key = (category, name.lower())
+            if key in lookup_cache:
+                return lookup_cache[key]
+            info: ObjInfo | None = None
+            main = idx_reader.get_metadata_object(category, name)
+            if main:
+                props = main.get("props") or {}
+                info = ObjInfo(
+                    category=category,
+                    name=main["object_name"],
+                    owner="main",
+                    reg=props.get("reg") or {},
+                )
+                if "ts" in props:
+                    info.ts_known = True
+                    info.tabular_sections = list(props["ts"])
+                rows = idx_reader.get_object_fields(category, main["object_name"])
+                if rows is None:
+                    fields_table_missing[0] = True
+                    info.fields_known = False
+                else:
+                    for r in rows:
+                        _add_field(info, r, "main")
+            ext = ext_objects.get((category.lower(), name.lower()))
+            if ext is not None:
+                ext_owner = _owner_for(ext[2])
+                if info is None:
+                    info = ObjInfo(category=category, name=ext[1], owner=ext_owner)
+                    # у объекта, которого нет в основной конфигурации, ТЧ без реквизитов не видны
+                    info.ts_known = False
+                for r in _ext_attrs_cache.get((ext[0].lower(), ext[1].lower()), []):
+                    _add_field(info, r, ext_owner)
+            lookup_cache[key] = info
+            return info
+
+        def _names(category: str) -> list[str]:
+            names = idx_reader.get_metadata_object_names(category) or []
+            extra = [o[1] for (c, _n), o in ext_objects.items() if c == category.lower()]
+            return list(dict.fromkeys(names + extra))
+
+        common = frozenset(n.lower() for n in (idx_reader.get_metadata_object_names("CommonAttributes") or []))
+        env = QueryEnv(lookup=_lookup, names=_names, uncertain=False, common_fields=common)
+
+        # --- источники запросов
+        items: list[tuple[str, int]] = []
+        if query.strip():
+            items.append((query, 1))
+        else:
+            for q in extract_queries(path):
+                if q.get("text"):
+                    items.append((q["text"], q.get("text_line") or q["line"]))
+
+        findings: list[dict] = []
+        skipped: list[dict] = []
+        for idx, (text, base_line) in enumerate(items):
+            res = check_query(text, env, base_line=base_line, query_index=idx)
+            findings.extend(res.findings)
+            skipped.extend(res.skipped)
+            checked["queries"] += 1
+            for k in ("tables", "objects", "aliases", "fields"):
+                checked[k] += getattr(res, k)
+            for owner, n in res.by_owner.items():
+                checked["by_owner"][owner] = checked["by_owner"].get(owner, 0) + n
+
+        partial = fields_table_missing[0]
+        note = "таблица реквизитов индекса недоступна: поля не проверены" if partial else ""
+        return _result(findings, skipped, partial, note)
 
     # ── Code metrics ─────────────────────────────────────────
 
@@ -18565,14 +18829,51 @@ def make_bsl_helpers(
     _reg(
         "extract_queries",
         extract_queries,
-        "extract_queries(path) -> [{procedure, line, tables, text_preview}]",
+        "extract_queries(path, include_text=True) -> [{procedure, line, tables, text_preview, text}]",
         "code",
         ["запрос", "query", "таблиц", "table", "select", "выбрать"],
         "EXTRACT QUERIES FROM MODULE:\n"
         "  queries = extract_queries('path/to/ObjectModule.bsl')\n"
         "  for q in queries:\n"
         "      print(f\"  {q['procedure']} стр.{q['line']}: таблицы={q['tables']}\")\n"
-        "      print(f\"    {q['text_preview'][:100]}\")",
+        "      print(f\"    {q['text_preview'][:100]}\")\n"
+        "  # q['text'] — ПОЛНЫЙ текст запроса (q['text_line'] — строка модуля, где он начинается);\n"
+        "  # extract_queries(path, include_text=False) — без текстов, если они не нужны.\n"
+        "  # Проверить существование объектов и полей: check_query_metadata(path=...).",
+    )
+    _reg(
+        "check_query_metadata",
+        check_query_metadata,
+        "check_query_metadata(query='', path='', limit=100) -> {checked, findings: [{kind, table, field, line, owner, message, uncertain}], skipped, partial}",
+        "code",
+        [
+            "проверка запроса",
+            "проверить запрос",
+            "validate query",
+            "query validation",
+            "поле запроса",
+            "реквизит запроса",
+            "несуществующий реквизит",
+            "виртуальная таблица",
+            "существует ли реквизит",
+            "опечатка в запросе",
+        ],
+        "CHECK QUERY AGAINST METADATA (объекты, табличные части, виртуальные таблицы, поля):\n"
+        "  # Текст запроса (пакет с ';' допустим) ИЛИ модуль — ровно один из двух:\n"
+        "  r = check_query_metadata(query='ВЫБРАТЬ Т.Ссылка ИЗ Справочник.Пользователи КАК Т')\n"
+        "  r = check_query_metadata(path='Catalogs/Пользователи/Ext/ObjectModule.bsl')  # line — строка МОДУЛЯ\n"
+        "  for f in r['findings']:\n"
+        "      # kind: missing_object | missing_tabular_section | missing_virtual_table | missing_field\n"
+        "      print(f['kind'], f['line'], f['message'])  # в message — ближайшие существующие имена\n"
+        "  print(r['checked'], r['partial'])\n"
+        "  # ПОЛИТИКА МОЛЧАНИЯ: то, что нельзя разрешить однозначно (временные таблицы, вложенные\n"
+        "  # запросы, параметры, неизвестные псевдонимы, регистры бухгалтерии, планы счетов и другие\n"
+        "  # категории с неразобранным составом), — НЕ ошибка, а r['skipped'] с причиной. Пустой\n"
+        "  # findings не доказывает, что запрос верен: смотри r['skipped'] и r['checked'].\n"
+        "  # partial=True — индекс не пригоден (нет реестра v17 / без метаданных): проверить нечем,\n"
+        "  # это НИЖНЯЯ граница, а не «ошибок нет». Реквизиты расширений учитываются (owner).\n"
+        "  # Ограничение: запросы, собранные конкатенацией или переданные переменной, и запросы СКД\n"
+        "  # и динамических списков не проверяются. Это не «запрос выполнится» — для этого живая база.",
     )
     _reg(
         "code_metrics",
