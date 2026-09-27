@@ -5646,6 +5646,17 @@ def _escape_for_sql_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _like_contains(value: str) -> str:
+    """Параметр подстрочного ``LIKE ? ESCAPE '\\'``: ``%`` и ``_`` значения — литералы.
+
+    v1.40.0: канон подстрочного фильтра во всём ридере — ``py_lower(col) LIKE
+    py_lower(?) ESCAPE '\\'`` с этим параметром. Живые ветки тех же хелперов ищут
+    литерально (``name.lower() in …``), и без экранирования имя 1С с ``_``
+    (префикс доработок ``тст_``, ``ПроизводственнаяОперация2_2``) давало на индексной ветке шаблон.
+    """
+    return "%" + _escape_for_sql_like(value) + "%"
+
+
 # ---------------------------------------------------------------------------
 # Bounded role detail (v1.34.0)
 # ---------------------------------------------------------------------------
@@ -5679,6 +5690,15 @@ def _normalize_role_details_limit(value) -> tuple[int, str | None]:
             return _ROLE_DETAILS_MAX, f"details_limit: +inf — ограничил до {_ROLE_DETAILS_MAX}."
         if value == float("-inf"):
             return _ROLE_DETAILS_DEFAULT, f"details_limit: -inf — использую {_ROLE_DETAILS_DEFAULT}."
+        if value < 0:
+            # Отрицательное судится ДО `int()` (v1.39.0): `int()` усекает К НУЛЮ,
+            # поэтому `int(-0.5)` = 0, и проверка после усечения отрицательную
+            # ДРОБЬ не видела вовсе — `-0.5` молча давал пустую детализацию вместо
+            # дефолта, хотя докстринг выше обещает обратное. Та же правка сделана
+            # в `_coerce_bound` и в его зеркале `Sandbox._note_saturation`.
+            return _ROLE_DETAILS_DEFAULT, (
+                f"details_limit: отрицательное {value!r} — использую {_ROLE_DETAILS_DEFAULT}."
+            )
         value = int(value)
     if value < 0:
         return _ROLE_DETAILS_DEFAULT, (f"details_limit: отрицательное {value!r} — использую {_ROLE_DETAILS_DEFAULT}.")
@@ -9666,7 +9686,14 @@ def _can_index_glob(pattern: str) -> tuple[str, dict] | None:
       Dir/** or Dir/**/*  → ('under_prefix', {prefix: 'Dir'})
       exact/path          → ('exact', {path: 'exact/path'})
       **/Name.*           → ('name_wildcard', {name_prefix: 'Name', ext: ''})
-      **/Name.ext         → ('name_wildcard', {name_prefix: 'Name', ext: '.ext'})
+      **/Name.ext         → ('name_exact', {filename: 'Name.ext'})
+
+    v1.40.0: источник истины — ``pathlib.Path.glob()`` той же маски (сессия без
+    индекса) по СТРУКТУРЕ: глубина, граница компонента, точка расширения. Прежде
+    ``**/Name.ext`` было префиксом имени (``Номенклатура.xml`` отдавало и
+    ``НоменклатураКонтрагентов.xml``), ``**/Dir/**`` не видело ``Dir`` верхнего
+    уровня и файлы прямо в ``Dir``, а ``Dir/*/File.ext`` — любую глубину. Регистр букв
+    в этот релиз не входит: индексная ветка отвечает по правилам SQLite, как и прежде.
     """
     if not pattern:
         return None
@@ -9680,8 +9707,7 @@ def _can_index_glob(pattern: str) -> tuple[str, dict] | None:
         if "*" not in rest and "?" not in rest:
             # **/Name.ext — specific file by name
             if "." in rest:
-                name, ext = rest.rsplit(".", 1)
-                return ("name_wildcard", {"name_prefix": name, "ext": "." + ext})
+                return ("name_exact", {"filename": rest})
             return None
         if rest.startswith("*.") and "*" not in rest[2:] and "?" not in rest[2:]:
             ext = "." + rest[2:]
@@ -10380,7 +10406,7 @@ class IndexReader:
             if module_hint:
                 # Filter by callee qualification: match qualified "hint.proc"
                 # OR unqualified "proc" (ambiguous — could belong to hint module)
-                escaped_hint = module_hint.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                escaped_hint = _escape_for_sql_like(module_hint)
                 query += " AND (c.callee_name LIKE ? ESCAPE '\\' OR c.callee_name = ? COLLATE NOCASE)"
                 params_list.append(f"{escaped_hint}.%")
                 params_list.append(proc_name)
@@ -11207,15 +11233,19 @@ class IndexReader:
                 elif kind == "under_prefix":
                     prefix = params["prefix"]
                     rows = self._conn.execute(
-                        "SELECT rel_path FROM file_paths WHERE rel_path LIKE ? ORDER BY rel_path",
-                        (prefix + "/%",),
+                        "SELECT rel_path FROM file_paths WHERE rel_path LIKE ? ESCAPE '\\' ORDER BY rel_path",
+                        (_escape_for_sql_like(prefix) + "/%",),
                     ).fetchall()
                 elif kind == "dir_file":
                     dir_pat = params["dir"]
                     fname = params["file"]
                     rows = self._conn.execute(
-                        "SELECT rel_path FROM file_paths WHERE dir_path LIKE ? AND filename = ? ORDER BY rel_path",
-                        (dir_pat + "/%", fname),
+                        # Ровно ОДИН уровень под `Dir` (`*` не пересекает `/`), как у
+                        # pathlib: прежний `LIKE 'Dir/%'` пропускал любую глубину, и
+                        # `Documents/*/ObjectModule.bsl` на CF отдавал `…/Ext/…`.
+                        "SELECT rel_path FROM file_paths WHERE dir_path LIKE ? ESCAPE '\\'"
+                        " AND dir_path NOT LIKE ? ESCAPE '\\' AND filename = ? ORDER BY rel_path",
+                        (_escape_for_sql_like(dir_pat) + "/%", _escape_for_sql_like(dir_pat) + "/%/%", fname),
                     ).fetchall()
                 elif kind == "exact":
                     rows = self._conn.execute(
@@ -11226,29 +11256,37 @@ class IndexReader:
                     prefix = params["prefix"]
                     ext = params["ext"]
                     rows = self._conn.execute(
-                        "SELECT rel_path FROM file_paths WHERE rel_path LIKE ? AND extension = ? ORDER BY rel_path",
-                        (prefix + "/%", ext),
+                        "SELECT rel_path FROM file_paths WHERE rel_path LIKE ? ESCAPE '\\' AND extension = ?"
+                        " ORDER BY rel_path",
+                        (_escape_for_sql_like(prefix) + "/%", ext),
                     ).fetchall()
                 elif kind == "under_prefix_ext":
                     dir_name = params["dir_name"]
                     ext = params["ext"]
                     rows = self._conn.execute(
-                        "SELECT rel_path FROM file_paths WHERE dir_path LIKE ? AND extension = ? ORDER BY rel_path",
-                        (f"%/{dir_name}/%", ext),
+                        # Граница КОМПОНЕНТА: `Dir` на любой глубине, включая верхний
+                        # уровень и файлы прямо в `Dir`. Прежний `dir_path LIKE '%/Dir/%'`
+                        # требовал компонент ДО и ПОСЛЕ `Dir` — категории метаданных лежат
+                        # на верхнем уровне, и живые фолбэки подписок/регламентных заданий
+                        # получали молчаливый ноль.
+                        "SELECT rel_path FROM file_paths WHERE ('/' || dir_path || '/') LIKE ? ESCAPE '\\'"
+                        " AND extension = ? ORDER BY rel_path",
+                        (f"%/{_escape_for_sql_like(dir_name)}/%", ext),
+                    ).fetchall()
+                elif kind == "name_exact":
+                    # `**/Name.ext` — ТОЧНОЕ имя файла, а не префикс (индекс
+                    # `idx_fp_filename` — NOCASE, регистровая семантика та же, что у
+                    # прежнего `LIKE`).
+                    rows = self._conn.execute(
+                        "SELECT rel_path FROM file_paths WHERE filename = ? COLLATE NOCASE ORDER BY rel_path",
+                        (params["filename"],),
                     ).fetchall()
                 elif kind == "name_wildcard":
-                    name_prefix = params["name_prefix"]
-                    ext = params.get("ext", "")
-                    if ext:
-                        rows = self._conn.execute(
-                            "SELECT rel_path FROM file_paths WHERE filename LIKE ? AND extension = ? ORDER BY rel_path",
-                            (name_prefix + "%", ext),
-                        ).fetchall()
-                    else:
-                        rows = self._conn.execute(
-                            "SELECT rel_path FROM file_paths WHERE filename LIKE ? ORDER BY rel_path",
-                            (name_prefix + "%",),
-                        ).fetchall()
+                    # `**/Name.*` — точка обязательна: `ИмяДругое.xml` маске не отвечает.
+                    rows = self._conn.execute(
+                        "SELECT rel_path FROM file_paths WHERE filename LIKE ? ESCAPE '\\' ORDER BY rel_path",
+                        (_escape_for_sql_like(params["name_prefix"]) + ".%",),
+                    ).fetchall()
                 else:
                     return None
             except sqlite3.OperationalError:
@@ -11272,8 +11310,9 @@ class IndexReader:
                     prefix = prefix.replace("\\", "/").strip("/")
                     base_depth = prefix.count("/") + 1
                     rows = self._conn.execute(
-                        "SELECT rel_path FROM file_paths WHERE rel_path LIKE ? AND depth <= ? ORDER BY rel_path",
-                        (prefix + "/%", base_depth + max_depth),
+                        "SELECT rel_path FROM file_paths WHERE rel_path LIKE ? ESCAPE '\\' AND depth <= ?"
+                        " ORDER BY rel_path",
+                        (_escape_for_sql_like(prefix) + "/%", base_depth + max_depth),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
@@ -11647,11 +11686,12 @@ class IndexReader:
     def count_objects(self, query: str, current_prefix: str | None = None) -> dict | None:
         """COUNT по ТОМУ ЖЕ WHERE, что у ``search_objects`` (v1.34.0).
 
-        Образец — именно ``search_objects``, а НЕ соседний ``count_regions``:
-        последний ищет через ``LIKE '%' || py_lower(?) || '%'`` БЕЗ ``ESCAPE`` (и это
-        согласовано с его собственным ``search_regions``), а ``search_objects``
-        экранирует ``%``/``_``. Скопировав соседа «как принято в проекте», мы
-        получили бы расхождение count↔list на запросах с SQL-метасимволами.
+        Предикат повторяет ``search_objects`` дословно: count и list обязаны судить
+        одним условием, иначе на запросах с SQL-метасимволами они разошлись бы.
+        v1.40.0: прежняя оговорка «соседний ``count_regions`` без экранирования»
+        снята — пары ``search_regions``/``count_regions``/``group_regions`` и
+        ``search_module_headers``/``count_module_headers`` выровнены тем же каноном
+        ``_like_contains`` + ``ESCAPE``, одновременно у всех членов.
 
         ``limit`` на count не влияет — считается ПОЛНЫЙ набор, а не срез
         ``ranked[:limit]``.
@@ -11794,9 +11834,9 @@ class IndexReader:
                         "m.rel_path AS module_path, m.object_name, m.category "
                         "FROM regions r "
                         "JOIN modules m ON m.id = r.module_id "
-                        "WHERE py_lower(r.name) LIKE '%' || py_lower(?) || '%' "
+                        "WHERE py_lower(r.name) LIKE py_lower(?) ESCAPE '\\' "
                         "LIMIT ?",
-                        (query.strip(), limit),
+                        (_like_contains(query.strip()), limit),
                     ).fetchall()
                 return [
                     {
@@ -11836,9 +11876,9 @@ class IndexReader:
                         "m.category, mh.header_comment "
                         "FROM module_headers mh "
                         "JOIN modules m ON m.id = mh.module_id "
-                        "WHERE py_lower(mh.header_comment) LIKE '%' || py_lower(?) || '%' "
+                        "WHERE py_lower(mh.header_comment) LIKE py_lower(?) ESCAPE '\\' "
                         "LIMIT ?",
-                        (query.strip(), limit),
+                        (_like_contains(query.strip()), limit),
                     ).fetchall()
                 return [
                     {
@@ -11871,8 +11911,8 @@ class IndexReader:
                 else:
                     row = self._conn.execute(
                         "SELECT COUNT(*) FROM regions r JOIN modules m ON m.id = r.module_id "
-                        "WHERE py_lower(r.name) LIKE '%' || py_lower(?) || '%'",
-                        (query.strip(),),
+                        "WHERE py_lower(r.name) LIKE py_lower(?) ESCAPE '\\'",
+                        (_like_contains(query.strip()),),
                     ).fetchone()
                 return int(row[0]) if row is not None else 0
             except sqlite3.OperationalError:
@@ -11902,8 +11942,8 @@ class IndexReader:
                 where = ""
                 params: tuple = ()
                 if query and query.strip():
-                    where = "WHERE py_lower(r.name) LIKE '%' || py_lower(?) || '%' "
-                    params = (query.strip(),)
+                    where = "WHERE py_lower(r.name) LIKE py_lower(?) ESCAPE '\\' "
+                    params = (_like_contains(query.strip()),)
                 rows = self._conn.execute(
                     f"SELECT {col} AS k, COUNT(*) AS c "
                     "FROM regions r JOIN modules m ON m.id = r.module_id "
@@ -11942,8 +11982,8 @@ class IndexReader:
                 else:
                     row = self._conn.execute(
                         "SELECT COUNT(*) FROM module_headers mh JOIN modules m ON m.id = mh.module_id "
-                        "WHERE py_lower(mh.header_comment) LIKE '%' || py_lower(?) || '%'",
-                        (query.strip(),),
+                        "WHERE py_lower(mh.header_comment) LIKE py_lower(?) ESCAPE '\\'",
+                        (_like_contains(query.strip()),),
                     ).fetchone()
                 return int(row[0]) if row is not None else 0
             except sqlite3.OperationalError:
@@ -12222,8 +12262,8 @@ class IndexReader:
                 )
                 params: tuple = ()
                 if name:
-                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
-                    params = (f"%{name}%",)
+                    sql += " WHERE py_lower(name) LIKE py_lower(?) ESCAPE '\\'"
+                    params = (_like_contains(name),)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 return None
@@ -12386,8 +12426,8 @@ class IndexReader:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT subsystem_name, subsystem_synonym, object_ref, file "
-                "FROM subsystem_content WHERE py_lower(object_ref) LIKE py_lower(?)",
-                (f"%{object_name}%",),
+                "FROM subsystem_content WHERE py_lower(object_ref) LIKE py_lower(?) ESCAPE '\\'",
+                (_like_contains(object_name),),
             ).fetchall()
 
             if not rows:
@@ -12651,8 +12691,8 @@ class IndexReader:
                 sql = "SELECT name, root_url, templates_json, file FROM http_services"
                 params: tuple = ()
                 if name:
-                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
-                    params = (f"%{name}%",)
+                    sql += " WHERE py_lower(name) LIKE py_lower(?) ESCAPE '\\'"
+                    params = (_like_contains(name),)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 return None
@@ -12678,8 +12718,8 @@ class IndexReader:
                 sql = "SELECT name, namespace, operations_json, file FROM web_services"
                 params: tuple = ()
                 if name:
-                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
-                    params = (f"%{name}%",)
+                    sql += " WHERE py_lower(name) LIKE py_lower(?) ESCAPE '\\'"
+                    params = (_like_contains(name),)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 return None
@@ -12705,8 +12745,8 @@ class IndexReader:
                 sql = "SELECT name, namespace, types_json, file FROM xdto_packages"
                 params: tuple = ()
                 if name:
-                    sql += " WHERE py_lower(name) LIKE py_lower(?)"
-                    params = (f"%{name}%",)
+                    sql += " WHERE py_lower(name) LIKE py_lower(?) ESCAPE '\\'"
+                    params = (_like_contains(name),)
                 rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 return None
@@ -12869,6 +12909,9 @@ class IndexReader:
     ) -> list[dict] | None:
         """Search indexed object attributes by name, object, category, or kind.
 
+        ``attr_name`` — подстрока имени/синонима реквизита; ``object_name`` — ТОЧНОЕ
+        регистронезависимое имя объекта (v1.40.0; было подстрокой).
+
         Returns list of dicts or None if table missing (fallback allowed).
         """
         with self._lock:
@@ -12877,12 +12920,16 @@ class IndexReader:
                 params: list[str | int] = []
                 if attr_name:
                     conditions.append(
-                        "(py_lower(attr_name) LIKE '%' || py_lower(?) || '%'"
-                        " OR py_lower(attr_synonym) LIKE '%' || py_lower(?) || '%')"
+                        "(py_lower(attr_name) LIKE py_lower(?) ESCAPE '\\'"
+                        " OR py_lower(attr_synonym) LIKE py_lower(?) ESCAPE '\\')"
                     )
-                    params.extend([attr_name, attr_name])
+                    params.extend([_like_contains(attr_name)] * 2)
                 if object_name:
-                    conditions.append("py_lower(object_name) LIKE '%' || py_lower(?) || '%'")
+                    # v1.40.0: ТОЧНОЕ имя (регистронезависимо). Подстрока подмешивала
+                    # соседа той же категории (ВзаиморасчетыССотрудниками +
+                    # БухгалтерскиеВзаиморасчеты…) даже в get_object_full_structure,
+                    # а живая ветка find_attributes всегда была точной.
+                    conditions.append("py_lower(object_name) = py_lower(?)")
                     params.append(object_name)
                 if category:
                     conditions.append("category = ?")
@@ -12928,6 +12975,9 @@ class IndexReader:
     ) -> list[dict] | None:
         """Search indexed predefined items by name or parent object.
 
+        ``item_name`` — подстрока имени/синонима элемента; ``object_name`` — ТОЧНОЕ
+        регистронезависимое имя объекта (v1.40.0; было подстрокой).
+
         Returns list of dicts or None if table missing (fallback allowed).
         """
         with self._lock:
@@ -12936,12 +12986,14 @@ class IndexReader:
                 params: list[str | int] = []
                 if item_name:
                     conditions.append(
-                        "(py_lower(item_name) LIKE '%' || py_lower(?) || '%'"
-                        " OR py_lower(item_synonym) LIKE '%' || py_lower(?) || '%')"
+                        "(py_lower(item_name) LIKE py_lower(?) ESCAPE '\\'"
+                        " OR py_lower(item_synonym) LIKE py_lower(?) ESCAPE '\\')"
                     )
-                    params.extend([item_name, item_name])
+                    params.extend([_like_contains(item_name)] * 2)
                 if object_name:
-                    conditions.append("py_lower(object_name) LIKE '%' || py_lower(?) || '%'")
+                    # v1.40.0: ТОЧНОЕ имя (регистронезависимо) — то же правило, что у
+                    # get_object_attributes: подстрока подмешивала чужие объекты.
+                    conditions.append("py_lower(object_name) = py_lower(?)")
                     params.append(object_name)
 
                 where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
@@ -13244,25 +13296,50 @@ class IndexReader:
             return [r["register_ref"] for r in rows]
 
     @_transient_safe(lambda: None)
-    def get_common_module_props(self, name: str = "", flag: str = "") -> list[dict] | None:
-        """Свойства общих модулей.
+    def get_common_module_props(self, name: str = "", flag: str = "", limit: int = 200) -> dict | None:
+        """Страница свойств общих модулей И полное число совпавших — ОДНИМ запросом.
 
         ``flag`` — имя булева свойства (``privileged``, ``global``, ``server_call``…)
         ЛИБО значение ``ReturnValuesReuse`` (``DuringSession``, ``DuringRequest``,
         ``DontUse``). Редкие значения и есть самые полезные: на боевой конфигурации
         привилегированных модулей 2, глобальных 40 при 3918 общих модулях.
+
+        Args:
+            name: фрагмент имени модуля (пусто = все).
+            flag: см. выше; пусто = без фильтра по свойству.
+            limit: размер страницы. ``0`` даёт пустую страницу при сохранённом
+                   ``total``; отрицательное отсекается (``LIMIT -1`` в SQLite —
+                   это «без ограничения», а неограниченный дамп здесь запрещён).
+
+        Returns:
+            ``{"modules": [{module_name, global, server, server_call, privileged,
+            external_connection, client_managed, client_ordinary,
+            return_values_reuse, file}], "total": int}`` либо ``None`` (индекс
+            старше v16 / таблицы нет / транзиентное состояние пересборки).
+            ``total`` — сколько ВСЕГО совпало, а не длина страницы.
+
+        **Форма возврата сменилась в v1.39.0** (было — голый ``list``): до релиза
+        ``LIMIT`` не ставился вовсе, и `flag='DontUse'` отдавал 3 835 строк одним
+        ответом. Приём взят у соседнего ``get_templates``: страница и ПОЛНЫЙ счёт
+        читаются ``COUNT(*) OVER ()`` из ОДНОГО снимка, поэтому пересборка на месте
+        (безопасная под открытым RO-ридером) не может развести их по поколениям.
+        В SQL уезжает ``max(1, limit)``, а страница режется в Python: оконный счёт
+        приезжает КОЛОНКОЙ строки, и при ``LIMIT 0`` он обнулился бы вместе с ней —
+        ноль совпадений и ноль запрошенных строк обязаны выглядеть по-разному.
         """
         if not self.has_declared_composition:
             return None
+        eff_limit = max(0, int(limit))
         sql = (
             "SELECT module_name, global_, server, server_call, privileged, external_connection, "
-            "client_managed, client_ordinary, return_values_reuse, file FROM common_module_props"
+            "client_managed, client_ordinary, return_values_reuse, file, COUNT(*) OVER () AS match_total "
+            "FROM common_module_props"
         )
         where: list[str] = []
         params: list = []
         if name:
-            where.append("py_lower(module_name) LIKE py_lower(?)")
-            params.append(f"%{name}%")
+            where.append("py_lower(module_name) LIKE py_lower(?) ESCAPE '\\'")
+            params.append(_like_contains(name))
         flag_key = (flag or "").strip()
         if flag_key:
             column = _COMMON_MODULE_FLAG_COLUMNS.get(flag_key.lower())
@@ -13273,24 +13350,30 @@ class IndexReader:
                 params.append(flag_key)
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY module_name"
+        sql += " ORDER BY module_name LIMIT ?"
+        params.append(max(1, eff_limit))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
-            return [
-                {
-                    "module_name": r["module_name"],
-                    "global": bool(r["global_"]),
-                    "server": bool(r["server"]),
-                    "server_call": bool(r["server_call"]),
-                    "privileged": bool(r["privileged"]),
-                    "external_connection": bool(r["external_connection"]),
-                    "client_managed": bool(r["client_managed"]),
-                    "client_ordinary": bool(r["client_ordinary"]),
-                    "return_values_reuse": r["return_values_reuse"] or "",
-                    "file": r["file"],
-                }
-                for r in rows
-            ]
+            return {
+                "modules": [
+                    {
+                        "module_name": r["module_name"],
+                        "global": bool(r["global_"]),
+                        "server": bool(r["server"]),
+                        "server_call": bool(r["server_call"]),
+                        "privileged": bool(r["privileged"]),
+                        "external_connection": bool(r["external_connection"]),
+                        "client_managed": bool(r["client_managed"]),
+                        "client_ordinary": bool(r["client_ordinary"]),
+                        "return_values_reuse": r["return_values_reuse"] or "",
+                        "file": r["file"],
+                    }
+                    for r in rows[:eff_limit]
+                ],
+                # Пустая выборка — честный ноль. Пустая СТРАНИЦА при limit=0 — нет:
+                # счёт берётся из строки, прочитанной ДО среза.
+                "total": int(rows[0]["match_total"]) if rows else 0,
+            }
 
     @_transient_safe(lambda: None)
     def get_constant(self, name: str) -> dict | None:
@@ -13339,17 +13422,28 @@ class IndexReader:
         шаг перед ним), поэтому одна выборка даёт и страницу, и ПОЛНЫЙ счёт из
         ОДНОГО снимка. Требует SQLite ≥ 3.25 (2018); проект требует Python ≥ 3.10
         (2021), так что порог заведомо ниже любого поддерживаемого окружения.
+
+        **``limit=0`` не имеет права обнулить счёт (v1.39.0).** Оконный счётчик
+        приезжает КОЛОНКОЙ строки: при ``LIMIT 0`` строк нет, и формула
+        ``rows[0]["match_total"] if rows else 0`` выдала бы честный на вид ноль там,
+        где совпадений три. Поэтому в SQL уезжает ``max(1, limit)``, а страница
+        режется в Python — цена ровно одна лишняя прочитанная строка на запросе,
+        который страницы не просил. Отрицательное значение тоже отсекается: в SQLite
+        ``LIMIT -1`` означает «без ограничения», и отдавать через него весь набор
+        запрещено политикой проекта (см. ``_coerce_bound`` в ``bsl_helpers``).
         """
         if not self.has_declared_composition:
             return None
+        # Публичная граница страницы; в SQL уедет max(1, …) — см. докстринг.
+        eff_limit = max(0, int(limit))
         where: list[str] = []
         params: list = []
         if owner:
             where.append("py_lower(owner_ref) = py_lower(?)")
             params.append(owner)
         if name:
-            where.append("py_lower(name) LIKE py_lower(?)")
-            params.append(f"%{name}%")
+            where.append("py_lower(name) LIKE py_lower(?) ESCAPE '\\'")
+            params.append(_like_contains(name))
         if template_type:
             where.append("py_lower(template_type) = py_lower(?)")
             params.append(template_type)
@@ -13358,7 +13452,7 @@ class IndexReader:
             "SELECT owner_ref, name, synonym, template_type, file, COUNT(*) OVER () AS match_total "
             f"FROM templates{clause} ORDER BY owner_ref, name LIMIT ?"  # noqa: S608 — clause из литералов
         )
-        params.append(int(limit))
+        params.append(max(1, eff_limit))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
             return {
@@ -13370,9 +13464,11 @@ class IndexReader:
                         "template_type": r["template_type"] or "",
                         "file": r["file"],
                     }
-                    for r in rows
+                    for r in rows[:eff_limit]
                 ],
                 # Пустая выборка — честный ноль: строк нет, значит и совпадений нет.
+                # А вот пустая СТРАНИЦА при limit=0 — не ноль: счёт берётся из
+                # прочитанной строки ДО среза, иначе он бы обнулился вместе с ней.
                 "total": int(rows[0]["match_total"]) if rows else 0,
             }
 

@@ -702,7 +702,7 @@ If output is truncated (ends with '... [output truncated]'), split into smaller 
 Print only summaries (counts, first N items) — never dump raw data.
 Ответ может нести 'duplicates' (тот же хелпер с теми же args дважды — переиспользуй переменную, они живут между rlm_execute)
   и 'efficiency_hints' (подсказки по батчингу/агрегатам — следуй им).
-Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index); вызов на старте = пустая трата execute (нужен лишь для has_regions/has_module_headers/extension_overrides).
+Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index); вызов на старте = пустая трата execute (число перехватов — get_overrides()['total']).
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')
 """
@@ -1029,13 +1029,12 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "full": [
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
-            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_objects/unique_methods — ИМЕНА, unique_object_methods — ПАРЫ",
+            "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_* — ЧИСЛА: unique_objects/unique_methods СЧИТАЮТ ИМЕНА, unique_object_methods — ПАРЫ объект+метод",
             "target_method_line=None — валидно: перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения) без текстового объявления в базовом модуле либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
             "ALT live (без индекса): detect_extensions() + find_ext_overrides(ext_path, 'ИмяОбъекта') — на СВЕЖЕМ индексе совпадает с index по количеству; на устаревшем может расходиться (контракт: index = снимок)",
-            "get_index_info() → has_extension_overrides, extension_overrides — статистика индекса",
             "Объекты и модули расширения видны из main-сессии: find_module/find_by_type/find_attributes/find_predefined/parse_object_xml/search возвращают пути с префиксом '../'. Передавай эти пути напрямую в read_procedure/extract_procedures — они читают расширение внутренне.",
             "read_file/grep/glob_files на путях с '../' дадут PermissionError (sandbox base-only)",
         ],
@@ -1564,7 +1563,7 @@ def _build_full_strategy(
             "NEVER call rlm_index(action='build') yourself — only the USER decides when to build indexes. "
             "Build runs in background (returns immediately), but requires the project password. Work with what you have.\n"
             "WITHOUT INDEX:\n"
-            "  - find_attributes(object_name='X') — WORKS (auto-resolves category via find_module, parses XML live)\n"
+            "  - find_attributes(object_name='X') — WORKS (auto-resolves category via metadata, parses XML live)\n"
             "  - find_predefined(object_name='X') — WORKS (parses Predefined.xml live)\n"
             "  - find_attributes('name') without object_name — EMPTY (cannot scan all files)\n"
             "  - find_predefined('name') without object_name — EMPTY (cannot scan all files)\n"
@@ -1759,10 +1758,12 @@ def _build_slim_strategy(
 
 
 def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) -> str:
-    """Render the dynamic INDEX block. Reused by both full and slim builders.
+    """Render the dynamic INDEX block — ТОЛЬКО для slim-сборщика.
 
-    Behavior matches the original inline block in `_build_full_strategy` so
-    legacy output stays byte-identical when reached via the router.
+    v1.40.0: прежняя строка «Reused by both full and slim builders» была неверна —
+    у full свой inline-блок ``== INDEX ==`` в ``_build_full_strategy`` без нуджа
+    ``get_index_info``, поэтому правка текста нуджа здесь меняет только slim.
+    Остальной текст блока исторически повторяет inline-блок full-сборщика.
     """
     if idx_stats is None:
         return (
@@ -1771,7 +1772,7 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
             "NEVER call rlm_index(action='build') yourself — only the USER decides when to build indexes. "
             "Build runs in background (returns immediately), but requires the project password. Work with what you have.\n"
             "WITHOUT INDEX:\n"
-            "  - find_attributes(object_name='X') — WORKS (auto-resolves category via find_module, parses XML live)\n"
+            "  - find_attributes(object_name='X') — WORKS (auto-resolves category via metadata, parses XML live)\n"
             "  - find_predefined(object_name='X') — WORKS (parses Predefined.xml live)\n"
             "  - find_attributes('name') without object_name — EMPTY (cannot scan all files)\n"
             "  - find_predefined('name') without object_name — EMPTY (cannot scan all files)\n"
@@ -1809,8 +1810,8 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
     # payload (rlm_start.index carries the same subset), so calling it on start wastes an execute.
     idx_lines.append(
         "⚠️ Эти данные (builder_version/has_*/counts) уже в rlm_start.index — НЕ вызывай "
-        "get_index_info() на старте (пустая трата execute); он нужен лишь для "
-        "has_regions/has_module_headers/extension_overrides."
+        "get_index_info() на старте (пустая трата execute); число перехватов — "
+        "get_overrides()['total']."
     )
 
     instant_helpers = ["extract_procedures()", "find_exports()"]

@@ -1110,6 +1110,15 @@ def test_reader_fixtures_smoke(request, fixture_name):
 # а новые ключи вернули меньше).
 #   Task 0 (бюджет): −456 прозы из 8 подписей; новые ключи Задач 2/5/6/7/8/9/11/12.
 #   Три новых хелпера: +557                                     -> 12393
+#
+#   v1.39.0: get_overrides +23 (один смысл `=`, единица счёта РЯДОМ с N,
+#                          + пропущенный unique_extensions),
+#            find_common_modules +22 (limit/truncated) -> факт 12 117 при пороге 12 393.
+#            Порог НЕ двигается: прибавка внутри запаса, оставленного v1.38.0.
+#   v1.40.0: find_attributes +28, find_predefined +28 (object_name — ТОЧНОЕ имя),
+#            find_print_forms +55 (presentation|None, presentation_source, delegate,
+#            _meta.delegates), get_module_outline +16, get_object_modules +16
+#            (loc=Σ строк методов) -> факт 12 260 при пороге 12 393. Порог НЕ двигается.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
 # v1.38.0 merge re-baseline: лестница выше — величина ЧИСТОГО upstream-дерева.
 # Форк несёт СВОИ 2 локальные подписи поверх (find_role_objects 174,
@@ -1118,6 +1127,14 @@ _SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
 # правки в измеренном факте, не разложены по отдельности намеренно: порог
 # снят ЦЕЛИКОМ на смерженном дереве, как остальные бэйслайны этого merge.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 12602
+# v1.39.0+v1.40.0 merge re-baseline: апстрим прибавил к ЧИСТОМУ дереву
+# find_common_modules +22 (limit/truncated) и find_attributes/find_predefined/
+# find_print_forms/get_module_outline/get_object_modules +143 (см. лестницу
+# выше) — у апстрима это укладывалось в их собственный запас (факт 12260 при
+# пороге 12393), но форк уже поднял порог под свои локальные подписи, поэтому
+# добавка выталкивает измеренный факт за прежний потолок. Порог снят ЦЕЛИКОМ
+# на смерженном дереве, тем же способом, что и v1.38.0 merge re-baseline.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 12790
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -2356,7 +2373,8 @@ def test_object_modules_registered_sig_exact():
     from rlm_tools_bsl.bsl_helpers import build_helper_metadata_snapshot
 
     sig = build_helper_metadata_snapshot()["get_object_modules"]["sig"]
-    assert len(sig) == 467
+    # v1.40.0: 467 -> 483 — `loc=Σ строк методов` (+16), осознанное расширение контракта.
+    assert len(sig) == 483
     assert "orphan_methods?" in sig
     assert "# ДЕШЕВЫЙ КОД-СКЕЛЕТ объекта за 1 вызов" not in sig
 
