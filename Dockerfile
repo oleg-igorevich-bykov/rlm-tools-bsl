@@ -21,13 +21,27 @@ USER rlm
 # For developers who want to pin a version from source (e.g. custom patches):
 #   uv build          # creates dist/*.whl from current sources
 #   docker compose up -d --build
-RUN if ls /tmp/build/dist/*.whl 1>/dev/null 2>&1; then \
-      echo "Installing from local wheel..." && \
-      pip install --user --no-cache-dir /tmp/build/dist/*.whl; \
-    else \
-      echo "Installing from PyPI..." && \
-      pip install --user --no-cache-dir rlm-tools-bsl; \
-    fi && rm -rf /tmp/build
+#
+# Retried: a dropped connection to PyPI mid-resolution can make pip walk the
+# whole (unbounded) anthropic/openai version history and report a false
+# ResolutionImpossible, even though the pinned ranges resolve cleanly on a
+# stable connection. Retrying the whole install clears it.
+RUN install_pkg() { \
+      if ls /tmp/build/dist/*.whl 1>/dev/null 2>&1; then \
+        echo "Installing from local wheel..." && \
+        pip install --user --no-cache-dir /tmp/build/dist/*.whl; \
+      else \
+        echo "Installing from PyPI..." && \
+        pip install --user --no-cache-dir rlm-tools-bsl; \
+      fi; \
+    }; \
+    n=0; \
+    until install_pkg; do \
+      n=$((n + 1)); \
+      [ "$n" -ge 3 ] && exit 1; \
+      echo "pip install failed, retrying ($n/3)..." >&2; \
+      sleep 5; \
+    done && rm -rf /tmp/build
 
 ENV PATH="/home/rlm/.local/bin:$PATH"
 ENV RLM_TRANSPORT=streamable-http
