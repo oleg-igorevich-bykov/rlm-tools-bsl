@@ -315,9 +315,15 @@ class TestReaderGlobFiles:
         assert result is None
 
     def test_glob_no_match_returns_empty(self, reader):
-        result = reader.glob_files("**/*.nonexistent")
+        # Расширение навигационного индекса без совпадений — честный пустой ответ индекса.
+        result = reader.glob_files("NoSuchDir/**/*.bsl")
         assert result is not None
         assert result == []
+
+    def test_glob_foreign_extension_goes_to_fs(self, reader):
+        # v1.43.0: расширения вне .bsl/.mdo/.xml индекс не хранит ПО ПОСТРОЕНИЮ — прежний []
+        # был ложным нулём; None отправляет вызывающего в обход файлов.
+        assert reader.glob_files("**/*.nonexistent") is None
 
     def test_glob_name_wildcard(self, reader):
         result = reader.glob_files("**/Configuration.mdo")

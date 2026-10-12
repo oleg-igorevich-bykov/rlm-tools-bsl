@@ -3949,17 +3949,25 @@ def test_get_object_modules_not_found():
 
 
 def test_get_object_modules_override_flags():
-    """Флаги перехватов на модуль через get_overrides_for_path + roll-up overrides."""
+    """Флаги перехватов на модуль — по карте идентичности (`get_extension_overrides`) + roll-up overrides."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bsl, reader = _make_object_modules_fixture(tmpdir, with_index=True)
         try:
 
-            def _fake_overrides(rel_path):
-                if rel_path.endswith("ObjectModule.bsl"):
-                    return {"ЗаполнитьДанные": [{"extension_name": "Расш", "annotation": "Вместо"}]}
-                return {}
+            def _fake_all_overrides(object_name="", method_name=""):
+                return [
+                    {
+                        "object_name": "РеализацияТоваров",
+                        "target_method": "ЗаполнитьДанные",
+                        "extension_name": "Расш",
+                        "annotation": "Вместо",
+                        "extension_root": os.path.join(os.path.dirname(tmpdir), "ext_root"),  # Path не импортирован
+                        "ext_module_path": "Documents/РеализацияТоваров/Ext/ObjectModule.bsl",
+                        "source_path": "Documents/РеализацияТоваров/Ext/ObjectModule.bsl",
+                    }
+                ]
 
-            reader.get_overrides_for_path = _fake_overrides  # instance attr shadows method
+            reader.get_extension_overrides = _fake_all_overrides  # instance attr shadows method
             res = bsl["get_object_modules"]("РеализацияТоваров")
             om = next(m for m in res["modules"] if m["path"].endswith("ObjectModule.bsl"))
             assert om["overrides"]["count"] == 1

@@ -110,7 +110,10 @@ def _split_params(raw: str) -> list[str]:
 
     ``params`` исторически хранится/возвращается строкой (``"Знач А, Б = 5"``),
     и агент, ожидавший список, получал ``AttributeError`` при итерации. Эта
-    функция — единый разборщик, применяемый на helper-границе (не в build-time).
+    функция — единый разборщик имён параметров: на helper-границе и (v1.42.0) в
+    build-time проверке затенения получателя обёртки запуска по имени
+    (``bsl_index._launch_receiver_context``) и локальности переменной-адресата запуска
+    (``bsl_index._launch_target_locals``) — одно правило для сборщика и живого разбора.
 
     Возвращает только имена параметров: отбрасывает по-значению-префикс
     ``Знач``/``Val`` (регистронезависимо — ключевые слова 1С) и хвост
@@ -200,6 +203,7 @@ def mask_comments_and_strings(
     lines: list[str],
     *,
     keep_string_content: bool = False,
+    line_states: list[bool] | None = None,
 ) -> list[str]:
     """Маска той же длины: текст комментариев (и, по умолчанию, содержимое строковых
     литералов) заменяется пробелами.
@@ -217,10 +221,17 @@ def mask_comments_and_strings(
 
     Кавычки-ограничители сохраняются всегда: без них ``_count_unquoted_parens`` перестал
     бы видеть границы литерала.
+
+    ``line_states`` (выходной) — по строке: начинается ли она ВНУТРИ литерала. Машина состояний
+    идет строго слева направо без заглядывания вперед, поэтому срез маски модуля с строки,
+    начавшейся вне литерала, совпадает с маской этого среза: так сборщик берет маску тела
+    процедуры готовой, а не считает ее заново.
     """
     out: list[str] = []
     in_string = False
     for raw in lines:
+        if line_states is not None:
+            line_states.append(in_string)
         n = len(raw)
         # 1С допускает КОММЕНТАРИЙ между строками-продолжениями многострочного
         # литерала. Такая строка — комментарий, а НЕ содержимое литерала, и её
@@ -288,7 +299,9 @@ def mask_comments_and_strings(
     return out
 
 
-_MULTILINE_HARD_CAP_LINES = 20
+# Строчный потолок — страховка; от разбега на битом файле защищают символьный потолок и стоп
+# на следующем объявлении (v1.42.0: 20 → 100 — типовые сигнатуры на 24+ строки).
+_MULTILINE_HARD_CAP_LINES = 100
 _MULTILINE_HARD_CAP_CHARS = 2000
 
 
@@ -322,8 +335,9 @@ def _merge_proc_continuations_with_mask(
     Решение о склейке принимается ПО МАСКЕ, поэтому закомментированное объявление с
     несбалансированной скобкой больше не проглатывает соседей.
 
-    Hard caps: 20 строк / 2000 символов на сигнатуру — защита от разбега на битых
-    файлах с несбалансированной `(`.
+    Hard caps: 100 строк / 2000 символов на сигнатуру и стоп на следующем объявлении
+    процедуры — защита от разбега на битых файлах с несбалансированной `(` (v1.42.0:
+    строчный потолок поднят с 20, соседнее объявление склейкой не поглощается).
     """
     merged_lines: list[str] = []
     merged_masked: list[str] = []
@@ -334,7 +348,8 @@ def _merge_proc_continuations_with_mask(
     while i < total:
         line = lines[i]
         mline = masked[i]
-        if _PROC_DEF_PREFIX_RE.match(mline):
+        # Префикс объявления требует «(» в той же строке: без нее регулярку не зовем.
+        if "(" in mline and _PROC_DEF_PREFIX_RE.match(mline):
             open_count, close_count = _count_unquoted_parens(mline)
             balance = open_count - close_count
             if balance > 0:
@@ -343,6 +358,11 @@ def _merge_proc_continuations_with_mask(
                 start_original = i + 1
                 last_index = i
                 for j in range(i + 1, min(i + _MULTILINE_HARD_CAP_LINES, total)):
+                    # Следующее объявление процедуры в сигнатуру входить не может: на битом файле
+                    # с несбалансированной '(' склейка остановится ДО него, и соседняя процедура
+                    # не будет поглощена при любом потолке.
+                    if "(" in masked[j] and _PROC_DEF_PREFIX_RE.match(masked[j]):
+                        break
                     combined = combined + " " + lines[j]
                     combined_mask = combined_mask + " " + masked[j]
                     o, c = _count_unquoted_parens(masked[j])
@@ -761,7 +781,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "_meta.delegates/_total/_truncated — первая страница получателей машинно; пагинации нет",
             "declared_registers/_total/_truncated — ОБЪЯВЛЕННЫЙ состав, ось ОТДЕЛЬНАЯ от кода; undeclared_code_registers — выведено, но не объявлено; unresolved — неразрешимо статически, пустой читай с _meta.unresolved_available",
             "analyze_document_flow('ДокИмя') → проводки + подписки + регзадания",
-            "find_event_subscriptions('ДокИмя', event_filter=['OnWrite','Posting','ПередЗаписью']) → подписки документа",
+            "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting']) → подписки документа",
             "ALT: search_methods('Проведение') при нестандартном имени",
         ],
     },
@@ -938,7 +958,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             'for d in rel[\'can_create_from_here\']: print(f\'  -> {d.get("ref") or d["document"]} (via={d["via"]})\')  # metadata ref канонический: Catalog.X/Document.X',
             "for d in rel['can_be_created_from']: print(f'  <- {d[\"type\"]}')",
             "search_methods('Заполнить') → процедуры заполнения шапки/ТЧ при вводе на основании",
-            "find_event_subscriptions('ДокИмя', event_filter=['Filling','ОбработкаЗаполнения']) → подписки на заполнение",
+            "find_event_subscriptions('ДокИмя', event_filter=['Filling']) → подписки на заполнение",
         ],
     },
     "структура объекта": {
@@ -1036,7 +1056,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "get_overrides() → перехваты конфигурации. СНАЧАЛА partial: False — total/агрегаты по полному выбранному источнику; True — только по прочитанной части, причины в _meta.failed_extension_roots. overrides = отсортированный срез 200, total/truncated сигналят обрезку; сводку по срезу не строй",
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
             "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_* — ЧИСЛА: unique_objects/unique_methods СЧИТАЮТ ИМЕНА, unique_object_methods — ПАРЫ объект+метод",
-            "target_method_line=None — валидно: перехват предопределенного события платформы (ПриЗаписи, ОбработкаПроведения) без текстового объявления в базовом модуле либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
+            "target_method_line=None — валидно: метода нет в базовом модуле — обычно перехват события платформы (ПриЗаписи, ОбработкаПроведения) без обработчика в основной конфигурации; у общего модуля событий платформы нет — там это расхождение версий основной конфигурации и расширения; либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
             "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",

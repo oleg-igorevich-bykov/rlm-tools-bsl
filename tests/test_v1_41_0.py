@@ -97,14 +97,15 @@ class TestDomainDataStretch:
 
     def test_domain_sizes_match_the_plan(self):
         """Размеры §3.3 плана (с git_search): документ 22, структура 18, код 16,
-        связи 20, расширения 14, поиск 17.
+        связи 20, расширения 14, поиск 17; + find_unresolved_calls в v1.42.0 (код 17,
+        расширения 15).
 
         Форк (v1.41.0 merge): +1 к «структура» (get_object_structures) и +1 к «связи»
         (find_role_objects) — форк-локальные хелперы обязаны входить хотя бы в один
         домен (test_every_snapshot_helper_is_in_core_or_a_domain): итого структура 19,
         связи 21."""
         sizes = {key: len(d["helpers"]) for key, d in HELPER_DOMAINS.items()}
-        assert sizes == {"документ": 22, "структура": 19, "код": 16, "связи": 21, "расширения": 14, "поиск": 17}
+        assert sizes == {"документ": 22, "структура": 19, "код": 17, "связи": 21, "расширения": 15, "поиск": 17}
         for key, d in HELPER_DOMAINS.items():
             assert len(set(d["helpers"])) == len(d["helpers"]), f"дубль в домене {key}"
 
@@ -247,7 +248,7 @@ class TestDomainTableAndDescription:
 
     def test_param_description_budget_and_contents(self):
         text = domains_param_description()
-        assert len(text) <= 3000, len(text)
+        assert len(text) <= 3100, len(text)  # форк: +2 локальных хелпера в таблице и find_unresolved_calls (v1.42.0); было 3000
         assert text.startswith("Ключи: документ | структура | код | связи | расширения | поиск | весь каталог.")
         assert "rlm_execute" in text and "[]" in text
         assert "RLM_CATALOG_MODE=all" in text

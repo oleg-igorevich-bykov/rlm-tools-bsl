@@ -622,6 +622,12 @@ def make_helpers(
         """Find files by glob pattern. Returns list of relative path strings.
 
         Uses SQLite index for supported patterns (instant), falls back to FS otherwise.
+
+        v1.43.0: маска с расширением вне ``.bsl/.mdo/.xml`` (``**/*.rights``, ``**/*.form``)
+        идёт обходом файлов (секунды на большом дереве; с префиксом каталога — доли секунды):
+        навигационный индекс таких файлов не хранит, и ответ из него был бы ложным нулём.
+        Маска БЕЗ расширения (``Dir/**``, ``**/Name.*``) и ``tree()`` на индексе видят только
+        ``.bsl/.mdo/.xml`` — остальное бери маской с расширением (``Roles/X/*.rights``).
         """
         if idx_reader is not None:
             _fallback_reason = None

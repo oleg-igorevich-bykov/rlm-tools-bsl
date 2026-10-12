@@ -1134,7 +1134,11 @@ _SIG_SUM_BUDGET_WITHOUT_GIT = 12602
 # пороге 12393), но форк уже поднял порог под свои локальные подписи, поэтому
 # добавка выталкивает измеренный факт за прежний потолок. Порог снят ЦЕЛИКОМ
 # на смерженном дереве, тем же способом, что и v1.38.0 merge re-baseline.
-_SIG_SUM_BUDGET_WITHOUT_GIT = 12790
+# v1.42.0+v1.43.0 merge re-baseline: апстрим добавил find_unresolved_calls (+255 подпись,
+# +32 expression/kind/target_owner), call_kind (+11 в трёх хелперах), search_module_headers
+# with_text (+11) и поднял свой порог на +255; форк поднимает свой 12790 так же и затем
+# снимает точное значение на смерженном дереве.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 13151
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -1190,6 +1194,30 @@ def test_trimmed_sigs_did_not_lose_a_single_key_name():
             "exact_rows",
             "fallback_rows",
         ],
+        # v1.42.0: все ключи строки issues (expression/kind/target_owner в подпись дописаны после e2e).
+        "find_unresolved_calls": [
+            "layer",
+            "reasons",
+            "path",
+            "limit",
+            "offset",
+            "issues",
+            "file",
+            "line",
+            "caller",
+            "owner",
+            "expression",
+            "target",
+            "kind",
+            "reason",
+            "target_owner",
+            "total",
+            "has_more",
+            "by_reason",
+            "not_checked",
+            "partial",
+        ],
+        "search_module_headers": ["query", "limit", "count_only", "total", "with_text", "source", "truncated", "scope"],
         # v1.37.0 (Задача 0) — надзор РАСШИРЕН на каждую фактически порезанную
         # подпись. Перечень выше покрывал лишь подписи, которые резал v1.36.0;
         # без этих строк резка вместе с именем ключа прошла бы зелёной.

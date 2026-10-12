@@ -283,7 +283,8 @@ def test_helper_snapshot_count_locked():
     # criterion-selector, code-index comparison gap #4).
     # v1.37.0 (upstream): no new sandbox helper.
     # v1.38.0 (upstream): +3 for count_matches, find_common_modules, find_templates.
-    assert len(build_helper_metadata_snapshot()) == 58
+    # v1.42.0 (upstream): +1 for find_unresolved_calls (аудит адресатов вызовов).
+    assert len(build_helper_metadata_snapshot()) == 59
 
 
 @pytest.mark.parametrize("mode", ["slim", "full"])
@@ -712,7 +713,10 @@ def test_missing_index_rlm_start_payload_within_budget(monkeypatch, tmp_path, mo
 # символов из 12727 всего available_functions; запаса под контракты v1.33.0
 # при этом не оставалось (slim+рецепт 49 символов, full payload 244).
 _SIG_CEILINGS = {
-    "find_call_hierarchy": 560,
+    # v1.42.0: 560 -> 571 ровно на измеренную дельту (+11, факт 559 -> 570): ключ `call_kind`
+    # в `callers[]` — без него агент не отличит запуск по имени (`background`) от прямого
+    # вызова и прочтет строку места запуска как строку вызова. Запас остается прежним (1).
+    "find_call_hierarchy": 571,
     "find_path": 540,
     # v1.37.0 (завершение релиза): 520 -> 410 по правилу `ceil10(факт * 1.10)` и
     # ТОЛЬКО ВНИЗ. Задача 0 срезала прозу, факт стал 370, и прежний потолок оставлял
@@ -1184,7 +1188,7 @@ def test_domain_table_lives_in_the_rlm_start_field(slim_schemas):
     desc = slim_schemas["tools"]["rlm_start"]["domains_desc"]
     assert desc == domains_param_description()
     assert render_domain_table(with_names=True) in desc
-    assert len(desc) <= 3000
+    assert len(desc) <= 3100  # форк: см. test_v1_41_0 (было 3000)
     assert "domains=[...] к ближайшему rlm_execute" in desc, "маршрут попутной догрузки"
 
 

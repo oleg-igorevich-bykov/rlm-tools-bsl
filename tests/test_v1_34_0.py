@@ -917,6 +917,9 @@ def test_coverage_map_matches_reality(cf_ext):
         # карта охвата обязана его нести — иначе новая строка документации
         # протухла бы молча.
         "find_functional_options": _source(bsl["find_functional_options"]("Док")),
+        # v1.43.0: `source` у count_matches — по маршруту перечисления (index | index+live |
+        # live); без этой строки неверная запись карты прошла бы молча.
+        "count_matches": _source(bsl["count_matches"]("Процедура")),
     }
     for helper, value in actual.items():
         assert helper in table, f"{helper} исчез из карты охвата"

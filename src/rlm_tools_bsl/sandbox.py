@@ -120,6 +120,32 @@ _KNOWN_HELPER_ALIASES: dict[str, str] = {
     "get_callers": "find_callers_context",
 }
 
+# Методы строки, которые хелпер зовёт на скалярном аргументе. AttributeError «у списка
+# нет .strip()» в кадре пакета значит «в хелпер передан список вместо строки» (v1.43.0),
+# а не «агент зовёт метод словаря на списке-результате».
+_STR_ARG_METHODS = frozenset(
+    {
+        "strip",
+        "lstrip",
+        "rstrip",
+        "lower",
+        "upper",
+        "casefold",
+        "split",
+        "rsplit",
+        "startswith",
+        "endswith",
+        "replace",
+        "partition",
+        "rpartition",
+        "find",
+        "rfind",
+        "encode",
+        "isdigit",
+        "isalpha",
+    }
+)
+
 # Сигнатуры generic-IO хелперов (НЕ в BSL _registry — приходят из make_helpers()).
 # Нужны, чтобы kwarg-хинт давал реальную сигнатуру и для grep/read_file/… (в логах
 # бенчмарка: grep(..., limit=...) → тупик). Зеркалит server.available_functions.
@@ -1058,14 +1084,27 @@ class Sandbox:
 
         # v1.23.0 — three recurrent agent-shape errors (from A/B logs). Each caught retry
         # that the agent would otherwise spend a whole rlm_execute fixing = −1 call.
-        # (a) .get()/.keys() on a list result (helper returned list[dict], not dict).
+        # (a) AttributeError у СПИСКА. Два разных прочтения различает последний кадр
+        # трассировки: внутри пакета — хелпер получил список там, где ждёт строку (v1.43.0);
+        # в коде агента — агент зовёт метод словаря на списке-результате (v1.23.0).
         if "AttributeError" in error and "'list' object has no attribute" in error:
-            hints.append(
-                "HINT: результат — СПИСОК (list[dict]), а не dict — не зови .get()/[ключ] на самом "
-                "списке. Итерируй элементы: for r in result: print(r['name']). Списком отдают, напр., "
-                "find_event_subscriptions (без limit), search_methods, extract_procedures, "
-                "find_roles(...)['roles']."
-            )
+            attr_m = re.search(r"'list' object has no attribute '(\w+)'", error)
+            frames = re.findall(r'File "([^"]+)"', error)
+            in_helper = bool(frames) and frames[-1] != "<rlm-sandbox>"
+            if in_helper and attr_m and attr_m.group(1) in _STR_ARG_METHODS:
+                hints.append(
+                    "HINT: в хелпер передан СПИСОК там, где ждется строка (у списка нет "
+                    f".{attr_m.group(1)}()). Списком принимают имена read_procedure, "
+                    "find_callers_context, find_enum_values, find_definition; остальным — по одному: "
+                    "for n in names: helper(n)."
+                )
+            else:
+                hints.append(
+                    "HINT: результат — СПИСОК (list[dict]), а не dict — не зови .get()/[ключ] на самом "
+                    "списке. Итерируй элементы: for r in result: print(r['name']). Списком отдают, напр., "
+                    "find_event_subscriptions (без limit), search_methods, extract_procedures, "
+                    "find_roles(...)['roles']."
+                )
         # (b) set()/dict-key over list[dict] → unhashable.
         if "TypeError" in error and "unhashable type: 'dict'" in error:
             hints.append(
