@@ -8104,9 +8104,12 @@ _HEADER_LICENSE_MARK = "Copyright"
 # Маркер доработки или условной сборки: `//++ НЕ УТ`, `// +++ <команда>; <автор>; <дата>`, `//-- ...`.
 # Строка блока уже без `//` и одного пробела; больший отступ — подпункт списка, а не маркер.
 _HEADER_MARKER_RE = re.compile(r"\+\+|--")
+# Потолок текста шапки модуля, который хранит индекс и ищет search_module_headers. Полный текст
+# длиннее — изменение сборщика; хелпер помечает строку, упёршуюся в потолок (v1.44.0).
+HEADER_COMMENT_MAX_CHARS = 500
 
 
-def _extract_header_comment(lines: list[str], max_chars: int = 500) -> str | None:
+def _extract_header_comment(lines: list[str], max_chars: int = HEADER_COMMENT_MAX_CHARS) -> str | None:
     """Шапка модуля: первый блок //-комментариев, который НЕ является лицензией.
 
     ``None`` — в начале модуля комментария нет; ``""`` — есть только блок лицензии (Copyright):

@@ -165,7 +165,9 @@ SEARCH_OBJECTS_KEYS = {"object_name", "category", "synonym", "file"} | {"owner"}
 
 SEARCH_REGIONS_KEYS = {"name", "line", "end_line", "module_path", "object_name", "category"} | {"owner"}
 
-SEARCH_HEADERS_KEYS = {"module_path", "object_name", "category", "header_comment"} | {"owner"}
+# v1.44.0: additive-ключ header_truncated (шапка упёрлась в потолок HEADER_COMMENT_MAX_CHARS) —
+# freeze дополнен, а не ослаблен до `>=`.
+SEARCH_HEADERS_KEYS = {"module_path", "object_name", "category", "header_comment"} | {"owner"} | {"header_truncated"}
 
 
 class TestSearchMethodsLive:

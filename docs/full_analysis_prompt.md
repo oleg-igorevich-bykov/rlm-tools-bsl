@@ -511,7 +511,7 @@ Replace `<path>` with the actual path to your 1C source code (EDT or CF format).
 
 2. **Per-source quota**:
    - search('а', limit=30) → группировка по source_type: сколько от каждого источника
-   - Ни один source_type не должен занимать более 7-8 записей (квота = limit // 4)
+   - Первый проход: каждому source_type по порядку источников min(своих строк, квоты, остатка limit), квота = max(limit // 6, 3); затем места, которые остались свободными, — источникам, у которых строки остались (v1.44.0). Нижняя граница min(своих строк, квоты) гарантирована, только когда весь квотный проход умещается в limit
    - search('а', limit=8) → группировка — покажи, как квота работает при малом limit
 
 3. **Scope фильтрация**:
@@ -584,7 +584,7 @@ This prompt verifies the unified `search()` helper from v1.5.1: broad-first disc
 | Area | Expected helpers | What to verify |
 |------|-----------------|----------------|
 | Broad discovery | `search(query)` | Multiple source_types in results (diversity) |
-| Per-source quota | `search(query, limit=N)` | No source_type exceeds `max(limit//4, 3)` entries |
+| Per-source quota | `search(query, limit=N)` | First pass: each source in order gets min(its rows, max(limit//6, 3), what is left of limit); then free places go to sources that still have rows |
 | Scope: methods | `search(q, scope='methods')` | All source_type='method', path_kind='bsl' |
 | Scope: objects | `search(q, scope='objects')` | All source_type='object', path_kind='metadata' |
 | Scope: regions | `search(q, scope='regions')` | All source_type='region', path_kind='bsl' |
@@ -605,7 +605,7 @@ This prompt verifies the unified `search()` helper from v1.5.1: broad-first disc
 |--------|---------------|
 | search('себестоимость') source_types | 2-4 distinct types |
 | search('себестоимость') total hits | 10-40 |
-| search('а', limit=30) max per source_type | <= 7-8 (quota = 30//4) |
+| search('а', limit=30) per source_type | 5 when every source has ≥ 5 rows (quota = 30//6) |
 | search('себестоимость', scope='methods') | 5-20 methods |
 | search('себестоимость', scope='objects') | 5-30 objects |
 | search('Проведение', scope='regions') | 30 (default limit); 1,200-1,400 with limit=2000 |
@@ -1162,7 +1162,7 @@ On a fresh v12 index, all 8 verifications should PASS. Common observations:
 | B1 non-postable document | When `Posting=Deny` is in XML: `is_postable: False`, `hint` mentions `find_event_subscriptions` |
 | C1 `find_event_subscriptions` | Default → `list[dict]` (legacy contract); with `limit=N` → `{subscriptions, total, returned, has_more}`; `event_filter=['BeforeWrite']` returns server-side filtered subset |
 | A1 fake `.mdo` path | `parse_object_xml('Documents/X.mdo')` auto-normalises to `Documents/X/X.mdo` (EDT) or `Documents/X/Ext/Document.xml` (CF); missing → FileNotFoundError with hint about directory |
-| C3 anti-duplicate | Response contains `duplicates: [{call: seq, prev_call: seq_prev, helper: name}]` for cross-execute repeats; helper return value bit-for-bit identical |
+| C3 anti-duplicate | Response contains `duplicates: [{call: seq, prev_call: seq_prev, helper: name}]` for cross-execute repeats (v1.44.0: first 10 entries, the rest counted in `duplicates_truncated_count`); helper return value bit-for-bit identical |
 | A2/A3 `read_procedure` | Missing procedure → `None`; missing path → FileNotFoundError; sandbox hint mentions `extract_procedures()` and XML-only objects |
 | Disambiguation | All 4 `help()` queries route to expected helpers (after BUG-2 fix in v1.10.x: exact keyword match wins over substring) |
 
@@ -1592,7 +1592,7 @@ Best run on a CF config WITH nearby extensions (CFE overrides) so triggers are n
 | Contract: grep | `safe_grep(pattern, name_hint=...)` | ответ — СЛОВАРЬ: строки в `res['results']`, число в `res['returned']`; пустой `results` НЕ доказывает отсутствие — срез `max_files` действует всегда, `name_hint` меняет лишь ЧТО режется. Охват виден по `candidates_total`/`scanned_files`/`failed_files`/`catalog_complete`/`read_status_complete`. Исчерпывающий поиск — `git_search` |
 | Contract: count_only | `search_regions(q, count_only=True)` | при настроенных расширениях и непустом `q` — `{total, total_main, total_extensions, source:"index+live"\|"live", truncated, scope:"main_index+live_extensions"}` и `total == len(list)`; без расширений или при пустом/пробельном `q` — прежний main-only dict |
 | Contract: functional options | `find_functional_options(obj, include_code=False)` | `xml_options` — ТОЧНОЕ совпадение: typed-ввод category-aware (включая member-ссылки), bare — по точному имени объекта; чужой глубокий `...Attribute.<Имя>` больше не засчитывается. Совпадает с `get_object_profile(...).functional_options` |
-| Contract: queries | `extract_queries(path)` | находит `Запрос.Текст = "..."` (в т.ч. с литералом на СЛЕДУЮЩЕЙ строке), `Новый Запрос("...")`/`New Query("...")`; разбор source-aware — вхождения в комментариях и внутри текста самого запроса ложных записей не дают. У конструктора и перенесённой формы `НСтр`/переменная/конкатенация не извлекаются; однострочное присваивание намеренно мягче — `Запрос.Текст = "..." + Хвост;` извлекается вместе с хвостом строки. v1.43.0: третья форма — любой литерал, который начинается с `ВЫБРАТЬ`/`SELECT` и содержит `ИЗ`/`КАК`/`ПОМЕСТИТЬ` (`FROM`/`AS`/`INTO`): переменная с другим именем, `ЗапросПоСкладам.Текст`, `Возврат "ВЫБРАТЬ…"`; `line` — строка начала литерала; фрагменты и литералы в склейке через `+` записей не дают |
+| Contract: queries | `extract_queries(path)` | находит `Запрос.Текст = "..."` (в т.ч. с литералом на СЛЕДУЮЩЕЙ строке), `Новый Запрос("...")`/`New Query("...")`; разбор source-aware — вхождения в комментариях и внутри текста самого запроса ложных записей не дают. У конструктора и перенесённой формы `НСтр`/переменная/конкатенация не извлекаются; однострочное присваивание намеренно мягче — `Запрос.Текст = "..." + Хвост;` извлекается вместе с хвостом строки. v1.43.0: третья форма — любой литерал, который начинается с `ВЫБРАТЬ`/`SELECT` и содержит `ИЗ`/`КАК`/`ПОМЕСТИТЬ` (`FROM`/`AS`/`INTO`): переменная с другим именем, `ЗапросПоСкладам.Текст`, `Возврат "ВЫБРАТЬ…"`; `line` — строка начала литерала; фрагменты и литералы в склейке через `+` записей не дают. v1.44.0: `tables` — все виды источников запроса (регистры, справочник, документ, перечисление, планы видов характеристик/счетов/видов расчета/обмена, бизнес-процесс, задача, константа, журнал документов, последовательность, критерий отбора, внешний источник данных; RU и EN), прежде — пять видов |
 
 ## Expected results
 

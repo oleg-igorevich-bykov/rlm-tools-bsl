@@ -1428,6 +1428,12 @@ def _rlm_start(
             "has_fts": idx_stats.get("has_fts", False),
             "has_synonyms": bool(idx_stats.get("object_synonyms", 0)),
             "object_synonyms": idx_stats.get("object_synonyms", 0),
+            # v1.44.0: стратегия и подсказка обещают «has_* уже в rlm_start.index», а трёх ключей,
+            # которые чаще всего и спрашивают, здесь не было. Вывод — как в get_index_info();
+            # has_* таблиц v16 сознательно не заводятся (их доступность — builder_version >= 16).
+            "has_regions": _bv >= 8,
+            "has_module_headers": _bv >= 8,
+            "has_extension_overrides": _bv >= 9,
             "has_object_attributes": _bv >= 11 and _has_meta,
             "object_attributes_count": idx_stats.get("object_attributes", 0),
             "has_predefined_items": _bv >= 11 and _has_meta,
@@ -1517,6 +1523,9 @@ def _rlm_start(
             "has_fts": False,
             "has_synonyms": False,
             "object_synonyms": 0,
+            "has_regions": False,
+            "has_module_headers": False,
+            "has_extension_overrides": False,
             "has_object_attributes": False,
             "object_attributes_count": 0,
             "has_predefined_items": False,
@@ -1843,6 +1852,12 @@ def _rlm_execute(
         return _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0, domains)
 
 
+# Поле `duplicates` ответа rlm_execute — пример повторов, а не журнал: оно лежит вне
+# max_output_chars, и один цикл с повторным вызовом давал сотни записей (31 тыс. символов при
+# stdout 3 тыс.). Остаток — счётчиком, как `new_variables_truncated_count` (v1.44.0).
+_DUPLICATES_SHOWN = 10
+
+
 def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_variables, t0, domains=None) -> str:
     session_id = session.session_id
     # Runtime WARNING+ из воркера — ПОСЛЕ возврата валидированного результата, но ДО
@@ -1884,7 +1899,9 @@ def _finish_rlm_execute(session, backend, code, result, detail_level, max_new_va
             if h.duplicate_of is not None
         ]
         if duplicates:
-            response["duplicates"] = duplicates
+            response["duplicates"] = duplicates[:_DUPLICATES_SHOWN]
+            if len(duplicates) > _DUPLICATES_SHOWN:
+                response["duplicates_truncated_count"] = len(duplicates) - _DUPLICATES_SHOWN
 
     # Server-side efficiency nudges (session-cumulative, throttled). Response metadata
     # ONLY — never in the helper return or stdout. Stable ids: read_files/reuse_var/batch/
@@ -2067,9 +2084,31 @@ async def rlm_start(
     )
 
 
+def _session_id_arg(tool: str, session_id: str, sid: str) -> tuple[str, str | None]:
+    """``(идентификатор, ошибка)`` сессии ``rlm_execute``/``rlm_end`` из ``session_id`` или ``sid`` (v1.44.0, issue #40).
+
+    Мост режима Cowork у Claude Desktop теряет аргумент с именем ``session_id``: вызов падал на проверке аргументов,
+    и закрыть сессию было нечем. ``sid`` — то же значение под другим именем; оба имени сразу — только с одинаковым
+    значением. Ошибка — JSON-ответ, как у неизвестной сессии, и строка лога: отказ не доходит до ``_rlm_execute``,
+    и без неё вызова в ``server.log`` не видно."""
+    if session_id and sid and session_id != sid:
+        message = "session_id and sid differ; pass the session id once"
+    elif session_id or sid:
+        return session_id or sid, None
+    else:
+        message = (
+            "session_id is required (the value from rlm_start); if the client drops session_id "
+            "(Claude Desktop Cowork), pass the same value as sid"
+        )
+    logger.info("%s: rejected: %s", tool, message)
+    return "", json.dumps({"error": message}, ensure_ascii=False)
+
+
 @mcp.tool()
 async def rlm_execute(
-    session_id: str,
+    *,
+    session_id: str = "",
+    sid: str = "",
     code: Annotated[
         str,
         Field(description="Python с хелперами; связанные операции — одним вызовом."),
@@ -2085,17 +2124,27 @@ async def rlm_execute(
     ] = None,
 ) -> str:
     """Runs Python with helpers in the session: output via print(), variables persist. Signatures of helpers not seen yet arrive in the signatures key."""
+    # v1.44.0 (issue #40): идентификатор сессии — `session_id` или `sid`; параметры только именованные, поэтому
+    # порядок свойств схемы прежний, а `code` остаётся обязательным.
+    resolved, error = _session_id_arg("rlm_execute", session_id, sid)
+    if error:
+        return error
     return await anyio.to_thread.run_sync(
-        lambda: _rlm_execute(session_id, code, detail_level, max_new_variables, domains)
+        lambda: _rlm_execute(resolved, code, detail_level, max_new_variables, domains)
     )
 
 
 @mcp.tool()
 async def rlm_end(
-    session_id: str,
+    *,
+    session_id: str = "",
+    sid: str = "",
 ) -> str:
     """Closes the session and frees its resources."""
-    return await anyio.to_thread.run_sync(lambda: _rlm_end(session_id))
+    resolved, error = _session_id_arg("rlm_end", session_id, sid)
+    if error:
+        return error
+    return await anyio.to_thread.run_sync(lambda: _rlm_end(resolved))
 
 
 # ─────────────────────────────────────────────────────────────────────

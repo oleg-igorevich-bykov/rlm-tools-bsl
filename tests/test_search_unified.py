@@ -186,15 +186,20 @@ class TestSearchDiversity:
         assert len(source_types) >= 2, f"Expected >=2 source types, got {source_types}"
 
     def test_search_all_per_source_quota(self, full_index):
-        """No single source_type should exceed per-source quota."""
+        """v1.44.0: первый проход даёт каждому источнику min(своих строк, квоты, остатка limit) —
+        разнообразие сохраняется; сверх квоты источник получает только места, которые остались
+        свободными. Здесь квотный проход четырёх проверяемых источников (4 × 5) умещается в limit=30,
+        поэтому у каждого из них не меньше min(своих строк, квоты)."""
         bsl, _ = full_index
-        results = bsl["search"]("Заполнение", limit=30)
         per_source = max(30 // 6, 3)
+        full = bsl["search"]("Заполнение", limit=30)
         from collections import Counter
 
-        counts = Counter(r["source_type"] for r in results)
-        for src, cnt in counts.items():
-            assert cnt <= per_source, f"{src} has {cnt} results, quota is {per_source}"
+        counts = Counter(r["source_type"] for r in full)
+        assert len(full) <= 30
+        for scope, src in (("methods", "method"), ("objects", "object"), ("regions", "region"), ("headers", "header")):
+            alone = len(bsl["search"]("Заполнение", scope=scope, limit=per_source))
+            assert counts.get(src, 0) >= min(alone, per_source), (src, counts)
 
 
 # ---------------------------------------------------------------------------

@@ -595,7 +595,10 @@ def test_full_form_recipe_overhead_within_plan_limit(_fmt_info, monkeypatch):
 # подпись `git_search` в available_functions и git-блок стратегии (в «только ядро» их
 # нет); slim ре-бэйслайнен ВНИЗ на факт (без compact index, строки INSTANT и прежнего
 # HELP), full значение не читает и не двигается.
-_GIT_PAYLOAD_BASELINES = {"slim": 21384, "full": 53595}
+# v1.44.0 merge re-baseline: апстрим добавил в rlm_start.index has_regions/has_module_headers/
+# has_extension_overrides и +4 к подписям; у апстрима рост укладывается в +5%, а форк, несущий
+# свои локальные хелперы, выходит за прежний потолок — slim снят на факт смерженного дерева.
+_GIT_PAYLOAD_BASELINES = {"slim": 22472, "full": 53595}
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git недоступен")
@@ -776,10 +779,14 @@ def test_trimmed_sigs_keep_their_keys():
             "code_registers",
             "suppressed_main_code_registers",
             "posting_handler_present",
-            # v1.38.0 — заголовочные ключи релиза. Спутники `_total`/`_truncated`
-            # идут суффиксной формой (та же идиома, что у `_meta.delegates`),
-            # поэтому дословно их здесь не требуем.
+            # v1.38.0 — заголовочные ключи релиза. v1.44.0: спутники названы полностью —
+            # суффиксная форма `declared_registers/_total/_truncated` читалась как
+            # `declared_registers_total` (ошиблись и агент волн, и исполнитель e2e), а ключи
+            # называются `declared_total` и `declared_truncated`. У `_meta.delegates/_total/_truncated`
+            # суффикс читается верно (`delegates_total`), там форма осталась.
             "declared_registers",
+            "declared_total",
+            "declared_truncated",
             "undeclared_code_registers",
             "unresolved",
         ],
@@ -919,7 +926,8 @@ _HELPER_DOMAIN_PAYLOAD_BASELINES: dict[tuple[str, ...], int] = {
     ("поиск",): 11492,
     # Самая тяжёлая пара (§3.3 плана): верхняя граница выбора «на стыке двух доменов».
     ("структура", "связи"): 17108,
-    ("весь каталог",): 20267,
+    # v1.44.0 merge re-baseline (см. _GIT_PAYLOAD_BASELINES): факт смерженного дерева.
+    ("весь каталог",): 21355,
 }
 
 # Хелпер из каждого выбранного домена, которого нет в ядре: ячейка обязана мерить
@@ -935,7 +943,8 @@ _HELPER_DOMAIN_MARKERS = {
 }
 
 # RLM_CATALOG_MODE=all: весь каталог без выбора агентом, блока доменов нет.
-_CATALOG_ALL_PAYLOAD_BASELINE = 20181
+# v1.44.0 merge re-baseline (см. _GIT_PAYLOAD_BASELINES): факт смерженного дерева.
+_CATALOG_ALL_PAYLOAD_BASELINE = 21269
 
 
 @pytest.mark.parametrize("domains", sorted(_HELPER_DOMAIN_PAYLOAD_BASELINES))
@@ -1122,8 +1131,9 @@ def test_recipe_step_signatures_within_budget(topic):
 # зависят — они меряются в процессе pytest; rlm_help регистрируется только в slim, а
 # conftest ставит full непомеченным тестам, поэтому сумма и схема справки снимаются в
 # подпроцессе с явным RLM_STRATEGY_MODE=slim. Общие потолки — из плана, не по факту:
-# четыре схемы ≤ 8 500, все шесть ≤ 10 000, докстринги ≤ 850, описания полей без
-# rlm_start.domains ≤ 1 800, инструкция сервера ≤ 220.
+# четыре схемы ≤ 8 500, все шесть ≤ 10 100 (v1.44.0: было 10 000, +`sid` у rlm_execute
+# и rlm_end, issue #40), докстринги ≤ 850, описания полей без rlm_start.domains ≤ 1 800,
+# инструкция сервера ≤ 220.
 
 _SCHEMA_FACTS = {"rlm_start": 4621, "rlm_execute": 1133, "rlm_help": 1518}
 
@@ -1160,7 +1170,7 @@ def test_tool_schemas_within_plan_limits(slim_schemas):
     four = sum(tools[n]["schema"] for n in ("rlm_start", "rlm_execute", "rlm_help", "rlm_end"))
     six = sum(t["schema"] for t in tools.values())
     assert four <= 8500, f"четыре схемы {four} > 8500"
-    assert six <= 10000, f"шесть схем {six} > 10000"
+    assert six <= 10100, f"шесть схем {six} > 10100"
     docs = sum(t["doc"] for t in tools.values())
     assert docs <= 850, f"докстринги шести тулов {docs} > 850"
     fields = sum(

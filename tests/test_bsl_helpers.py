@@ -8968,14 +8968,19 @@ def test_fo_typed_keeps_category_without_index(tmp_path):
 
 def test_fo_legacy_display_name_is_case_sensitive_as_before(tmp_path):
     """`_strip_meta_prefix` регистрозависим, и его результат — публичный `object` И
-    `name_hint` code-скана. Новая регистронезависимая классификация не имеет права
-    протечь в это значение."""
+    `name_hint` code-скана. v1.44.0: на корректной ссылке, где он префикс не снял
+    (`document.X`, `DOCUMENT.X`), имя — суффикс канонической ссылки: прежде здесь
+    стояли `document.Заказ` и `DOCUMENT.Заказ`, и code-скан искал эту строку, молча
+    давая ноль. На не-ссылке (член объекта) имя по-прежнему регистрозависимо."""
     tmpdir = str(tmp_path)
     _write_fo(tmpdir, "ФО_Док", ["Document.Заказ"])
     bsl = _fo_bsl(tmpdir)
     assert bsl["find_functional_options"]("Document.Заказ", include_code=False)["object"] == "Заказ"
-    assert bsl["find_functional_options"]("document.Заказ", include_code=False)["object"] == "document.Заказ"
-    assert bsl["find_functional_options"]("DOCUMENT.Заказ", include_code=False)["object"] == "DOCUMENT.Заказ"
+    assert bsl["find_functional_options"]("document.Заказ", include_code=False)["object"] == "Заказ"
+    assert bsl["find_functional_options"]("DOCUMENT.Заказ", include_code=False)["object"] == "Заказ"
+    assert bsl["find_functional_options"]("Document.Заказ.Реквизит", include_code=False)["object"] == "Заказ.Реквизит"
+    member = "document.Заказ.Реквизит"
+    assert bsl["find_functional_options"](member, include_code=False)["object"] == member
     # ...но xml_options у всех трёх одинаковы — category распознана регистронезависимо
     for raw in ("Document.Заказ", "document.Заказ", "DOCUMENT.Заказ"):
         assert _fo_names(bsl["find_functional_options"](raw, include_code=False)) == ["ФО_Док"]

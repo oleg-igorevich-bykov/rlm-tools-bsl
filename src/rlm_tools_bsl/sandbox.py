@@ -548,6 +548,9 @@ class Sandbox:
         "search_methods": (1, 30),
         "find_by_type": (2, 50),
         "find_module": (3, 50),
+        # v1.44.0: свободные места распределяются между источниками, поэтому строк меньше
+        # limit — значит, ничего не отброшено; ровно limit — возможно усечение.
+        "search": (2, 30),
     }
 
     def _note_saturation(self, name: str, args: tuple, kwargs: dict, result) -> None:
@@ -670,8 +673,8 @@ class Sandbox:
         # (4) get_index_info() at session start — its payload (builder_version/has_*/counts)
         # already ships in rlm_start.index, so a discovery call on start wastes a round-trip.
         # Gate on the MINIMAL seq of get_index_info in THIS execute: seq<=2 = 1st/2nd call of
-        # the session (start signal). A mid-session call for niche fields (has_regions/
-        # has_module_headers/extension_overrides) has a high seq → no false nudge. Throttled once.
+        # the session (start signal). A mid-session call for niche fields (has_* таблиц v16,
+        # extension_overrides) has a high seq → no false nudge. Throttled once.
         if "redundant_get_index_info" not in emitted:
             gii_seqs = [c.seq for c in self._helper_calls if c.name == "get_index_info"]
             if gii_seqs and min(gii_seqs) <= 2:
@@ -684,8 +687,9 @@ class Sandbox:
                         "trigger": f"get_index_info() as session call #{min(gii_seqs)} (payload already in rlm_start.index)",
                         "message": (
                             "builder_version/has_*/counts уже пришли в rlm_start.index (поле index) — "
-                            "не трать execute на get_index_info() на старте. has_regions/has_module_headers/"
-                            "has_extension_overrides следуют из builder_version (>= 8 / 8 / 9); число перехватов — "
+                            "не трать execute на get_index_info() на старте. Доступность таблиц v16 "
+                            "(declared_register_records, role_flags, common_module_props, constants, templates) — "
+                            "builder_version >= 16 и has_object_attributes; число перехватов — "
                             "get_overrides()['total'] (полное при partial=False)."
                         ),
                     }
@@ -733,6 +737,9 @@ class Sandbox:
                 # fix остаётся — но с оговоркой про порядок: это тот же прямой проход.
                 fix = "подними limit или сузь запрос"
                 order_note = " Порядок выдачи — не релевантность."
+            elif helper == "search":
+                fix = "сузь scope ('methods'|'objects'|'regions'|'headers'|'attributes'|'predefined') или подними limit"
+                order_note = " Строки сгруппированы по источникам."
             else:
                 fix = "подними limit или сузь запрос"
                 order_note = ""  # ранжированная выдача: усекается хвост, а не случайное

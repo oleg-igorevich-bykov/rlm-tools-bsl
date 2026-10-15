@@ -727,7 +727,7 @@ If output is truncated (ends with '... [output truncated]'), split into smaller 
 Print only summaries (counts, first N items) — never dump raw data.
 Ответ может нести 'duplicates' (тот же хелпер с теми же args дважды — переиспользуй переменную, они живут между rlm_execute)
   и 'efficiency_hints' (подсказки по батчингу/агрегатам — следуй им).
-Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index); вызов на старте = пустая трата execute (число перехватов — get_overrides()['total']).
+Не зови get_index_info на старте — builder_version/has_*/counts уже в ответе rlm_start (поле index; таблицы v16 — при builder_version>=16 и has_object_attributes); вызов на старте = пустая трата execute (число перехватов — get_overrides()['total']).
 
 Call help('keyword') for code recipes — e.g. help('exports'), help('movements'), help('flow')
 """
@@ -779,7 +779,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "НАШЕЛ Движения.X: find_register_writers('Регистр') даст static-кандидатов; Posting/CFE проверь forward, измененный после build main-файл — живьем. Набор записей helper не найдет — ищи регистр через git_search, иначе safe_grep",
             "ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 норма, но ЯВНЫЙ BSL-вызов хелперы покажут. Движения ищи через hint, call-хелперами трассируй ДЕЛЕГАТА; include_triggers — лишь CFE-перехват",
             "_meta.delegates/_total/_truncated — первая страница получателей машинно; пагинации нет",
-            "declared_registers/_total/_truncated — ОБЪЯВЛЕННЫЙ состав, ось ОТДЕЛЬНАЯ от кода; undeclared_code_registers — выведено, но не объявлено; unresolved — неразрешимо статически, пустой читай с _meta.unresolved_available",
+            "declared_registers/declared_total/declared_truncated — ОБЪЯВЛЕННЫЙ состав, ось ОТДЕЛЬНАЯ от кода; undeclared_code_registers — выведено, но не объявлено; unresolved — неразрешимо статически, пустой читай с _meta.unresolved_available",
             "analyze_document_flow('ДокИмя') → проводки + подписки + регзадания",
             "find_event_subscriptions('ДокИмя', event_filter=['BeforeWrite','OnWrite','Posting']) → подписки документа",
             "ALT: search_methods('Проведение') при нестандартном имени",
@@ -1057,7 +1057,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
             "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_* — ЧИСЛА: unique_objects/unique_methods СЧИТАЮТ ИМЕНА, unique_object_methods — ПАРЫ объект+метод",
             "target_method_line=None — валидно: метода нет в базовом модуле — обычно перехват события платформы (ПриЗаписи, ОбработкаПроведения) без обработчика в основной конфигурации; у общего модуля событий платформы нет — там это расхождение версий основной конфигурации и расширения; либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
-            "extract_procedures(path) → у перехваченных методов поле overridden_by={ext, annotation, ext_method}",
+            "extract_procedures(path) → overridden_by=[{annotation, extension_name, extension_method, extension_root, ext_module_path, ext_line}]",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
             "ALT live (без индекса): detect_extensions() + find_ext_overrides(ext_path, 'ИмяОбъекта') — на СВЕЖЕМ индексе совпадает с index по количеству; на устаревшем может расходиться (контракт: index = снимок)",
@@ -1985,9 +1985,8 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
     # Co-located nudge (v1.27.0): the counts/has_*/builder_version below ARE the get_index_info()
     # payload (rlm_start.index carries the same subset), so calling it on start wastes an execute.
     idx_lines.append(
-        "⚠️ Эти данные (builder_version/has_*/counts) уже в rlm_start.index — НЕ вызывай "
-        "get_index_info() на старте (пустая трата execute); число перехватов — "
-        "get_overrides()['total']."
+        "⚠️ builder_version/has_*/counts уже в rlm_start.index (таблицы v16 — при builder_version>=16 и "
+        "has_object_attributes) — НЕ вызывай get_index_info() на старте; число перехватов — get_overrides()['total']."
     )
     # v1.41.0: строка «INSTANT from index: …» (перечень индексных хелперов) из slim
     # убрана — она дублирует rlm_help(section='performance'), где та же раскладка

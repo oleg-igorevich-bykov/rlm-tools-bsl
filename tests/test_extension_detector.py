@@ -515,7 +515,11 @@ def test_sibling_scan_stays_linear_in_the_number_of_neighbours(tmp_path, monkeyp
     for i in range(neighbours):
         nb = parent / f"Сосед{i:02d}" / "cfg"
         nb.mkdir(parents=True)
-        (nb / "Configuration.xml").write_text(_CF_MAIN_XML, encoding="utf-8")
+        # v1.44.0: соседи — расширения: у основной конфигурации `nearby_main` теперь `None`
+        # всегда, и признак «скан работает» — число найденных расширений.
+        (nb / "Configuration.xml").write_text(
+            _cf_extension_xml(f"Расш{i:02d}", "AddOn", f"р{i:02d}_"), encoding="utf-8"
+        )
 
     own = parent / "Основная"
     own.mkdir(parents=True)
@@ -535,7 +539,7 @@ def test_sibling_scan_stays_linear_in_the_number_of_neighbours(tmp_path, monkeyp
 
     # Скан обязан РАБОТАТЬ: иначе линейность достигалась бы бездельем.
     assert ctx.current.role == ConfigRole.MAIN
-    assert ctx.nearby_main is not None, "соседи не найдены — тест перестал стеречь скан"
+    assert len(ctx.nearby_extensions) == neighbours, "соседи не найдены — тест перестал стеречь скан"
 
     quadratic = neighbours * (neighbours - 1) // 2
     assert calls <= 6 * neighbours, (

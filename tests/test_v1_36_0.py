@@ -1119,6 +1119,11 @@ def test_reader_fixtures_smoke(request, fixture_name):
 #            find_print_forms +55 (presentation|None, presentation_source, delegate,
 #            _meta.delegates), get_module_outline +16, get_object_modules +16
 #            (loc=Σ строк методов) -> факт 12 260 при пороге 12 393. Порог НЕ двигается.
+#   v1.44.0: search_module_headers +18 (header_truncated в строке выдачи) −22 (отсылка
+#            «как у search_regions» переехала в рецепт); find_register_movements +16
+#            (declared_total/declared_truncated названы полностью: суффиксная форма
+#            читалась как declared_registers_total) −8 («стр.1» про _meta.delegates
+#            переехало в рецепт) — порог НЕ двигается: факт 12 625 при пороге 12 648.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 11836 + 557
 # v1.38.0 merge re-baseline: лестница выше — величина ЧИСТОГО upstream-дерева.
 # Форк несёт СВОИ 2 локальные подписи поверх (find_role_objects 174,
@@ -1138,7 +1143,9 @@ _SIG_SUM_BUDGET_WITHOUT_GIT = 12602
 # +32 expression/kind/target_owner), call_kind (+11 в трёх хелперах), search_module_headers
 # with_text (+11) и поднял свой порог на +255; форк поднимает свой 12790 так же и затем
 # снимает точное значение на смерженном дереве.
-_SIG_SUM_BUDGET_WITHOUT_GIT = 13151
+# v1.44.0 merge re-baseline: апстрим +4 нетто (search_module_headers +18 −22,
+# find_register_movements +16 −8, см. лестницу выше); у форка запаса не было — порог +4.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 13155
 
 
 def test_sig_budget_headroom_freed_for_release():

@@ -456,6 +456,10 @@ def detect_extension_context(base_path: str) -> ExtensionContext:
             for info in infos:
                 # Avoid duplicates (same resolved path)
                 resolved_info = Path(info.path).resolve()
+                # v1.44.0: на уровне −2 каталог-предок содержит саму конфигурацию, и _detect_all
+                # находит её же — она не сосед себе (раньше nearby_main основной был ею самой).
+                if resolved_info == base:
+                    continue
                 if resolved_info not in seen_sibling_paths:
                     seen_sibling_paths.add(resolved_info)
                     siblings.append(info)
@@ -467,7 +471,10 @@ def detect_extension_context(base_path: str) -> ExtensionContext:
     # Partition siblings
     nearby_extensions = [s for s in siblings if s.role == ConfigRole.EXTENSION]
     nearby_mains = [s for s in siblings if s.role == ConfigRole.MAIN]
-    nearby_main = nearby_mains[0] if nearby_mains else None
+    # v1.44.0: «соседняя основная» имеет смысл только для расширения (и неизвестной роли). У
+    # основной конфигурации это был посторонний проект из общего каталога репозиториев или
+    # соседняя версия выгрузки — и он уезжал агенту в rlm_start.extension_context.nearby_main.
+    nearby_main = nearby_mains[0] if nearby_mains and current.role != ConfigRole.MAIN else None
 
     # Build warnings
     warnings = _build_warnings(current, nearby_extensions, nearby_main)

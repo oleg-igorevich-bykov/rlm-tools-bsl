@@ -972,6 +972,21 @@ def _parse_cf_xml(root) -> dict:
             if posting_text:
                 result["posting"] = posting_text
 
+    # v1.44.0: имена форм и команд — паритет с EDT-веткой. В выгрузке Конфигуратора форма —
+    # текстовый узел `<Form>Имя</Form>`, команда — `<Command><Properties><Name>`; прежде
+    # CF-ветка их не разбирала вовсе, и get_object_full_structure без индекса отдавал forms=[].
+    cf_forms = [el.text.strip() for el in search_el.findall("md:Form", ns) if el.text and el.text.strip()]
+    if cf_forms:
+        result["forms"] = cf_forms
+    cf_commands = []
+    for cmd_el in search_el.findall("md:Command", ns):
+        cmd_props = cmd_el.find("md:Properties", ns)
+        cmd_name = _xml_find_text(cmd_props, "md:Name", ns) if cmd_props is not None else ""
+        if cmd_name:
+            cf_commands.append(cmd_name)
+    if cf_commands:
+        result["commands"] = cf_commands
+
     if references:
         result["references"] = references
 
@@ -1157,15 +1172,20 @@ def _parse_mdo_xml(root) -> dict:
                         }
                     )
 
-    # Forms, commands — list names
+    # Forms, commands — list names. v1.44.0: в EDT это ВЛОЖЕННЫЕ блоки
+    # `<forms uuid><name>…</name>…</forms>`; прежний `ch.text` давал пробельный текст перед
+    # <name>, то есть ключ существовал и врал (на боевом документе — шесть пустых строк).
+    # Плоский текстовый узел (`<forms>Имя</forms>`) по-прежнему принимается.
     forms = []
     commands = []
     for ch in root:
         local = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
-        if local == "forms" and ch.text:
-            forms.append(ch.text.strip())
-        elif local == "commands" and ch.text:
-            commands.append(ch.text.strip())
+        if local not in ("forms", "commands"):
+            continue
+        name = _xml_direct_text(ch, "name") or (ch.text or "").strip()
+        if not name:
+            continue
+        (forms if local == "forms" else commands).append(name)
     if forms:
         result["forms"] = forms
     if commands:
