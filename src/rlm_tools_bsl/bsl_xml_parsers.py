@@ -304,14 +304,55 @@ def type_set_category(token: str) -> str:
     рядом с существующим и на ``ConstantValueManager`` давало бы ``ConstantValue``,
     которого нет ни в одной карте.
 
-    Пустая строка = токен вне карты. На двух боевых конфигурациях таких ровно три:
-    ``SequenceRecordSet``, ``RecalculationRecordSet``, ``DocumentJournalManager``.
+    Пустая строка = токен вне карты. На всех десяти боевых индексах таких ровно три:
+    ``SequenceRecordSet``, ``RecalculationRecordSet``, ``DocumentJournalManager``. Их состав известен по
+    определению (наборы записей последовательностей и перерасчётов, менеджеры журналов), поэтому
+    ``match_type_sets`` сверяет их голову по ``_SET_TOKEN_EXTRA_HEADS`` (v1.45.0), а не отдаёт в
+    ``unresolved``; категорией объекта эта карта не становится.
     """
     canon = canonicalize_type_ref(f"{(token or '').strip()}.X")
     if not canon.endswith(".X"):
         return ""
     head = canon[:-2]
     return "" if head == "DefinedType" else head
+
+
+_FORM_REF_KINDS = frozenset({"default_object_form", "default_list_form", "main_form", "list_form"})
+
+
+def normalize_used_in(used_in: str, ref_kind: str) -> str:
+    """Суффикс ``used_in`` в написании выгрузки Конфигуратора (v1.45.0, Д24) — полная строка или сам суффикс.
+
+    EDT-разбор строил суффикс как ``tag.capitalize()`` и ``f"{tag}={…}"``: ``….Basedon`` и
+    ``….defaultObjectForm=…`` против CF ``….BasedOn`` и ``….DefaultObjectForm=…`` — одна конфигурация в двух
+    форматах давала разные строки. У ``based_on`` хвост ``Basedon`` → ``BasedOn``; у видов форм первая буква
+    имени тега перед ``=`` — прописная; прочее — как есть. Идемпотентна: ею же пишет EDT-разбор и
+    нормализуют строки ридеры индекса, собранного до релиза."""
+    if not used_in:
+        return used_in
+    if ref_kind == "based_on":
+        if used_in == "Basedon":
+            return "BasedOn"
+        if used_in.endswith(".Basedon"):
+            return used_in[: -len("Basedon")] + "BasedOn"
+        return used_in
+    if ref_kind in _FORM_REF_KINDS and "=" in used_in:
+        left, right = used_in.split("=", 1)
+        head, _, tag = left.rpartition(".")
+        if tag and tag[0].islower():
+            tag = tag[0].upper() + tag[1:]
+            return f"{head}.{tag}={right}" if head else f"{tag}={right}"
+    return used_in
+
+
+# v1.45.0 (Д21): наборы вне карты категорий с ИЗВЕСТНЫМ составом — голова объекта, который в набор входит.
+# Совпала с головой спрошенного объекта — `matched`; не совпала — строка к объекту не относится (раньше
+# такой токен уходил в `unresolved` у ЛЮБОГО объекта, и вопрос «не закрыт» висел у справочников и документов).
+_SET_TOKEN_EXTRA_HEADS = {
+    "sequencerecordset": "Sequence",
+    "recalculationrecordset": "Recalculation",
+    "documentjournalmanager": "DocumentJournal",
+}
 
 
 def match_type_sets(
@@ -330,8 +371,8 @@ def match_type_sets(
 
     Returns:
         ``(matched, unresolved)``. ``unresolved`` — токены, по которым вопрос НЕ
-        закрыт (набора нет в карте, определяемый тип неизвестен либо категорию
-        спрошенного объекта разрешить не удалось). Молчание здесь хуже отказа:
+        закрыт (набора нет ни в карте, ни в ``_SET_TOKEN_EXTRA_HEADS``, определяемый тип
+        неизвестен либо категорию спрошенного объекта разрешить не удалось). Молчание здесь хуже отказа:
         сегодня такая строка либо ложно ``universal``, либо исчезает совсем.
     """
     matched: list[str] = []
@@ -352,7 +393,7 @@ def match_type_sets(
             elif any((m or "").lower() in refs_lower for m in members):
                 matched.append(t)
             continue
-        head = type_set_category(t)
+        head = type_set_category(t) or _SET_TOKEN_EXTRA_HEADS.get(t.casefold(), "")
         if not head:
             unresolved.append(t)
         elif head.lower() in heads_lower:
@@ -378,6 +419,11 @@ def classify_subscription_row(
     разойдутся, как уже расходились ветки индекса и live.
 
     Порядок: ``exact`` (по типу) → ``set`` → ``partial`` → ``universal``.
+
+    v1.45.0: набор вне карты категорий с известным составом (``SequenceRecordSet``,
+    ``RecalculationRecordSet``, ``DocumentJournalManager`` — ``_SET_TOKEN_EXTRA_HEADS``) у объекта своей
+    головы — ``set``/``set``, у прочих объектов строки нет; ``set_unresolved`` — только у токенов, чей
+    состав неизвестен.
 
     Returns:
         ``(scope, matched_via, matched_types, matched_sets)`` либо ``None``, если
@@ -1227,7 +1273,8 @@ def _parse_mdo_xml(root) -> dict:
                         {
                             "ref_object": canon,
                             "ref_kind": ref_kind,
-                            "used_in_suffix": tag.capitalize(),
+                            # v1.45.0 (Д24): написание CF (`BasedOn`, а не `Basedon`)
+                            "used_in_suffix": normalize_used_in(tag.capitalize(), ref_kind),
                         }
                     )
 
@@ -1248,7 +1295,8 @@ def _parse_mdo_xml(root) -> dict:
                         {
                             "ref_object": canon,
                             "ref_kind": ref_kind,
-                            "used_in_suffix": f"{tag}={text}",
+                            # v1.45.0 (Д24): написание CF (`DefaultObjectForm=…`, а не `defaultObjectForm=…`)
+                            "used_in_suffix": normalize_used_in(f"{tag}={text}", ref_kind),
                         }
                     )
 
@@ -2561,6 +2609,54 @@ def parse_object_commands_parameter_types(mdo_text: str) -> list[dict]:
                     if canon:
                         out.append({"command_name": name, "ref_object": canon})
     return out
+
+
+def parse_document_journal(content: str) -> dict | None:
+    """Журнал документов (v1.45.0): ``{registered: [канонические ссылки], commands: [имена]}``.
+
+    CF — ``<RegisteredDocuments><xr:Item>`` в свойствах и ``<ChildObjects><Command>``; EDT —
+    ``<registeredDocuments>`` и ``<commands><name>`` у корня ``mdclass:DocumentJournal``. Не журнал или
+    битый XML — ``None``. Колонки журнала (``<Column>``/``<columns>``) командами не считаются."""
+    if not content:
+        return None
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return None
+
+    def _local(el) -> str:
+        return el.tag.split("}")[-1] if "}" in el.tag else el.tag
+
+    registered: list[str] = []
+    commands: list[str] = []
+    if _local(root) == "DocumentJournal":  # EDT
+        for ch in root:
+            local = _local(ch)
+            if local == "registeredDocuments" and ch.text:
+                canon = canonicalize_type_ref(ch.text.strip(), fold_case=False)
+                if canon:
+                    registered.append(canon)
+            elif local == "commands":
+                name = _xml_direct_text(ch, "name")
+                if name:
+                    commands.append(name)
+        return {"registered": registered, "commands": commands}
+    journal = root.find("md:DocumentJournal", _NS_CF)
+    if journal is None:
+        return None
+    props = journal.find("md:Properties", _NS_CF)
+    reg_el = props.find("md:RegisteredDocuments", _NS_CF) if props is not None else None
+    for item in reg_el.findall("xr:Item", _NS_CF) if reg_el is not None else []:
+        canon = canonicalize_type_ref((item.text or "").strip(), fold_case=False)
+        if canon:
+            registered.append(canon)
+    children = journal.find("md:ChildObjects", _NS_CF)
+    for cmd_el in children.findall("md:Command", _NS_CF) if children is not None else []:
+        cmd_props = cmd_el.find("md:Properties", _NS_CF)
+        name = _xml_find_text(cmd_props, "md:Name", _NS_CF) if cmd_props is not None else ""
+        if name:
+            commands.append(name)
+    return {"registered": registered, "commands": commands}
 
 
 _NS_RIGHTS_VERSIONS = [

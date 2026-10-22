@@ -90,25 +90,22 @@ from rlm_tools_bsl.bsl_index import (
     OLD_INDEX_GAPS,
     IndexReader,
     IndexStatus,
+    categories_changed_since,
     check_index_usable,
+    content_sample_check,
     describe_index_root,
     get_index_db_path,
     index_incomplete,
     index_root_diagnostics,
+    index_status_label,
     stats_indicate_load_failure,
 )
 from rlm_tools_bsl.sandbox import HelperCall
 
 logging.basicConfig(level=logging.INFO, encoding="utf-8")
 
-# rlm_start.index "index_status" — stable machine-readable contract (codex round 16/22/24):
-# explicit IndexStatus→string map (FRESH.value is "fresh", we expose "ok" to mirror
-# get_index_info.status); plain STALE/MISSING → "missing"; incomplete handled separately.
-_INDEX_STATUS_LABELS = {
-    IndexStatus.FRESH: "ok",
-    IndexStatus.STALE_AGE: "stale_age",
-    IndexStatus.STALE_CONTENT: "stale_content",
-}
+# rlm_start.index "index_status" — метка `bsl_index.index_status_label` (v1.45.0: карта переехала в
+# bsl_index, чтобы get_index_info называл свежесть тем же правилом).
 logger = logging.getLogger(__name__)
 
 # v1.41.0: инструкция сервера — не больше 220 символов (задача 9 плана): предпочтение
@@ -577,6 +574,8 @@ def _create_session_backend(
     current_config_name: str = "",
     current_config_root: str = "",
     extension_name_by_root: dict[str, str] | None = None,
+    index_start_status: dict | None = None,
+    main_config_root: str = "",
 ):
     """Фабрика backend по режиму (§5.2): выбор делается один раз при rlm_start,
     дальше server не ветвится по типу backend.
@@ -588,7 +587,9 @@ def _create_session_backend(
 
     Роль/имя/current-root/карта имён расширений (v1.34.0) уже вычислены сервером
     через ``detect_extension_context`` и едут JSON-safe примитивами — внутри
-    сессии detector не повторяется."""
+    сессии detector не повторяется. Тем же путём (v1.46.0, П11) едет
+    ``main_config_root`` — корень основной рядом с расширением в сессии на
+    расширении: по нему хелперы судят о существовании объектов основной."""
     # Защитная проверка топологии корней ДО создания backend: на активном
     # BSL-пути пересекающиеся base/ext дали бы двойной учёт одного дерева.
     # В generic-режиме валидация не выполняется — provenance там не используется.
@@ -609,6 +610,7 @@ def _create_session_backend(
             db_path=str(db_path) if idx_reader is not None else None,
             index_expected=idx_reader is not None,
             idx_zero_callers_authoritative=callers_authoritative,
+            index_start_status=index_start_status,
             extension_paths=ext_paths_for_sandbox,
             enable_bsl_helpers=enable_bsl_helpers,
             max_llm_calls=session.max_llm_calls,
@@ -617,6 +619,7 @@ def _create_session_backend(
             current_config_name=current_config_name,
             current_config_root=current_config_root,
             extension_name_by_root=dict(extension_name_by_root or {}),
+            main_config_root=main_config_root,
         )
 
         def _startup_unregister(candidate) -> None:
@@ -646,12 +649,14 @@ def _create_session_backend(
         format_info=format_info,
         idx_reader=idx_reader,
         idx_zero_callers_authoritative=callers_authoritative,
+        index_start_status=index_start_status,
         extension_paths=ext_paths_for_sandbox,
         enable_bsl_helpers=enable_bsl_helpers,
         current_config_role=current_config_role,
         current_config_name=current_config_name,
         current_config_root=current_config_root,
         extension_name_by_root=dict(extension_name_by_root or {}),
+        main_config_root=main_config_root,
         # v1.40.0: ОДНА аренда общего бюджета обхода на все inline-сессии процесса.
         # Сессии она не принадлежит, поэтому закрытию backend-а освобождать нечего.
         scan_lease=get_scan_ledger().inline_lease(),
@@ -700,6 +705,24 @@ def _start_extension_warnings(ext_context, ext_total: int, ext_shown: int) -> li
             "extension_context.nearby_extensions; complete list — detect_extensions()."
         ]
     return [f"{ext_total} extension(s) detected near main config — see extension_context.nearby_extensions."]
+
+
+def _stale_age_sample_note(sample: str, files: int, has_calls: bool, graph_authoritative: bool) -> str:
+    """Хвост предупреждения о возрасте индекса (v1.45.0, Р1): итог выборочной сверки и — по
+    ВЫЧИСЛЕННОЙ авторитетности графа, а не по итогу сверки — фраза о графе вызовов."""
+    if sample == "ok":
+        note = f"; выборочная сверка содержимого ({files} файлов): совпадает"
+    elif sample == "skipped":
+        note = "; выборочная сверка не проводится (модулей меньше RLM_INDEX_SAMPLE_THRESHOLD)"
+    elif sample == "mismatch":
+        note = f"; выборочная сверка содержимого ({files} файлов): расходится — rlm-bsl-index index update"
+    else:
+        note = "; выборочная сверка содержимого недоступна"
+    if graph_authoritative:
+        note += " — граф вызовов авторитетен"
+    elif not has_calls:
+        note += " — графа вызовов в индексе нет: ноль вызывающих проверяется обходом файлов"
+    return note
 
 
 def _session_warnings(source_support: SourceSupport, ext_warnings: list[str]) -> list[str]:
@@ -1048,6 +1071,11 @@ def _rlm_start(
         # report "incomplete" (retry) rather than "missing" even if the marker was already
         # cleared by a finishing rebuild (codex Low).
         idx_load_failed = False
+        # v1.45.0 (Р1): на stale_age граф вызовов авторитетен по выборочной сверке mtime/size
+        # (совпала либо не проводится из-за порога числа модулей) и при наличии графа в индексе.
+        stale_age_graph_authoritative = False
+        # v1.45.0 (Д29): итог выборочной сверки СТАРТА — едет в сессию (get_index_info)
+        start_content_sample = "not_checked"
         # Computed BEFORE the try (round 27): the no-stats index_block branch below uses
         # db_path for index_incomplete(); get_index_db_path is a pure path construction.
         db_path = get_index_db_path(resolved)
@@ -1085,13 +1113,42 @@ def _rlm_start(
                         if idx_status == IndexStatus.STALE_AGE:
                             built_at = idx_stats.get("built_at")
                             age_days = int((time.time() - float(built_at)) / 86400) if built_at else "?"
+                            sample, sample_files = content_sample_check(db_path, resolved)
+                            start_content_sample = sample
+                            has_calls = bool(idx_reader.has_calls)
+                            stale_age_graph_authoritative = has_calls and sample in ("ok", "skipped")
                             idx_warnings.append(
                                 f"Index is {age_days} days old — verify critical findings with live read_file()"
+                                + _stale_age_sample_note(sample, sample_files, has_calls, stale_age_graph_authoritative)
+                            )
+                            logger.info(
+                                "rlm_start: session=%s content_sample=%s files=%d graph_authoritative=%s",
+                                session_id,
+                                sample,
+                                sample_files,
+                                stale_age_graph_authoritative,
                             )
                         elif idx_status == IndexStatus.STALE_CONTENT:
                             idx_warnings.append(
                                 "Index content may be outdated — run 'rlm-bsl-index index update' to refresh"
                             )
+                        # v1.46.0 (Д16, П3 — V1): каталоги категорий, изменённые после сборки, — `stat` против
+                        # `built_at`. Время каталога растёт, когда объект добавлен или удалён, но и когда описатель
+                        # перезаписан (git checkout/pull пересоздаёт файлы), поэтому текст — «мог измениться», без
+                        # утверждения о новых объектах (ревью 1.46.0). Статус `ok` полноты не доказывал:
+                        # у молодого индекса выборка не делается, а структурный дрейф не проверялся вовсе.
+                        # `index_status` не меняется; `update` переписывает `built_at` — ложного повтора нет.
+                        drift_built_at = idx_stats.get("built_at")
+                        drift = categories_changed_since(resolved, float(drift_built_at)) if drift_built_at else []
+                        if drift:
+                            idx_warnings.append(
+                                f"После сборки индекса мог измениться состав категорий: {', '.join(drift)} (каталог "
+                                "категории изменен: объект добавлен, удален или его описатель перезаписан — так делают "
+                                "и git checkout/pull) — индекс может отставать; вложенную подсистему и модуль, "
+                                "добавленный в существующий объект, эта проверка не видит. Обновить индекс: "
+                                f'rlm-bsl-index index update "{resolved}"'
+                            )
+                            logger.warning("rlm_start: session=%s category_drift=%s", session_id, ",".join(drift))
                         # Check index builder version
                         idx_version = int(idx_stats.get("builder_version") or 0)
                         if idx_version < BUILDER_VERSION:
@@ -1198,8 +1255,24 @@ def _rlm_start(
         if sandbox_mode == "inline" and os.environ.get("RLM_LLM_BASE_URL"):
             threading.Thread(target=warmup_openai_import, daemon=True).start()
 
-        # Determine if index is authoritative for zero-callers results
-        _callers_authoritative = idx_status == IndexStatus.FRESH and idx_reader is not None and idx_reader.has_calls
+        # Determine if index is authoritative for zero-callers results. v1.45.0 (Р1): stale_age —
+        # по выборочной сверке, посчитанной при открытии ридера (stale_age_graph_authoritative).
+        _callers_authoritative = idx_reader is not None and (
+            (idx_status == IndexStatus.FRESH and idx_reader.has_calls)
+            or (idx_status == IndexStatus.STALE_AGE and stale_age_graph_authoritative)
+        )
+
+        # v1.45.0 (Д29): метка свежести и итог выборки СТАРТА — в сессию тем же каналом, что
+        # callers_authoritative: get_index_info отдаёт их, а не тянет случайную выборку заново (иначе на
+        # частично разошедшемся индексе метка хелпера расходилась со стартом и «прыгала» между вызовами).
+        _index_start_status = (
+            {
+                "index_status": index_status_label(idx_status, reader_loaded=True, incomplete=False),
+                "content_sample": start_content_sample,
+            }
+            if idx_reader is not None
+            else None
+        )
 
         t_step = time.monotonic()
         # Foundation-фильтр (v1.34.0): directory symlink/junction рядом с базой
@@ -1216,6 +1289,13 @@ def _rlm_start(
         )
         ext_paths_for_sandbox = [e.path for e in _nearby_for_bsl]
         ext_name_by_root = {e.path: e.name for e in _nearby_for_bsl if e.path and e.name}
+        # v1.46.0 (П11): корень основной рядом с расширением — в сессию на расширении (только для проверки
+        # существования объектов основной; повторный детект внутри сессии запрещён).
+        _main_root_for_bsl = (
+            ext_context.nearby_main.path
+            if ext_context.current.role == ConfigRole.EXTENSION and ext_context.nearby_main is not None
+            else ""
+        )
         backend, parent_owns_reader = _create_session_backend(
             sandbox_mode=sandbox_mode,
             resolved=resolved,
@@ -1226,6 +1306,7 @@ def _rlm_start(
             idx_reader=idx_reader,
             db_path=db_path,
             callers_authoritative=_callers_authoritative,
+            index_start_status=_index_start_status,
             ext_paths_for_sandbox=ext_paths_for_sandbox,
             registry_epoch=registry_epoch,
             enable_bsl_helpers=not generic_mode,
@@ -1233,6 +1314,7 @@ def _rlm_start(
             current_config_name=ext_context.current.name or "",
             current_config_root=_current_root_for_bsl,
             extension_name_by_root=ext_name_by_root,
+            main_config_root=_main_root_for_bsl or "",
         )
         _drain_startup_log_records(session_id, backend)
         if not parent_owns_reader:
@@ -1448,14 +1530,16 @@ def _rlm_start(
             "config_version": idx_stats.get("config_version"),
             # Reader loaded → map the freshness status (FRESH→"ok"). The with-stats branch
             # is only reached for FRESH/STALE_AGE/STALE_CONTENT, so .get default is unused.
-            "index_status": _INDEX_STATUS_LABELS.get(idx_status, "ok"),
+            "index_status": index_status_label(idx_status, reader_loaded=True, incomplete=False),
             "warnings": idx_warnings,
         }
     else:
         # No index loaded — SAME key set with safe defaults so the payload shape is stable
         # (strategy/docs tell the agent to read these from rlm_start.index; a missing key
         # would break that or push agents back to a get_index_info() call).
-        _incomplete_status = "incomplete" if (index_incomplete(db_path) or idx_load_failed) else "missing"
+        _incomplete_status = index_status_label(
+            idx_status, reader_loaded=False, incomplete=index_incomplete(db_path) or idx_load_failed
+        )
         if _incomplete_status == "incomplete":
             # v1.33.0: раньше здесь выставлялся только машинный index_status, а
             # idx_warnings оставался пустым — человек и агент об оборванной сборке
@@ -1591,6 +1675,8 @@ def _rlm_start(
             "max_llm_calls": session.max_llm_calls,
             "max_execute_calls": session.max_execute_calls,
             "execution_timeout_seconds": execution_timeout_seconds,
+            # v1.45.0 (Д30): лимит вывода rlm_execute — тот, по которому режется print.
+            "max_output_chars": max_output_chars,
             # §16.2: агент/оператор обязаны видеть, включена ли процессная
             # изоляция — в inline hard-kill таймаута не гарантируется.
             "sandbox_mode": backend.mode,

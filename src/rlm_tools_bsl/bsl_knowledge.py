@@ -482,8 +482,9 @@ index-домена (синонимы, ссылки метаданных) пол�
 (disabled|build_unproven|wider_than_current|unavailable|not_used). owner ('main' |
 'extension:<Имя>') — провенанс СТРОКИ. scope — legacy-композит, полноту по нему не судят.
 СВЕЖЕСТЬ — МАТРИЦА, не иерархия: index_status=missing/incomplete → собери индекс;
-stale_content → index update; stale_age → только календарь, сверь критичное живьём;
-ok полноты НЕ доказывает (структурный дрейф не проверяется никогда);
+stale_content → index update; stale_age → календарь (выборка — в warnings: совпала/не проводится —
+граф вызовов авторитетен), сверь критичное живьём;
+ok полноты НЕ доказывает (дрейф виден лишь по каталогам категорий);
 index_coverage=disabled → домен не строился, пересобери с нужной опцией;
 unavailable|wider_than_current → строки годны, полнота не доказана; partial=True →
 неполон ИМЕННО этот ответ (см. _meta.reasons). index_status — снимок СЕССИИ, а
@@ -767,7 +768,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "search_objects('ДокИмя') → найти документ по бизнес-имени",
             "get_object_profile('ДокИмя') → за 1 вызов: регистры (registers) + подписки (subscriptions) + структура + модули + роли",
             "code_registers=0 ≠ непроводимый: при posting_handler_present движения могут писать делегаты (а могут и не писаться) — проверь hint и найденные тела. Непроводимый — только find_register_movements('ДокИмя').is_postable=False. ОбработкаПроведения зовет ПЛАТФОРМА: callers=0 — норма, но ЯВНЫЙ BSL-вызов хелперы покажут; call-хелперами трассируй делегата из hint",
-            "метка получателя в hint — ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН: модуль по имени не угадывай, одноименный отдаст ЧУЖОЕ тело; category=='CommonModules' после module_hint='ОбщийМодуль.X' не подтверждение — ТАВТОЛОГИЯ его фильтра",
+            "метка получателя в hint — ПЕРЕМЕННАЯ/РЕКВИЗИТ/НЕ ОПОЗНАН: модуль по имени не угадывай, одноименный отдаст ЧУЖОЕ тело; category=='CommonModules' после module_hint='ОбщийМодуль.X' не подтверждение — ТАВТОЛОГИЯ его фильтра; пояснение вида — у первого делегата этого вида",
             "поток целиком → get_object_profile('ДокИмя', include_flow=True)",
         ],
         "full": [
@@ -898,8 +899,9 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "full": [
             "res = find_references_to_object('Справочник.ВидыПодарочныхСертификатов')  # метаданные-XML",
             "print(res['by_kind'], res['total'])",
+            "Голое имя — ссылка единственной категории (_meta.resolved_ref); омоним — ValueError",
             "Filter by kind: find_references_to_object('Справочник.Х', kinds=['attribute_type'])",
-            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст",
+            "_meta.kinds_applied — что применено ПОСЛЕ выбора маршрута; unsupported_kinds — LIVE, на index пуст; _meta.expanded_on_read — раскрыто при чтении",
             "Членство в подсистемах: find_references_to_object('Документ.Х', kinds=['subsystem_content']); на устаревшем индексе состав подсистем мог измениться — проверь live (rlm_index build)",
             "code = find_code_usages('Документ.ПриобретениеТоваровУслуг')  # обращения в коде",
             "print(code['by_kind'])  # {'manager':.., 'ref_type':.., 'query':..}; u['member'] = имя ТЧ для query",
@@ -907,7 +909,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "Полная картина одним вызовом: find_references_to_object('Документ.Х', include_code=True) → + ключи code_*",
             "Если res['partial'] / code['partial'] — индекс старый, запустить rlm_index(action='build')",
             "Если объект упоминается через DefinedType — find_defined_types('ИмяТипа') раскроет составляющие; затем find_references_to_object('DefinedType.Имя') найдёт обратные использования",
-            "Аналог конфигуратора 'Найти ссылки' (XML — issue #10; код — v1.14.0). Код расширений вне индекса.",
+            "Аналог конфигуратора 'Найти ссылки'. Код расширений вне индекса.",
         ],
         "code_hint": (
             "# 1) Декларативные ссылки из метаданных-XML:\n"
@@ -1012,19 +1014,19 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "find_call_hierarchy('ПроцИмя', direction='callers', depth=2) → транзитивные вызывающие на 2 уровня",
             "Одноимённый ОБЪЕКТНЫЙ метод (ЗаполнитьДокумент) → module_hint=find_module('X')[i]['path']: rel_path — ТОЧНАЯ форма, 'Документ.X' задаёт лишь ОБЪЕКТ",
-            "ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 это НОРМА, а не мертвый код. По имени хелпер их НЕ исключает — ЯВНЫЙ вызов из BSL он ПОКАЖЕТ; но движения так не найти: читай тело и трассируй ДЕЛЕГАТА → рецепт «проведение»",
+            "ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 это НОРМА, а не мертвый код. По имени хелпер их НЕ исключает — ЯВНЫЙ вызов из BSL он ПОКАЖЕТ; но движения так не найти: читай тело и трассируй ДЕЛЕГАТА → рецепт «проведение»; неэкспортную зовут только из своего модуля",
             "Экспортный метод общего модуля с уникальным во всей БД именем → hint не нужен (exact сам); если root_exact=False — имя неуникально, пинь rel_path",
             "Для одного уровня + контекст строк используй find_callers_context('ПроцИмя')",
             "direction='callees' пока не поддерживается (возвращает error-dict с hint)",
         ],
         "full": [
             "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint=find_module('РеализацияТоваровУслуг')[i]['path'], depth=2) → одноимённый ОБЪЕКТНЫЙ метод",
-            "ПЛАТФОРМЕННЫЕ обработчики модуля объекта (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код, и module_hint этого не лечит. НО по имени хелпер обработчики НЕ исключает: если BSL-код где-то ЯВНО зовет ОбработкаПроведения(...), такое ребро в индексе ЕСТЬ и хелпер его ПОКАЖЕТ — не игнорируй его. Просто ЧЕМ пишутся движения, так не найти: трассируй ДЕЛЕГАТА из тела обработчика → рецепт «проведение». include_triggers ребра «зовет платформа» не добавит (такого edge_type нет), но CFE-перехват самого обработчика ПОКАЖЕТ",
+            "ПЛАТФОРМЕННЫЕ обработчики модуля объекта (ОбработкаПроведения, ПередЗаписью, ПриЗаписи, ОбработкаЗаполнения): вызов от ПЛАТФОРМЫ в граф ВЫЗОВОВ не попадает → callers=0 это НОРМА, а не мертвый код, и module_hint этого не лечит. НО по имени хелпер обработчики НЕ исключает: если BSL-код где-то ЯВНО зовет ОбработкаПроведения(...), такое ребро в индексе ЕСТЬ и хелпер его ПОКАЖЕТ — не игнорируй его. Просто ЧЕМ пишутся движения, так не найти: трассируй ДЕЛЕГАТА из тела обработчика → рецепт «проведение». include_triggers ребра «зовет платформа» не добавит (такого edge_type нет), но CFE-перехват самого обработчика ПОКАЖЕТ. Неэкспортную зовут только из своего модуля",
             "module_hint=rel_path привязывает КОРЕНЬ к ОДНОМУ модулю → exact; 'Документ.X'/голое имя — лишь при уникальном в объекте имени",
             "Формы hint: rel_path (ТОЧНАЯ) | 'Документ.X' | голое имя — две последние задают лишь ОБЪЕКТ: exact только если имя в нём уникально",
-            "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows, node['meta'].target_exact, node['target_key']=rel_path::метод",
+            "Доверие: _meta.root_exact (включился ли exact на корне), _meta.exact_rows/fallback_rows (у узла — node['meta']; target_exact — лишь цель), node['target_key']=rel_path::метод",
             "Дерево по узлам: tree['tree'][i] = {name, target_hint, target_key, meta, callers}",
-            "tree['truncated_targets'] — список узлов с >200 callers (популярные имена)",
+            "tree['truncated_targets'] — список узлов с >200 callers (популярные имена); добор — с node['target_hint'], не ''",
             "tree['visited'] — общее число уникальных узлов в обходе",
             "БЕЗ hint для одноимённого объектного метода exact на корне НЕ включится → _meta.root_exact=False, раскроет всех носителей по имени",
             "_meta.node_budget_exceeded=True → широкий корень без hint упёрся в visited_cap, дерево частичное; hint и точнее, и ограничивает обход",
@@ -1035,11 +1037,10 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "# NB: корень — метод, который РЕАЛЬНО зовут из BSL: у платформенного callers=0.\n"
             "hint = [m['path'] for m in find_module('РеализацияТоваровУслуг') if m['module_type'] == 'ObjectModule'][0]\n"
             "tree = find_call_hierarchy('ЗаполнитьДокумент', module_hint=hint, depth=2)  # rel_path — ТОЧНАЯ форма\n"
-            "m = tree.get('_meta', {})\n"
-            "print(f\"root_exact={m.get('root_exact')} exact_rows={m.get('exact_rows')} fallback_rows={m.get('fallback_rows')}\")\n"
-            "for node in tree.get('tree', []):\n"
-            "    mark = 'EXACT' if node['meta']['target_exact'] else 'name'\n"
-            "    print(f\"{node['name']} [{mark}] ({len(node.get('callers', []))} callers)\")\n"
+            "for node in tree.get('tree', []):  # метка — по РЕБРАМ узла, первый — корень\n"
+            "    x = node['meta']\n"
+            "    mark = 'смешанно' if x['exact_rows'] and x['fallback_rows'] else 'точно' if x['exact_rows'] else 'по имени'\n"
+            "    print(f\"{node['name']} [ребра: {mark}; цель: {x['target_exact']}] ({len(node.get('callers', []))} callers)\")\n"
             "    for caller in node.get('callers', [])[:5]:\n"
             "        print(f\"  ← {caller['caller_name']} ({caller['object_name']} {caller['module_path']}:{caller['line']})\")"
         ),
@@ -1057,7 +1058,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "get_overrides('ИмяОбъекта') → перехваты объекта; row.extension_file исполним в read_procedure",
             "by_annotation/by_object_top/by_extension_top — DICT {имя: количество} (top-20 у двух последних): итерируй .items(), срез — list(d.items())[:N]; это НЕ список записей. unique_* — ЧИСЛА: unique_objects/unique_methods СЧИТАЮТ ИМЕНА, unique_object_methods — ПАРЫ объект+метод",
             "target_method_line=None — валидно: метода нет в базовом модуле — обычно перехват события платформы (ПриЗаписи, ОбработкаПроведения) без обработчика в основной конфигурации; у общего модуля событий платформы нет — там это расхождение версий основной конфигурации и расширения; либо строка без source-привязки. Не считай это ошибкой индекса и не перепроверяй",
-            "extract_procedures(path) → overridden_by=[{annotation, extension_name, extension_method, extension_root, ext_module_path, ext_line}]",
+            "extract_procedures(path) → overridden_by=[{annotation, extension_name, extension_method, extension_root, ext_module_path, ext_line, extension_file}]",
             "read_procedure(path, name) → ТОЛЬКО оригинал (по умолчанию, без перехватов)",
             "read_procedure(path, name, include_overrides=True) → оригинал + секция «=== Перехвачен &Аннотация в расширении ИмяРасш ===»",
             "ALT live (без индекса): detect_extensions() + find_ext_overrides(ext_path, 'ИмяОбъекта') — на СВЕЖЕМ индексе совпадает с index по количеству; на устаревшем может расходиться (контракт: index = снимок)",
@@ -1085,7 +1086,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
         "compact": [
             "if 'error' in res (find_path): имя многозначно (определено в >1 модуле) без своего hint → добавь to_hint/from_hint = res['candidates'][i]['file'] (это rel_path — ТОЧНАЯ форма); проверяй ПЕРЕД found/budget_exceeded",
             "find_path('МетодА', 'МетодБ') → есть ли путь вызовов from→to (forward)",
-            "found=False + _meta.budget_exceeded → обход обрезан, сузь max_depth/дай hint",
+            "found=False + _meta.budget_exceeded → обход обрезан: res['hint'] — исполнимый добор; сузь max_depth/дай hint",
             "find_call_hierarchy('Метод', include_triggers=True) → callers + триггеры (подписки/формы/рег.задания/CFE)",
         ],
         "full": [
@@ -1095,7 +1096,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "одноимённые методы → from_hint/to_hint: rel_path ТОЧЕН, 'Документ.X'/object_name — лишь ОБЪЕКТ",
             "call_line элемента пути = строка ВЫЗОВА к СЛЕДУЮЩЕМУ узлу (ребро), НЕ определения; у терминального (to) None",
             "find_call_hierarchy('Метод', module_hint=find_module('X')[i]['path'], include_triggers=True) → дерево callers + не-call триггеры на КАЖДОМ узле",
-            "_meta.budget_exceeded=True → обход упёрся в visited_cap, found=False НЕ доказывает отсутствие пути",
+            "_meta.budget_exceeded=True → visited_cap ИЛИ узел >1 страницы callers (_meta.truncated_nodes; прямое ребро к from проверено по всем), found=False НЕ доказывает отсутствие пути; добор — res['hint']",
             "ALT: find_callers_context('Метод') для одного уровня callers с контекстом строк и file:line",
         ],
     },
@@ -1111,7 +1112,7 @@ _BUSINESS_RECIPES: dict[str, dict[str, list[str]]] = {
             "каждый элемент path = РЕБРО {from, to, kind, used_in, path, line}",
             "kinds=[...] → ограничить виды ссылок (attribute_type, owner, based_on, subsystem_content, ...)",
             "partial=True → нет таблицы metadata_references (старый индекс) — нужен ребилд",
-            "_meta.budget_exceeded=True → обход упёрся в node_budget (~400), сузь max_depth",
+            "_meta.budget_exceeded=True → node_budget (~400) ИЛИ узел не последнего уровня с ≥1000 ссылок (_meta.truncated_nodes; прямая ссылка на to проверена); маршрут — res['hint']",
             "ALT: find_references_to_object('Справочник.X') → все ВХОДЯЩИЕ ссылки на объект (обратное направление, 1 уровень)",
         ],
     },
@@ -1630,7 +1631,7 @@ def _build_full_strategy(
             "INDEX TIPS:",
             "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
             "  - НО module_hint — это ТОЧНОСТЬ, не скорость. Точная форма — rel_path: module_hint=find_module('X')[i]['path'] привязывает корень к ОДНОМУ модулю (exact по callee_key). 'Документ.X' и голое имя задают лишь ОБЪЕКТ: exact — только если имя внутри него уникально, иначе корень берётся произвольно, а типизированный hint не сужает вовсе.",
-            "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение').",
+            "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение'). Неэкспортную зовут только из своего модуля.",
             "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
             "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
             "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",
@@ -2008,7 +2009,7 @@ def _render_index_block(idx_stats: dict | None, idx_warnings: list[str] | None) 
         "INDEX TIPS:",
         "  - find_callers_context() returns instantly — для СКОРОСТИ scope-hint не нужен, ищи по всей кодовой базе.",
         "  - НО module_hint — это ТОЧНОСТЬ, не скорость. Точная форма — rel_path: module_hint=find_module('X')[i]['path'] привязывает корень к ОДНОМУ модулю (exact по callee_key). 'Документ.X' и голое имя задают лишь ОБЪЕКТ: exact — только если имя внутри него уникально, иначе корень берётся произвольно, а типизированный hint не сужает вовсе.",
-        "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение').",
+        "  - ПЛАТФОРМЕННЫЕ обработчики (ОбработкаПроведения, ПередЗаписью): вызов от ПЛАТФОРМЫ в граф не попадает → callers=0 норма, не мертвый код (ЯВНЫЙ BSL-вызов хелпер покажет). Движения ищи не тут: rlm_help(topic='проведение'). Неэкспортную зовут только из своего модуля.",
         "  - Batch 5-10 helpers per rlm_execute (index calls are <1ms each).",
         "  - extract_procedures + find_exports + find_callers_context in ONE call is fine.",
         "  - find_attributes() and find_predefined() are INSTANT from index — use for attribute/subconto type questions.",
@@ -2193,7 +2194,8 @@ def _extension_strategy(ext_context, ext_overrides: dict, *, slim: bool = False)
         # truncation markers — nearby_extensions_truncated/total/shown + extensions_hint);
         # serializing them a 2nd time here (prose header) and a 3rd (per-extension counters
         # below) cost ~600 tok on EVERY rlm_start. The behavioral block is preserved VERBATIM.
-        header = f"CRITICAL — {total} EXTENSIONS DETECTED"
+        # v1.46.0 (Д11): число согласовано — «1 EXTENSION DETECTED» (прежде «1 EXTENSIONS»).
+        header = f"CRITICAL — {total} {'EXTENSION' if total == 1 else 'EXTENSIONS'} DETECTED"
         lines.append(
             (f"\n== {header} ==\n" if slim else f"\n{header} ")
             + "(name/prefix/overrides_count в extension_context.nearby_extensions)\n"

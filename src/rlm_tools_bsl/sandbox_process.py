@@ -282,6 +282,8 @@ class ProcessBackendConfig:
     db_path: str | None = None
     index_expected: bool = False
     idx_zero_callers_authoritative: bool = False
+    # v1.45.0 (Д29): метка свежести и итог выборки старта — {index_status, content_sample} или None
+    index_start_status: dict | None = None
     extension_paths: list[str] = field(default_factory=list)
     # Generic-режим (v1.32.0): False отключает загрузку BSL-хелперов в worker.
     # Default True — прежнее поведение для всех существующих конструкций.
@@ -314,6 +316,10 @@ class ProcessBackendConfig:
     # Production-код _rlm_start это поле никогда не заполняет. В конце dataclass по
     # тому же правилу, что и поля v1.34.0 выше.
     test_scan_hold_extra: int = 0
+    # v1.46.0 (П11): корень основной конфигурации рядом с расширением в сессии, открытой на
+    # расширении (сервер: extension_context.nearby_main); по нему хелперы судят только о
+    # СУЩЕСТВОВАНИИ объектов основной. В конце dataclass — правило полей v1.34.0.
+    main_config_root: str = ""
 
     @classmethod
     def from_env(cls, **overrides) -> "ProcessBackendConfig":
@@ -868,6 +874,7 @@ class ProcessSandboxBackend:
                 "db_path": cfg.db_path,
                 "index_expected": cfg.index_expected,
                 "idx_zero_callers_authoritative": cfg.idx_zero_callers_authoritative,
+                "index_start_status": cfg.index_start_status,
                 "extension_paths": list(cfg.extension_paths),
                 "enable_bsl_helpers": cfg.enable_bsl_helpers,
                 "execution_timeout_seconds": 0,
@@ -884,6 +891,8 @@ class ProcessSandboxBackend:
                 "current_config_name": cfg.current_config_name,
                 "current_config_root": cfg.current_config_root,
                 "extension_name_by_root": dict(cfg.extension_name_by_root or {}),
+                # v1.46.0 (П11): additive JSON-примитив; нет ключа у старого payload — "".
+                "main_config_root": cfg.main_config_root,
             }
             init_frame = encode_frame(make_message("init", request_id, gen, init_payload), cfg.ipc_max_bytes)
             self._send_bytes_with_deadline(parent_conn, init_frame, deadline)

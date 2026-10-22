@@ -274,6 +274,8 @@ class Sandbox:
         current_config_root: str = "",
         extension_name_by_root: dict[str, str] | None = None,
         scan_lease=None,
+        index_start_status: dict | None = None,
+        main_config_root: str = "",
     ):
         # Топология корней (v1.34.0) проверяется ДО построения namespace и до
         # любого обращения к ридеру/ФС, но ТОЛЬКО на активном BSL-пути:
@@ -299,9 +301,13 @@ class Sandbox:
         self._current_config_role = current_config_role
         self._current_config_name = current_config_name or ""
         self._current_config_root = current_config_root or ""
+        # v1.46.0 (П11): корень основной рядом с расширением — только имена описателей для проверки существования.
+        self._main_config_root = main_config_root or ""
         self._extension_name_by_root = dict(extension_name_by_root or {})
         self._idx_reader = idx_reader
         self._idx_zero_callers_authoritative = idx_zero_callers_authoritative
+        # v1.45.0 (Д29): метка свежести и итог выборки старта сессии — для get_index_info
+        self._index_start_status = dict(index_start_status) if index_start_status else None
         self._extension_paths = list(extension_paths or [])
         # Process mode подставляет фабрику writer-а в shared-buffer; None → bounded
         # in-memory capture. Возвращаемый объект обязан поддерживать write/flush,
@@ -326,6 +332,9 @@ class Sandbox:
         # in execute(). `*_arg_counts` keys on (helper_name, arg_fingerprint).
         self._session_helper_name_counts: dict[str, int] = {}
         self._session_helper_arg_counts: dict[tuple[str, str], int] = {}
+        # v1.45.0 (Д26): ОДИНОЧНЫЕ чтения для подсказки `read_files` — `read_file` всегда, `read_procedure`
+        # только с именем процедуры строкой (список имён — уже батч, раньше он считался как одиночный).
+        self._session_single_read_counts: dict[str, int] = {}
         self._emitted_efficiency_hints: set[str] = set()
         # v1.24.0 #5 — batch nudge granularity is rlm_execute ROUND-TRIPS, not raw
         # invocations: an execute with only 1-2 top-level helper calls is "sparse".
@@ -401,6 +410,7 @@ class Sandbox:
                 format_info=self._format_info,
                 idx_reader=self._idx_reader,
                 idx_zero_callers_authoritative=self._idx_zero_callers_authoritative,
+                index_start_status=self._index_start_status,
                 extension_paths=self._extension_paths,
                 grep_status_fn=private_io.get("grep_with_status"),
                 catalog_scan_fn=private_io.get("scan_bsl_catalog_status"),
@@ -408,6 +418,7 @@ class Sandbox:
                 current_config_role=self._current_config_role,
                 current_config_name=self._current_config_name,
                 current_config_root=self._current_config_root,
+                main_config_root=self._main_config_root,
                 extension_name_by_root=self._extension_name_by_root,
                 scan_lease=self._scan_lease,
             )
@@ -508,6 +519,12 @@ class Sandbox:
                     # Composite helpers call inner closures directly (bypassing this
                     # wrapper), so only TOP-LEVEL agent calls are counted here.
                     self._session_helper_name_counts[_name] = self._session_helper_name_counts.get(_name, 0) + 1
+                    if _name == "read_file" or (
+                        _name == "read_procedure"
+                        and isinstance(args[1] if len(args) > 1 else kwargs.get("proc_name"), str)
+                    ):
+                        _src = self._session_single_read_counts
+                        _src[_name] = _src.get(_name, 0) + 1
                     _fp = _arg_fingerprint(args, kwargs)
                     if _fp is not None:
                         _akey = (_name, _fp)
@@ -612,8 +629,9 @@ class Sandbox:
             self._session_sparse_execute_count += 1
 
         # (1) Non-batched homogeneous reads → read_files([...]) / read_procedure(path, [...]).
-        rf = nc.get("read_file", 0)
-        rp = nc.get("read_procedure", 0)
+        # v1.45.0 (Д26): по счётчику ОДИНОЧНЫХ чтений — вызов списком имён батчем уже является.
+        rf = self._session_single_read_counts.get("read_file", 0)
+        rp = self._session_single_read_counts.get("read_procedure", 0)
         if (rf >= 3 or rp >= 3) and "read_files" not in emitted:
             emitted.add("read_files")
             helper = "read_file" if rf >= rp else "read_procedure"
@@ -731,12 +749,13 @@ class Sandbox:
                     "точное число — find_by_type(category, count_only=True): "
                     "'total' это МОДУЛИ, 'unique_objects' — объекты"
                 )
-                order_note = " Порядок выдачи — не релевантность."
+                # v1.45.0 (Д16): с именем точный объект идёт первым; остальное — проход каталога.
+                order_note = " С именем точный объект — первым; остальное — проход каталога, не релевантность."
             elif helper == "find_module":
                 # count_only здесь НЕ вводится (п.3 даёт только limit), поэтому прежний
                 # fix остаётся — но с оговоркой про порядок: это тот же прямой проход.
                 fix = "подними limit или сузь запрос"
-                order_note = " Порядок выдачи — не релевантность."
+                order_note = " С именем точный объект — первым; остальное — проход каталога, не релевантность."
             elif helper == "search":
                 fix = "сузь scope ('methods'|'objects'|'regions'|'headers'|'attributes'|'predefined') или подними limit"
                 order_note = " Строки сгруппированы по источникам."

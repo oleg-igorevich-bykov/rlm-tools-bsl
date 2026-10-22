@@ -89,11 +89,23 @@ class TestTypeSetTokens:
         assert type_set_category("ChartOfCharacteristicTypesManager") == "ChartOfCharacteristicTypes"
 
     def test_tokens_outside_the_map_are_named_not_silent(self):
-        """Ровно три боевых токена не раскрываются — они обязаны быть ОТКАЗОМ."""
-        for token in ("SequenceRecordSet", "RecalculationRecordSet", "DocumentJournalManager"):
+        """Токен вне карты с НЕИЗВЕСТНЫМ составом обязан быть ОТКАЗОМ.
+
+        v1.45.0: прежде здесь стояли три боевых токена (``SequenceRecordSet``, ``RecalculationRecordSet``,
+        ``DocumentJournalManager``) с ответом ``set_unresolved`` у документа. Их состав известен по
+        определению: у объекта другой головы строки нет, у своей — ``set``/``set``; отказ остался у токена,
+        чей состав неизвестен."""
+        for token, head in (
+            ("SequenceRecordSet", "Sequence"),
+            ("RecalculationRecordSet", "Recalculation"),
+            ("DocumentJournalManager", "DocumentJournal"),
+        ):
             assert type_set_category(token) == ""
-            verdict = classify_subscription_row([], [token], object_name="Х", target_refs=("Document.Х",))
-            assert verdict == ("set", "set_unresolved", [], [token])
+            assert classify_subscription_row([], [token], object_name="Х", target_refs=("Document.Х",)) is None
+            verdict = classify_subscription_row([], [token], object_name="Х", target_refs=(f"{head}.Х",))
+            assert verdict == ("set", "set", [], [token])
+        verdict = classify_subscription_row([], ["НеизвестныйНабор"], object_name="Х", target_refs=("Document.Х",))
+        assert verdict == ("set", "set_unresolved", [], ["НеизвестныйНабор"])
 
 
 class TestSubscriptionSourceParsing:
@@ -298,9 +310,9 @@ def test_set_subscriptions_are_found_on_both_branches(tmp_path, monkeypatch, edt
         assert "НаборДокументов" in by_name
         # Набор не своей категории не притягивается.
         assert "НаборКонстант" not in by_name
-        # Токен вне карты назван, а не проглочен.
-        assert by_name["НеРаскрываемый"]["matched_via"] == "set_unresolved"
-        assert by_name["НеРаскрываемый"]["matched_sets"] == ["SequenceRecordSet"]
+        # v1.45.0: прежде здесь стояло `set_unresolved` у «НеРаскрываемый» (набор `SequenceRecordSet`).
+        # Состав набора известен — наборы записей последовательностей: к документу строка не относится.
+        assert "НеРаскрываемый" not in by_name
     finally:
         if reader:
             reader.close()

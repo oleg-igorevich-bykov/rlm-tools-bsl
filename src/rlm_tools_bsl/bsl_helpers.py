@@ -37,11 +37,13 @@ from rlm_tools_bsl.bsl_index import (
     _BACKGROUND_LAUNCHERS,
     _BSL_GLOBAL_FUNCS_LOWER,
     _CALL_MANAGER_COLLECTIONS,
+    _CATEGORY_RU,
     _MANAGER_CALL_RE,
     _REGISTER_CATALOG_DIRS,
     _extract_calls_from_body,
     _blank_signature_tail,
     _extract_header_comment,
+    file_matches_index_stat,
     _has_launch_marker,
     _is_chain_member,
     _is_chain_member_in_lines,
@@ -67,6 +69,7 @@ from rlm_tools_bsl.bsl_index import (
     _MOVEMENT_METHOD_NOISE,
     _ref_anchor_index,
     _scan_module,
+    strip_category_prefix,
 )
 from rlm_tools_bsl.cache import load_index, save_index
 from rlm_tools_bsl.helpers import (
@@ -131,6 +134,74 @@ _COMMON_MODULE_FLAG_KEYS: dict[str, str] = {
     "client_ordinary": "client_ordinary",
     "clientordinaryapplication": "client_ordinary",
 }
+# Значения `ReturnValuesReuse` — второе семейство значений `find_common_modules(flag=)`.
+_COMMON_MODULE_REUSE_VALUES = ("DontUse", "DuringSession", "DuringRequest")
+
+# v1.46.0 (Д4, П1): закрытые наборы значений фильтров (сверены с данными всех боевых индексов).
+# Типы макетов платформы (в индексах встречаются девять из десяти).
+_TEMPLATE_TYPES: tuple[str, ...] = (
+    "SpreadsheetDocument",
+    "TextDocument",
+    "BinaryData",
+    "ActiveDocument",
+    "HTMLDocument",
+    "GeographicalSchema",
+    "GraphicalSchema",
+    "DataCompositionSchema",
+    "DataCompositionAppearanceTemplate",
+    "AddIn",
+)
+# События подписок — английские имена, как в XML подписки (21 имя по всем индексам).
+_SUBSCRIPTION_EVENTS: tuple[str, ...] = (
+    "BeforeWrite",
+    "OnWrite",
+    "BeforeDelete",
+    "Posting",
+    "UndoPosting",
+    "Filling",
+    "FillCheckProcessing",
+    "OnCopy",
+    "OnSetNewCode",
+    "OnSetNewNumber",
+    "ChoiceDataGetProcessing",
+    "FormGetProcessing",
+    "PresentationGetProcessing",
+    "PresentationFieldsGetProcessing",
+    "OnSendDataToMaster",
+    "OnSendDataToSlave",
+    "OnSendNodeDataToSlave",
+    "OnReceiveDataFromMaster",
+    "OnReceiveDataFromSlave",
+    "BeforeExecute",
+    "OnExecute",
+)
+# `object_attributes.attr_kind`: колонка табличной части — `ts_attribute` (не `column`).
+_ATTR_KINDS: tuple[str, ...] = ("attribute", "dimension", "resource", "ts_attribute")
+# `metadata_code_usages.kind`.
+_CODE_USAGE_KINDS: tuple[str, ...] = ("manager", "ref_type", "query")
+
+
+def _closed_values(helper: str, param: str, values, allowed, *, fold=str.casefold) -> list[str]:
+    """v1.46.0 (Д4, П1): значения параметра с ЗАКРЫТЫМ набором — в каноническом написании из ``allowed``
+    (регистр и пробелы по краям не важны). Неизвестное значение — в том числе одно из нескольких — ``ValueError``
+    с именем хелпера, параметра, неизвестными и допустимыми значениями: прежде такой фильтр давал тихий ноль, а
+    частично неизвестный список молча терял неизвестный вид («ссылок этого вида нет» читалось как факт). Строка
+    (и любой не-список) вместо списка — список из одного элемента."""
+    allowed = list(allowed)
+    by_key = {fold(a): a for a in allowed}
+    items = list(values) if isinstance(values, (list, tuple, set, frozenset)) else [values]
+    out: list[str] = []
+    unknown: list = []
+    for item in items:
+        key = fold(item.strip()) if isinstance(item, str) else None
+        if key is not None and key in by_key:
+            out.append(by_key[key])
+        else:
+            unknown.append(item)
+    if unknown:
+        raise ValueError(f"{helper}: {param} — неизвестные значения {unknown!r}; допустимые: {sorted(allowed)}")
+    return out
+
 
 logger = logging.getLogger(__name__)
 from rlm_tools_bsl.bsl_xml_parsers import (
@@ -138,6 +209,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
     _RU_META_FORMS,
     _normalize_category,
     cf_form_event_scope,
+    parse_document_journal,
     parse_metadata_xml,
     parse_event_subscription_xml,
     parse_scheduled_job_xml,
@@ -458,6 +530,64 @@ _DELEGATE_METHOD_NOISE = frozenset(
         "execute",
     }
 )
+# v1.46.0 (Д12, П5): метод платформенной коллекции у ПРОСЛЕЖЕННОГО платформенного получателя — не делегат.
+# Получатель — свойство объекта типа Структура (`ДополнительныеСвойства`, не затенённое переменной, реквизитом или
+# общим модулем) либо табличная часть самого документа (имя из живого описателя); одним именем или ровно
+# `ЭтотОбъект.<…>`/`ThisObject.<…>`. Прежде подсказка проведения предлагала искать «объявление» `Вставить`,
+# `Свойство`, `Выгрузить` по всему дереву. `Записать`/`Write` — ни в одном списке: у табличной части такого метода
+# нет, а у неопознанного получателя он может писать движения.
+_PLATFORM_OBJECT_PROPERTIES = frozenset({"дополнительныесвойства", "additionalproperties"})
+_STRUCTURE_METHODS = frozenset(
+    {"вставить", "свойство", "удалить", "очистить", "количество", "insert", "property", "delete", "clear", "count"}
+)
+_TABULAR_SECTION_METHODS = frozenset(
+    {
+        "выгрузить",
+        "выгрузитьколонку",
+        "загрузить",
+        "загрузитьколонку",
+        "добавить",
+        "вставить",
+        "удалить",
+        "очистить",
+        "количество",
+        "найти",
+        "найтистроки",
+        "итог",
+        "сортировать",
+        "свернуть",
+        "индекс",
+        "получить",
+        "сдвинуть",
+        "unload",
+        "unloadcolumn",
+        "load",
+        "loadcolumn",
+        "add",
+        "insert",
+        "delete",
+        "clear",
+        "count",
+        "find",
+        "findrows",
+        "total",
+        "sort",
+        "groupby",
+        "indexof",
+        "get",
+        "move",
+    }
+)
+
+
+def _platform_collection_call(receiver_name: str, kind: str, method: str, tabular_sections: set[str]) -> bool:
+    """v1.46.0 (Д12, П5): вызов ``<получатель>.<метод>()`` — метод платформенной коллекции у прослеженного
+    платформенного получателя (``receiver_name`` — одно имя без ``ЭтотОбъект.``, в нижнем регистре; ``kind`` — вид,
+    который разбор дал бы делегату): Структура ``ДополнительныеСвойства`` (вид ``unknown``: не переменная, не
+    реквизит, не общий модуль) либо табличная часть документа (имя из живого описателя)."""
+    if kind == "unknown" and receiver_name in _PLATFORM_OBJECT_PROPERTIES:
+        return method in _STRUCTURE_METHODS
+    return kind == "attribute" and receiver_name in tabular_sections and method in _TABULAR_SECTION_METHODS
 
 
 def _live_code_only(body: str) -> str:
@@ -494,6 +624,15 @@ _HIERARCHY_VISITED_CAP = 2000
 # call time so tests can monkeypatch it.
 _DATA_PATH_NODE_BUDGET = 400
 
+# v1.45.0 (Д2): страница исходящих ссылок одного узла find_data_path. Узел, чья выдача
+# равна странице, усечён: прямая ссылка на `to` у него проверяется точечным запросом,
+# а промах объявляется неокончательным. Module global so tests can monkeypatch.
+_DATA_PATH_REFS_PAGE = 1000
+
+# v1.45.0 (Д1, Д2): сколько усечённых узлов перечисляет `_meta.truncated_nodes`
+# (полный счёт — `_meta.truncated_nodes_total`).
+_TRUNCATED_NODES_SHOWN = 10
+
 # Бюджет МОДУЛЕЙ для живого поиска объявлений (find_definition без индекса и
 # ext-merge индексной ветки). Ранней остановки `_result_cap` для защиты НЕ хватает:
 # она срабатывает только когда находки ЕСТЬ, а худший случай — имя, которого нет
@@ -526,6 +665,65 @@ _MISSING = _MissingArg()
 # the search as truncated (budget_exceeded) so a found=False stays inconclusive
 # instead of silently dropping caller #N+1. Module global so tests can monkeypatch.
 _FIND_PATH_NODE_LIMIT = 200
+
+
+def _find_path_miss_hint(
+    truncated: list[dict],
+    truncated_total: int,
+    first_hint: str,
+    visited_cap_hit: bool,
+    layer_partial: bool,
+) -> str:
+    """Верхний hint неокончательного промаха find_path (v1.45.0, Д1): исполнимый вызов добора
+    первого усечённого узла в единицах его маршрута, причины упора — отдельными фразами."""
+    parts = ["found=False НЕ доказывает отсутствие пути."]
+    if truncated:
+        node = truncated[0]
+        name, page = node["name"], node["next_offset"]
+        if node["page_unit"] == "rows":
+            total = node["total_callers"]
+            parts.append(
+                f"Узел {name!r} усечен: обход шел по первым {node['expanded']} из {total} вызывающих "
+                "(прямое ребро к from проверено по всем); остальные — "
+                f"find_callers_context({name!r}, {first_hint!r}, offset={page}, limit={total - page})."
+            )
+        else:
+            parts.append(
+                f"Узел {name!r} усечен (маршрут файлов): обход шел по первым {page} файлам-кандидатам; "
+                f"продолжение — find_callers_context({name!r}, {first_hint!r}, offset={page}, limit={page}); "
+                "FS-маршрут листает ФАЙЛЫ: повторяй с offset += limit, пока has_more."
+            )
+        if truncated_total > 1:
+            parts.append(f"Усеченных узлов: {truncated_total} (_meta.truncated_nodes).")
+    if visited_cap_hit:
+        parts.append(f"Обход уперся в visited_cap={_HIERARCHY_VISITED_CAP} узлов.")
+    if layer_partial:
+        parts.append("Слой вызовов расширений неполон (_meta.extension_layer='partial').")
+    parts.append("Либо сузь from_hint/to_hint до rel_path модуля (find_module('X')[i]['path']).")
+    return " ".join(parts)
+
+
+def _data_path_miss_hint(to_arg, truncated: list[dict], budget_hit: bool, partial: bool, no_index: bool) -> str:
+    """Верхний hint неокончательного промаха find_data_path (v1.45.0, Д2)."""
+    check = f"find_references_to_object({to_arg!r})"
+    parts = ["found=False НЕ доказывает недостижимость."]
+    if no_index:
+        parts.append(
+            f"Индекса нет — графа ссылок метаданных нет (partial=True); ссылки на объект читает {check} и без индекса."
+        )
+        return " ".join(parts)
+    if truncated:
+        node = truncated[0]
+        parts.append(
+            f"Узел {node['object']} усечен: исходящих ссылок не меньше страницы ({node['refs_returned']}); "
+            "прямая ссылка на to проверена по всем, обход — по первой странице."
+        )
+    if budget_hit:
+        parts.append(f"Обход уперся в бюджет узлов ({_DATA_PATH_NODE_BUDGET}): уменьши max_depth.")
+    if partial:
+        parts.append("Таблица ссылок метаданных недоступна (partial=True): нужна пересборка индекса с метаданными.")
+    parts.append(f"Сузь kinds=[...] или проверь ссылку обратным поиском: {check}.")
+    return " ".join(parts)
 
 
 def _is_literal_pattern(pattern: str) -> bool:
@@ -1362,18 +1560,27 @@ def _sql_nocase(s: str) -> str:
 
 
 def _ext_row_matches(
-    callee_name: str, key: str | None, proc_name: str, target_key: str | None, kind: str | None = None
+    callee_name: str,
+    key: str | None,
+    proc_name: str,
+    target_key: str | None,
+    kind: str | None = None,
+    *,
+    exact_only: bool = False,
 ) -> bool:
     """Отбор строки слоя — зеркало ``WHERE`` у ``IndexReader.get_callers``: точный режим —
     ``callee_key = K`` либо ключа нет и совпало имя; режим по имени — совпадение имени (для
     голого ``proc_name`` — по хвосту после точки, для ``Модуль.Метод`` — целиком). Вид ребра —
     как ``_graph_kind_clause``: член цепочки — только ``<…>.Менеджер.М(`` и в точном режиме только
-    у цели в модуле менеджера; вычисляемый запуск — никогда."""
+    у цели в модуле менеджера; вычисляемый запуск — никогда. ``exact_only`` (v1.45.0, Д5) —
+    неэкспортная цель: строка годится только точным ребром ``key == target_key``."""
     if kind not in (None, "background"):
         if kind != "member" or not _is_manager_member(callee_name):
             return False
         if target_key is not None and not _is_manager_module_key(target_key):
             return False
+    if exact_only and target_key is not None:
+        return key == target_key
     if "." in proc_name:
         name_ok = _sql_nocase(callee_name) == _sql_nocase(proc_name)
     else:
@@ -1444,6 +1651,14 @@ _EXT_ZERO_HINT = (
     "проверить partial и _meta.reasons."
 )
 _EXT_PARTIAL_NOTE = " Слой вызовов расширений неполный (_meta.extension_layer='partial'): ноль не окончательный."
+# v1.46.0 (Д15): `target_exact=True` значит «цель разрешена в один модуль», а не «вызывающие точные» — при нуле
+# точных рёбер строки найдены по имени (на боевых конфигурациях — в основном вызовы одноимённого метода ДРУГОГО
+# объекта через переменную), и без подсказки это читалось как точный ответ.
+_EXACT_TARGET_NAME_ROWS_HINT = (
+    "Цель разрешена точно, но точных ребер нет: строки — вызовы по имени (edge_exact=False), среди них бывают "
+    "вызовы одноименных методов других объектов; сверяй получатель по строке. Вызов через выражение "
+    "(ПолучитьОбъект().Метод()) граф не видит."
+)
 
 
 def make_bsl_helpers(
@@ -1458,12 +1673,14 @@ def make_bsl_helpers(
     extension_paths: list[str] | None = None,
     register_git_search: str = "auto",
     *,
+    index_start_status: dict | None = None,  # v1.45.0 (Д29): {index_status, content_sample} старта сессии
     grep_status_fn=None,
     catalog_scan_fn=None,
     glob_files_fs_fn=None,
     current_config_role: str | None = None,
     current_config_name: str = "",
     current_config_root: str = "",
+    main_config_root: str = "",
     extension_name_by_root: dict[str, str] | None = None,
     scan_lease=None,
 ) -> dict:
@@ -1511,6 +1728,14 @@ def make_bsl_helpers(
     внутри ``current_config_root`` (поддержанный wrapper-вход, где base шире
     фактического CFE). Прямой конструктор без этих аргументов один раз лениво
     зовёт detector сам — прежнее поведение сохраняется.
+
+    ``main_config_root`` (v1.46.0, П11) — корень ОСНОВНОЙ конфигурации рядом с
+    расширением, в сессии, открытой на самом расширении (сервер уже знает его:
+    ``extension_context.nearby_main``). По нему — только по ИМЕНАМ каталогов
+    описателей — судится существование объектов основной (шлюз, отказ «имя
+    категории», правила не-ссылки); читать файлы основной хелперы по-прежнему не
+    могут. Пусто — основной рядом нет либо прямой конструктор: ленивый детектор
+    соседей не ищет, а повторный детект в сессии запрещён, — проверки нет.
     """
 
     # Топология корней проверяется ПЕРВЫМ действием: до `_ensure_index`, любого
@@ -1574,6 +1799,8 @@ def make_bsl_helpers(
         "role": (str(current_config_role).strip().lower() if current_config_role else None),
         "name": str(current_config_name or ""),
         "root": str(current_config_root or "") or base_path,
+        # v1.46.0 (П11): корень основной рядом с расширением — только от сервера (ленивый детектор его не ищет).
+        "main_root": str(main_config_root or ""),
     }
     _foundation_lock = threading.Lock()
 
@@ -1674,6 +1901,30 @@ def make_bsl_helpers(
             value = ""
         _current_prefix_raw_cache[0] = value
         return value
+
+    def _group_key(rel: str) -> str:
+        """v1.45.0 (Д17, Р3): ключ ГРУППЫ «категория» по пути — от СВОЕГО корня (префикс соседнего
+        расширения `../cfe/<Имя>` и префикс текущего корня снимаются): первый сегмент `Ext` (CF) или
+        `Configuration` (EDT), а также файл в корне — `'Configuration'` (модули уровня конфигурации);
+        иначе — первый сегмент (категория, в том числе вне словаря: `Sequences`, `IntegrationServices`).
+        Раньше ключом был сырой первый сегмент: `'..'` (все файлы расширений одной группой), `'Ext'`."""
+        comps = [c for c in str(rel or "").replace("\\", "/").split("/") if c and c != "."]
+        norm = tuple(os.path.normcase(c) for c in comps)
+        for prefix, _root in _ext_rel_prefixes:
+            if len(norm) > len(prefix) and norm[: len(prefix)] == prefix:
+                comps = comps[len(prefix) :]
+                break
+        else:
+            cur = [c for c in _current_rel_prefix_raw().split("/") if c]
+            if (
+                cur
+                and len(comps) > len(cur)
+                and [os.path.normcase(c) for c in comps[: len(cur)]] == [os.path.normcase(c) for c in cur]
+            ):
+                comps = comps[len(cur) :]
+        if len(comps) <= 1 or comps[0].casefold() in ("ext", "configuration"):
+            return "Configuration"
+        return comps[0]
 
     def _current_rel_prefix() -> tuple[str, ...]:
         cached = _current_prefix_cache[0]
@@ -1994,10 +2245,15 @@ def make_bsl_helpers(
                     _ext_file_cache.popitem(last=False)
             return content
         except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Файл {path!r} не найден. Пути модулей объекта — find_module('Имя') или "
-                "get_object_modules('Имя'); у формы без модуля parse_form отдает module_path=''."
-            ) from None
+            raise _module_file_not_found(path) from None
+
+    def _module_file_not_found(path: str) -> FileNotFoundError:
+        """Файла модуля нет — относительный путь и маршрут (v1.44.0); общий текст ``_ext_read_file`` и
+        ``get_module_outline`` по имени без модуля (v1.46.0)."""
+        return FileNotFoundError(
+            f"Файл {path!r} не найден. Пути модулей объекта — find_module('Имя') или "
+            "get_object_modules('Имя'); у формы без модуля parse_form отдает module_path=''."
+        )
 
     def _glob_hits(pattern: str) -> list[str]:
         """Файлы маски без строки-подсказки. Маска без ``*`` уходит в ``glob_files_fn`` только
@@ -2957,7 +3213,15 @@ def make_bsl_helpers(
     _registry: dict[str, dict] = {}
 
     def _reg(name: str, fn, sig: str, cat: str, kw: list[str] | None = None, recipe: str = ""):
-        """Register a helper: sig for strategy table, kw+recipe for help()."""
+        """Register a helper: sig for strategy table, kw+recipe for help().
+
+        v1.45.0 (Д8): хелпер класса «аргумент объекта» регистрируется обёрткой публичной границы
+        (``_public_arg_guard``): отказ называет ВЫЗВАННЫЙ агентом хелпер, а внутренние вызовы хелперов
+        друг другом идут к функциям замыкания и прежних ответов не меняют."""
+        guard = _PUBLIC_ARG_GUARDS.get(name)
+        if guard is not None:
+            refusal, overview, param = guard
+            fn = _public_arg_guard(name, fn, refusal, blank_as_empty=overview, param=param)
         _registry[name] = {
             "fn": fn,
             "sig": sig,
@@ -3101,8 +3365,34 @@ def make_bsl_helpers(
                 break
         return results
 
+    def _ranked_module_rows(rows: list[dict], name: str) -> list[dict]:
+        """v1.45.0 (Д16, П2): точный объект — первым. Устойчивая сортировка по (не точное имя объекта,
+        порядок первой встречи категории среди точных, ``_module_rank``): модуль объекта, менеджера, затем
+        остальные; неточные строки — в порядке прохода каталога после точных."""
+        target = _strip_meta_prefix(name or "").strip().casefold()
+        cat_order: dict[str, int] = {}
+        for r in rows:
+            if (r.get("object_name") or "").casefold() == target:
+                cat_order.setdefault((r.get("category") or "").casefold(), len(cat_order))
+
+        def key(r: dict) -> tuple:
+            if (r.get("object_name") or "").casefold() != target:
+                return (1, 0, 0)
+            return (
+                0,
+                cat_order[(r.get("category") or "").casefold()],
+                _module_rank(r.get("category"), r.get("module_type")),
+            )
+
+        return sorted(rows, key=key)
+
     def find_module(name: str = "", module_type: str = "", category: str = "", limit: int = 50) -> list[dict]:
         """Find BSL modules by name fragment (case-insensitive).
+
+        v1.45.0 (Д16, П2): с непустым ``name`` — полный проход сопоставления и точный объект ПЕРВЫМ
+        (модуль объекта, менеджера, затем остальные; неточные — в порядке каталога), срез ``limit``.
+        Раньше порядок был проходом каталога, и модуль объекта тонул под подстрочными совпадениями.
+        Без имени — прежний проход каталога. Внутренние потребители — ``_find_module_page`` (прежний порядок).
 
         v1.19.0 — tolerant contract: ``name`` is OPTIONAL and ``module_type`` /
         ``category`` are optional filters (matched case-insensitively against the
@@ -3113,11 +3403,19 @@ def make_bsl_helpers(
 
         ``limit`` (v1.34.0, default = прежний жёсткий cap 50): без него сигнал
         усечения был неисполним — агент узнавал, что выдача обрезана, и не мог её
-        дочитать. Порядок выдачи — прямой проход каталога, НЕ релевантность.
+        дочитать. Порядок выдачи — прямой проход каталога, НЕ релевантность (v1.45.0: с именем — точный
+        объект первым, см. выше).
 
         Returns: list of dicts {path, category, object_name, module_type, form_name,
         owner}. ``form_name`` — ПУБЛИЧНАЯ проекция (``_public_form_name``): у ОБЩЕЙ
         формы он равен её имени, хотя сегмента ``Forms`` в пути нет."""
+        return _find_module_page(name, module_type, category, limit, ranked=True)
+
+    def _find_module_page(
+        name: str = "", module_type: str = "", category: str = "", limit: int = 50, *, ranked: bool = False
+    ) -> list[dict]:
+        """Прежняя выдача ``find_module`` (проход каталога) — для внутренних потребителей (v1.45.0);
+        ``ranked`` — публичная: с именем точный объект первым."""
         limit, _w = _coerce_bound(limit, 50, "limit", "find_module(name='', module_type='', category='', limit=50)")
         _warn_bound(_w)
         # v16: фильтры нормализуются ДО раннего возврата — иначе `limit=0` глотал бы
@@ -3131,6 +3429,9 @@ def make_bsl_helpers(
             # при limit=0 результат зависел бы от того, совпала ли первая запись, —
             # одна строка либо пусто, недетерминировано относительно порядка каталога.
             return []
+        if ranked and _strip_meta_prefix(name or "").strip():
+            rows = _ranked_module_rows(_find_module_matches(name, module_type, category), name)
+            return _project_public_rows(rows[:limit])
         return _project_public_rows(_find_module_matches(name, module_type, category, max_results=limit))
 
     # Потолок страницы `find_module` по умолчанию: на ней ищут точное имя `_exact_page_modules`.
@@ -3315,12 +3616,19 @@ def make_bsl_helpers(
         if count_only:
             # count закономерно считает полный набор и от `limit` не зависит.
             return _find_by_type_count_payload(meta_type_lower, name_lower)
+        return _find_by_type_rows(meta_type_lower, name, limit, ranked=True)
+
+    def _find_by_type_rows(meta_type_lower: str, name: str, limit: int, *, ranked: bool) -> list[dict]:
+        """Строки ``find_by_type``: ``ranked`` (публичный вызов с именем, v1.45.0) — полный проход и точный
+        объект первым (``_ranked_module_rows``); иначе — прежний проход каталога с ранним выходом."""
+        name_lower = name.lower()
         if limit <= 0:
             # Ранний возврат: потолок у find_by_type проверяется сразу после append
             # ВНУТРИ ветки совпадения, поэтому наивная замена `50` → `limit` при
             # limit=0 вернула бы ровно одну лишнюю строку.
             return []
         _ensure_index()
+        full = ranked and bool(name_lower.strip())
         results = []
         for relative_path, info in _index_state:
             if not info.category or info.category.lower() != meta_type_lower:
@@ -3328,9 +3636,20 @@ def make_bsl_helpers(
             if name_lower and (not info.object_name or name_lower not in info.object_name.lower()):
                 continue
             results.append(_info_to_dict(relative_path, info))
-            if len(results) >= limit:
+            if not full and len(results) >= limit:
                 break
+        if full:
+            results = _ranked_module_rows(results, name)[:limit]
         return _project_public_rows(results)
+
+    def _find_by_type_page(category, name: str = "", limit: int = 50) -> list[dict]:
+        """Прежняя выдача ``find_by_type`` (проход каталога) — для внутренних потребителей (v1.45.0)."""
+        limit, _w = _coerce_bound(limit, 50, "limit", "find_by_type(meta_type, name='', limit=50)")
+        _warn_bound(_w)
+        name = _strip_meta_prefix(name)
+        if str(category or "").strip():
+            _normalize_category_arg(str(category))
+        return _find_by_type_rows(_normalize_category(category), name, limit, ranked=False)
 
     _proc_lazy = LazyDict()
     # Пути, разобранные, когда карту перехватов индекса прочитать не удалось: их `overridden_by`
@@ -3435,6 +3754,8 @@ def make_bsl_helpers(
                         "extension_root": ov.get("extension_root", ""),
                         "ext_module_path": ov.get("ext_module_path", ""),
                         "ext_line": ov.get("ext_line"),
+                        # v1.45.0 (Д12): исполнимый путь файла расширения (`../cfe/…`), как у get_overrides.
+                        "extension_file": _override_extension_file(ov),
                     }
                     for ov in method_overrides
                 ]
@@ -3463,7 +3784,8 @@ def make_bsl_helpers(
         Returns: list of dicts {name, type, line, end_line, is_export, params, overridden_by?}.
         ``params`` — список имён параметров (list[str], v1.18.0; напр. "Знач А, Б=5" → ["А", "Б"]).
         ``overridden_by?`` — list[{annotation, extension_name, extension_method, extension_root,
-        ext_module_path, ext_line}]; ``ext_line`` — строка аннотации, объявление метода ниже."""
+        ext_module_path, ext_line, extension_file}]; ``ext_line`` — строка аннотации, объявление метода ниже;
+        ``extension_file`` (v1.45.0) — исполнимый путь файла расширения (``../cfe/…``)."""
 
         _orig_arg = path
         path, _arg_meta = _resolve_module_arg(path)
@@ -3540,6 +3862,32 @@ def make_bsl_helpers(
     # ответ помечается truncated — «сервер посчитал не всё» обязано быть видно.
     _COUNT_MATCHES_SCAN_MAX = 60_000
 
+    # v1.46.0 (Д8, П6): память FS-перечисления масок `count_matches` на сессию (исходники в течение сессии
+    # неизменны): повторный вызов с той же маской обход дерева не повторяет.
+    _fs_mask_memo: dict[str, list] = {}
+
+    def _dir_path_on_disk(rel: str) -> str | None:
+        """Написание каталога ``rel`` (от корня сессии) на диске — посегментно без учёта регистра (точное
+        написание сегмента предпочитается); сегмента нет или это не каталог — ``None``."""
+        spelled: list[str] = []
+        for part in [p for p in rel.replace("\\", "/").split("/") if p]:
+            found = None
+            try:
+                with os.scandir(os.path.join(base_path, *spelled)) as it:
+                    for entry in it:
+                        if entry.name.casefold() != part.casefold() or not entry.is_dir():
+                            continue
+                        if entry.name == part:
+                            found = entry.name
+                            break
+                        found = found or entry.name
+            except OSError:
+                return None
+            if found is None:
+                return None
+            spelled.append(found)
+        return "/".join(spelled) or None
+
     def count_matches(
         pattern: str,
         file_types: str = "bsl",
@@ -3567,7 +3915,9 @@ def make_bsl_helpers(
                 пусто — как ``'bsl'``. Расширение вне ``.bsl/.mdo/.xml`` (``rights``,
                 ``form``, ``dcs``) перечисляется обходом файлов (v1.43.0; раньше — ложный ноль).
             path: относительное поддерево (``'CommonModules'``); пусто — весь
-                текущий корень. Санитайзер тот же, что у ``git_search``.
+                текущий корень. Санитайзер тот же, что у ``git_search``. v1.46.0: каталог
+                перечисляется обходом ФС только своим поддеревом; повтор маски в сессии
+                обход не повторяет (числа прежние).
             top: размер страницы ``top`` — файлы с наибольшим числом совпадений.
             group_by: ``'category'`` (первый сегмент пути) либо ``'file'``.
 
@@ -3646,6 +3996,10 @@ def make_bsl_helpers(
         candidates: list[str] = []
         index_enum = live_enum = False
         index_files: set[str] = set()  # кандидаты, которые отдал навигационный индекс
+        # v1.46.0 (Д8, П6): `path`-КАТАЛОГ сужает обход ФС до своего поддерева (маска от написания каталога на
+        # диске); прежде маска была всегда от корня, а фильтр пути шёл после полного перечисления (~12 с на
+        # формах крупной ERP вместо долей секунды). Путь файла и несуществующий путь — прежняя маска и фильтр.
+        prefix_dir = _dir_path_on_disk(prefix) if prefix else None
         for ext in exts or (".bsl",):
             mask = f"**/*{ext}"
             try:
@@ -3661,7 +4015,11 @@ def make_bsl_helpers(
                 else:
                     # FS-канал текущего корня; без него — штатный `glob_files` (ридер снова отдаст
                     # `None`, и сработает тот же обход ФС).
-                    rows = (glob_files_fs_fn if callable(glob_files_fs_fn) else glob_files_fn)(mask)
+                    fs_mask = f"{prefix_dir}/**/*{ext}" if prefix_dir else mask
+                    rows = _fs_mask_memo.get(fs_mask)
+                    if rows is None:
+                        rows = list((glob_files_fs_fn if callable(glob_files_fs_fn) else glob_files_fn)(fs_mask))
+                        _fs_mask_memo[fs_mask] = rows
                     live_enum = True
                 candidates.extend(_without_glob_hints(rows))
             except Exception:
@@ -3775,7 +4133,7 @@ def make_bsl_helpers(
         ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         groups: dict[str, int] = {}
         for rel, n in counts.items():
-            key = rel.split("/", 1)[0] if group_by == "category" else rel
+            key = _group_key(rel) if group_by == "category" else rel  # v1.45.0 (Д17): имя группы, а не '..'/'Ext'
             groups[key] = groups.get(key, 0) + n
         group_rows = [
             {"key": k, "count": v} for k, v in sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))[: max(0, top)]
@@ -4767,7 +5125,10 @@ def make_bsl_helpers(
             ext_line = ov.get("ext_line")
 
             header = f'\n// === Перехвачен &{annotation} в расширении "{ext_name}" ==='
-            file_ref = f"// Файл: {ext_name}/{ext_mod}"
+            # v1.45.0 (Д12): ссылка на файл — исполнимый `extension_file` (`../cfe/…`, его принимают
+            # read_procedure/extract_procedures); корень вне сессии — прежняя форма «имя расширения/путь».
+            ext_file = _override_extension_file(ov)
+            file_ref = f"// Файл: {ext_file}" if ext_file else f"// Файл: {ext_name}/{ext_mod}"
             if ext_line:
                 file_ref += f":{ext_line}"
 
@@ -4907,7 +5268,23 @@ def make_bsl_helpers(
         max_files, _w = _coerce_bound(max_files, 20, "max_files", "find_callers(proc, module_hint='', max_files=20)")
         _warn_bound(_w)
         result = find_callers_context(proc_name, module_hint, 0, max_files)
-        return [{"file": c["file"], "line": c["line"], "text": c.get("context", "")} for c in result["callers"]]
+        # v1.45.0 (Д6): строки индекса (и слоя расширений) контекста не несут — текст строки
+        # дочитывается из файла; файлов на странице не больше max_files. FS-маршрут — прежний context.
+        file_lines: dict[str, list[str] | None] = {}
+        out: list[dict] = []
+        for c in result["callers"]:
+            text = c.get("context")
+            if text is None:
+                rel = c["file"]
+                if rel not in file_lines:
+                    try:
+                        file_lines[rel] = _ext_read_file(rel).splitlines()
+                    except Exception:
+                        file_lines[rel] = None
+                lines, ln = file_lines[rel], c.get("line")
+                text = lines[ln - 1].rstrip() if lines and isinstance(ln, int) and 0 < ln <= len(lines) else ""
+            out.append({"file": c["file"], "line": c["line"], "text": text})
+        return out
 
     # --- Parallel prefilter for find_callers_context ---
     _base = Path(base_path)
@@ -5097,6 +5474,15 @@ def make_bsl_helpers(
                 # концом) — не ноль вызывающих: индексный ответ сохраняется, а подсказка
                 # «вызывающих нет» допустима только при total_callers == 0.
                 if _n > 0 or (isinstance(_total, int) and _total > 0):
+                    if (
+                        _meta.get("target_exact")
+                        and int(_meta.get("exact_rows") or 0) == 0
+                        and int(_meta.get("fallback_rows") or 0) > 0
+                        and "hint" not in _meta
+                    ):
+                        # v1.46.0 (Д15): цель точная, рёбра — по имени (см. `_EXACT_TARGET_NAME_ROWS_HINT`).
+                        _meta["hint"] = _EXACT_TARGET_NAME_ROWS_HINT
+                        result["_meta"] = _meta
                     return _tag(result)
                 if idx_zero_callers_authoritative:
                     logger.debug(
@@ -5158,6 +5544,9 @@ def make_bsl_helpers(
 
         # --- Step 1: Determine scope based on export status ---
         target_files: list[str] | None = None  # None = search all
+        # v1.45.0 (Д5): область сужена из-за НЕЭКСПОРТНОЙ процедуры (а не экспорта формы) — вызов
+        # засчитывается только по имени без точки, точка ищется и через перевод строки.
+        non_export_scope = False
 
         if module_hint:
             # СЫРОЙ matcher, а не публичный `find_module`: ниже `form_name` —
@@ -5183,6 +5572,7 @@ def make_bsl_helpers(
                                 if not p["is_export"] or hm.get("form_name") is not None:
                                     # Not exported or form module -> only search same file
                                     target_files = [hm["path"]]
+                                    non_export_scope = not p["is_export"]
                                 break
                     except Exception:
                         pass
@@ -5223,12 +5613,40 @@ def make_bsl_helpers(
 
         # --- Step 5: Scan each file for callers ---
         callers: list[dict] = []
+        own_call_re = re.compile(r"(?<!\w)" + name_esc + r"\s*\(", re.IGNORECASE)
 
         for rel, info in page_files:
             try:
                 content = _ext_read_file(rel)
                 lines = content.splitlines()
                 procs = extract_procedures(rel)
+
+                if non_export_scope:
+                    # Неэкспортная цель: только вызов по имени без точки. Точка перед именем ищется по
+                    # маске назад через пробелы, перевод строки и погашенный комментарий — тем же
+                    # примитивом, что у сборщика для членов цепочки (`Модуль.` ⏎ `Метод(` — стиль БСП).
+                    masked = mask_comments_and_strings(lines)
+                    for proc in procs:
+                        body_end = proc["end_line"] if proc["end_line"] else len(lines)
+                        for line_idx in range(proc["line"], min(body_end, len(masked))):
+                            for m in own_call_re.finditer(masked[line_idx]):
+                                if _is_chain_member_in_lines(masked, line_idx, m.start()):
+                                    continue
+                                callers.append(
+                                    {
+                                        "file": rel,
+                                        "caller_name": proc["name"],
+                                        "caller_is_export": proc["is_export"],
+                                        "line": line_idx + 1,
+                                        "context": lines[line_idx].rstrip(),
+                                        "object_name": info.object_name,
+                                        "category": info.category,
+                                        "module_type": info.module_type,
+                                        "call_kind": "call",
+                                    }
+                                )
+                                break  # one match per line is enough
+                    continue
 
                 # Finding #3 (v1.26.0): multiline-aware очистка через _scan_module —
                 # содержимое многострочных строковых литералов (тексты запросов с |)
@@ -5289,6 +5707,8 @@ def make_bsl_helpers(
             "exact_rows": 0,
             "fallback_rows": len(callers),
         }
+        if non_export_scope:
+            _fs_meta["non_export_target"] = True
         if _layer_transient:
             # Слой пытались подмешать, но поколение индекса сменилось: ответ неполный.
             _fs_meta["extension_layer"] = "partial"
@@ -5337,6 +5757,9 @@ def make_bsl_helpers(
             ``str``-режим: dict with "callers" list and "_meta" pagination info.
             ``list``-режим: dict by name (значение — ``{callers, _meta}`` либо
             ``{error}`` на упавшем элементе).
+            v1.46.0 (Д15): ``_meta.hint`` (условный) — на индексе при ``target_exact=True``,
+            ``exact_rows == 0`` и ``fallback_rows > 0``: цель разрешена точно, а строки — вызовы по
+            имени (``edge_exact=False``), среди них — вызовы одноимённых методов других объектов.
         """
         return _single_or_map(
             proc_name,
@@ -5467,6 +5890,11 @@ def make_bsl_helpers(
         #   - fallback branch → (name.casefold(), '') — legacy name-only behavior,
         #     no precision to preserve.
         visited: set[tuple[str, str]] = set()
+        # v1.45.0 (Д3): пары (имя, подсказка), уже запрошенные у find_callers_context. Каждая строка
+        # вызывающего — отдельная запись очереди (метод, зовущий цель трижды, — три записи), и повтор
+        # пары стоил полного запроса, после которого шёл `continue` по visited. Индекс и исходники
+        # неизменны в течение сессии, поэтому повтор дал бы тот же ответ и тот же `continue`.
+        queried: set[tuple[str, str]] = set()
         queue: list[tuple[str, int, str]] = [(name, 1, module_hint or "")]
         per_target_truncation: dict[tuple[str, str], dict] = {}
         root_seen = False
@@ -5481,6 +5909,9 @@ def make_bsl_helpers(
                 break
             target_name, level, hint = queue.pop(0)
             name_cf = target_name.casefold()
+            if (name_cf, hint) in queried:
+                continue
+            queried.add((name_cf, hint))
 
             try:
                 ctx = find_callers_context(target_name, module_hint=hint, offset=0, limit=200)
@@ -5676,9 +6107,10 @@ def make_bsl_helpers(
         # the py_lower resolve below — so an ambiguous bail never pays the
         # Cyrillic SCAN of _resolve_target_key. Each unhinted end is checked
         # independently (a one-sided hint pins only its own end). The guard runs
-        # ONLY on a FRESH authoritative index WITH a call graph: on a
-        # stale/no-calls index find_path falls back to FS anyway and the methods
-        # probe is unreliable, so it stays out of the way.
+        # ONLY on an authoritative index WITH a call graph (FRESH, or — v1.45.0, Р1 —
+        # stale_age whose content sample matched or was skipped by the threshold): on a
+        # non-authoritative/no-calls index find_path falls back to FS anyway and the
+        # methods probe is unreliable, so it stays out of the way.
         def _has_calls() -> bool:
             # has_calls is a SQL-backed property (SELECT 1 FROM calls LIMIT 1) —
             # evaluate it ONCE here, never per-end.
@@ -5811,6 +6243,11 @@ def make_bsl_helpers(
                         f"Проверка модуля расширения из {_arg} недоступна (бюджет или отказ чтения): "
                         "путь не утверждается и не опровергается."
                     )
+                    # v1.45.0 (Д1): неокончательный промах несёт верхний hint — тот же текст и маршрут.
+                    _early["hint"] = (
+                        f"{_early_meta['hint']} Маршрут: другая подсказка — путь модуля, где метод объявлен "
+                        f"(find_definition({_nm!r})), либо пустая подсказка для поиска по имени."
+                    )
                     _early["_meta"] = _early_meta
                     return _early
                 _early["error"] = f"Метод '{_nm}' не объявлен в модуле расширения {_rel} ({_arg})"
@@ -5874,6 +6311,8 @@ def make_bsl_helpers(
             hit_id = 0
 
         visited: set[tuple[str, str]] = set()
+        # v1.45.0 (Д3): уже запрошенные пары (имя, подсказка) — см. find_call_hierarchy.
+        queried: set[tuple[str, str]] = set()
         queue: list[tuple[str, str, int, int]] = [(to_name, to_hint or "", 0, 0)]
         nodes_expanded = 0
         budget_exceeded = False
@@ -5883,6 +6322,21 @@ def make_bsl_helpers(
         # budget_exceeded ONLY on a miss (a hit is conclusive regardless).
         callers_truncated = False
         layer_states: set[str] = set()  # v1.42.0: статусы слоя расширений у раскрытых узлов
+        # v1.45.0 (Д1): усечённые узлы (первые _TRUNCATED_NODES_SHOWN) и подсказка, с которой
+        # запрашивался первый из них, — для исполнимого маршрута добора в верхнем hint промаха.
+        truncated_nodes: list[dict] = []
+        truncated_total = 0
+        first_truncated_hint = ""
+
+        def _caller_node(c: dict, parent_id: int) -> dict:
+            return {
+                "name": c.get("caller_name", ""),
+                "module_path": c.get("file", ""),
+                "call_line": c.get("line"),
+                "call_kind": c.get("call_kind", "call"),
+                "edge_exact": bool(c.get("edge_exact", False)),
+                "parent_id": parent_id,
+            }
 
         while queue and hit_id is None:
             if nodes_expanded >= _HIERARCHY_VISITED_CAP:
@@ -5891,6 +6345,9 @@ def make_bsl_helpers(
             cur_name, cur_hint, depth, cur_id = queue.pop(0)
             if depth >= max_depth_int:
                 continue
+            if (cur_name.casefold(), cur_hint) in queried:
+                continue
+            queried.add((cur_name.casefold(), cur_hint))
             try:
                 ctx = find_callers_context(cur_name, module_hint=cur_hint, offset=0, limit=_FIND_PATH_NODE_LIMIT)
             except Exception:
@@ -5910,6 +6367,7 @@ def make_bsl_helpers(
             if meta.get("extension_layer") in ("complete", "partial"):
                 layer_states.add(meta["extension_layer"])
 
+            queued = 0
             for c in ctx.get("callers", []) or []:
                 c_name = c.get("caller_name", "")
                 if not c_name:
@@ -5917,18 +6375,47 @@ def make_bsl_helpers(
                 c_file = c.get("file", "")
                 counter += 1
                 cid = counter
-                nodes[cid] = {
-                    "name": c_name,
-                    "module_path": c_file,
-                    "call_line": c.get("line"),
-                    "call_kind": c.get("call_kind", "call"),
-                    "edge_exact": bool(c.get("edge_exact", False)),
-                    "parent_id": cur_id,
-                }
+                nodes[cid] = _caller_node(c, cur_id)
                 if _matches_from(c_name, c_file):
                     hit_id = cid
                     break
                 queue.append((c_name, c_file, depth + 1, cid))
+                queued += 1
+
+            if hit_id is None and meta.get("has_more"):
+                # v1.45.0 (Д1): маршрут строк (индекс, слой расширений — счёт и срез общие) —
+                # прямое ребро `from → узел` проверяется по ВСЕМ вызывающим одним запросом остатка;
+                # в очередь остаток не идёт. Маршрут файлов (FS) листает ФАЙЛЫ, продолжение — обход
+                # следующих кандидатов без верхней границы цены (Р2): узел только помечается.
+                rows_route = meta.get("exact_available") is True
+                total = meta.get("total_callers")
+                page = _FIND_PATH_NODE_LIMIT
+                if rows_route and isinstance(total, int) and total > page:
+                    try:
+                        rest = find_callers_context(cur_name, module_hint=cur_hint, offset=page, limit=total - page)
+                    except Exception:
+                        rest = None
+                    for c in (rest.get("callers", []) or []) if isinstance(rest, dict) else []:
+                        if c.get("caller_name") and _matches_from(c["caller_name"], c.get("file", "")):
+                            counter += 1
+                            nodes[counter] = _caller_node(c, cur_id)
+                            hit_id = counter
+                            break
+                if hit_id is None:
+                    truncated_total += 1
+                    if not truncated_nodes:
+                        first_truncated_hint = cur_hint
+                    if len(truncated_nodes) < _TRUNCATED_NODES_SHOWN:
+                        truncated_nodes.append(
+                            {
+                                "name": cur_name,
+                                "module_path": nodes[cur_id]["module_path"],
+                                "expanded": queued,
+                                "next_offset": page,
+                                "page_unit": "rows" if rows_route else "files",
+                                "total_callers": total if rows_route and isinstance(total, int) else None,
+                            }
+                        )
 
         _meta = {
             "max_depth": max_depth_int,
@@ -5949,14 +6436,21 @@ def make_bsl_helpers(
             # overflow (callers_truncated) means we may have skipped the edge; a partial
             # extension layer (v1.42.0) likewise leaves the miss inconclusive.
             _meta["budget_exceeded"] = budget_exceeded or callers_truncated or "partial" in layer_states
-            return {
-                "found": False,
-                "from": from_name,
-                "to": to_name,
-                "path": None,
-                "depth": 0,
-                "_meta": _meta,
-            }
+            miss: dict = {"found": False, "from": from_name, "to": to_name, "path": None, "depth": 0}
+            if _meta["budget_exceeded"]:
+                # v1.45.0 (Д1): неокончательный промах называет маршрут добора, а не молчит.
+                if truncated_nodes:
+                    _meta["truncated_nodes"] = truncated_nodes
+                    _meta["truncated_nodes_total"] = truncated_total
+                miss["hint"] = _find_path_miss_hint(
+                    truncated_nodes,
+                    truncated_total,
+                    first_truncated_hint,
+                    budget_exceeded,
+                    "partial" in layer_states,
+                )
+            miss["_meta"] = _meta
+            return miss
 
         # Reconstruct forward path [from → … → to] by walking parent_id from the
         # hit node (= from) up to the start node (= to). parent_id of a caller
@@ -6450,9 +6944,12 @@ def make_bsl_helpers(
                 _ext_layer_cache["graph"] = value
         return value
 
-    def _ext_rows_for(proc_name: str, target_key: str | None, root: str | None) -> tuple[list[dict], str]:
+    def _ext_rows_for(
+        proc_name: str, target_key: str | None, root: str | None, *, exact_only: bool = False
+    ) -> tuple[list[dict], str]:
         """Строки слоя для ответа графа (отбор — ``_ext_row_matches``) по ``(file, line, call_kind)``
-        и статус уровня. ``root`` задан — только строки модулей этого корня (цель в расширении)."""
+        и статус уровня. ``root`` задан — только строки модулей этого корня (цель в расширении).
+        ``exact_only`` (v1.45.0, Д5) — неэкспортная цель: только точные рёбра."""
         layer = _ext_graph_index()
         ids = set(layer["by_short"].get(_sql_nocase(proc_name.rpartition(".")[2]), ()))
         if target_key is not None:
@@ -6463,7 +6960,7 @@ def make_bsl_helpers(
             key = layer["keys"][i]
             if root is not None and row_root != root:
                 continue
-            if not _ext_row_matches(callee, key, proc_name, target_key, kind):
+            if not _ext_row_matches(callee, key, proc_name, target_key, kind, exact_only=exact_only):
                 continue
             info = layer["module_info"][file]
             out.append(
@@ -6490,7 +6987,7 @@ def make_bsl_helpers(
             meta["extension_rows"] = 0
             meta["extension_layer"] = "not_applied"  # подсказка не свелась к одному модулю
             return result
-        ext, status = _ext_rows_for(proc_name, target_key, None)
+        ext, status = _ext_rows_for(proc_name, target_key, None, exact_only=bool(meta.get("non_export_target")))
         main_total = int(meta.get("total_callers") or 0)
         ext_exact = sum(1 for d in ext if d["edge_exact"])
         result["callers"] = _merge_ext_page(list(result.get("callers") or []), main_total, ext, offset, limit)
@@ -6547,8 +7044,11 @@ def make_bsl_helpers(
         target_status = _ext_target_status(proc_name, rel)
         declared = target_status == "declared"
         target_key = _make_callee_key(rel, proc_name) if declared else None
+        # v1.45.0 (Д5): неэкспортная процедура модуля расширения — только точные рёбра (вызов по имени
+        # без точки в своём модуле); объявление — фаза 2 слоя.
+        non_export = declared and not _ext_call_layer()["module_procs"][rel][proc_name.casefold()].get("is_export")
         if declared:
-            ext, status = _ext_rows_for(proc_name, target_key, _extension_root_for.get(rel))
+            ext, status = _ext_rows_for(proc_name, target_key, _extension_root_for.get(rel), exact_only=non_export)
         else:
             # Подсказка указывает на конкретный модуль без такой процедуры: поиск по одному
             # имени дал бы чужое эвристическое ребро.
@@ -6570,6 +7070,8 @@ def make_bsl_helpers(
         }
         if declared:
             meta["target_key"] = target_key
+        if non_export:
+            meta["non_export_target"] = True
         if target_status == "unavailable":
             meta["hint"] = (
                 "Проверка целевого модуля расширения недоступна: бюджет или отказ чтения." + _EXT_PARTIAL_NOTE
@@ -7282,7 +7784,8 @@ def make_bsl_helpers(
         Проверяются ``Модуль.Метод(``, ``Коллекция.X.Метод(`` и запуски по имени
         (``ФоновыеЗадания.Выполнить``, ``ДлительныеОперации.*``). Основной слой — индекс v17 с
         графом вызовов; расширения — живой проход (общий кеш сессии). Страница ``issues`` режется
-        из полного отсортированного набора, агрегаты считаются по нему же."""
+        из полного отсортированного набора, агрегаты считаются по нему же. Неизвестный ``layer`` и
+        (v1.46.0) неизвестная причина в ``reasons`` — ``ValueError`` с перечнем допустимых."""
         _sig = "find_unresolved_calls(layer='all', reasons=None, path='', limit=50, offset=0)"
         limit, w_lim = _coerce_bound(limit, 50, "limit", _sig)
         offset, w_off = _coerce_bound(offset, 0, "offset", _sig)
@@ -7290,25 +7793,8 @@ def make_bsl_helpers(
         if reasons is None:
             reasons_norm = set(_AUDIT_DEFAULT_REASONS)
         else:
-            if isinstance(reasons, str):
-                items = [reasons]
-            elif isinstance(reasons, (list, tuple, set, frozenset)):
-                items = list(reasons)
-            else:
-                items = [reasons]
-            reasons_norm = set()
-            unknown: list[str] = []
-            for item in items:
-                token = item.strip().lower() if isinstance(item, str) else None
-                if token in _AUDIT_REASONS:
-                    reasons_norm.add(token)
-                else:
-                    unknown.append(repr(item))
-            if unknown:
-                warns.append(
-                    f"reasons: неизвестные значения {', '.join(unknown)} отброшены; допустимые: "
-                    f"{', '.join(_AUDIT_REASONS)}."
-                )
+            # v1.46.0 (Д4, П1): неизвестная причина — отказ (прежде отбрасывалась с `_meta.arg_warning`).
+            reasons_norm = set(_closed_values("find_unresolved_calls", "reasons", reasons, _AUDIT_REASONS))
         ext_layers: dict[str, str] = {}
         for ext_root in _ext_roots_resolved:
             lname = _audit_layer_name(str(ext_root))
@@ -8149,9 +8635,15 @@ def make_bsl_helpers(
 
         Имя объекта аргументом по-прежнему сначала резолвится
         ``_resolve_module_arg`` — за буквальный filesystem path оно НЕ принимается,
-        и все resolver-ключи ``_meta`` сохраняются.
+        и все resolver-ключи ``_meta`` сохраняются. v1.46.0: имя, которому не нашёлся
+        модуль, — тот же ``FileNotFoundError``, что у ``extract_procedures`` (раньше —
+        «скелет» с нулями); путь несуществующего файла — прежний ответ.
         """
         locator, arg_meta = _resolve_module_arg(path)
+        if arg_meta.get("chosen_reason") == "name_not_found":
+            # v1.46.0 (Д3): имя, которому не нашёлся модуль, — тот же `FileNotFoundError`, что у
+            # `extract_procedures`; раньше — «скелет» с нулями (`fallback_reason='parse_failed: …'`).
+            raise _module_file_not_found(locator)
         try:
             resolved = _ext_resolve_safe(locator)
         except PermissionError:
@@ -8160,17 +8652,31 @@ def make_bsl_helpers(
             raise PermissionError(
                 f"Access denied: path {locator!r} cannot be resolved ({type(exc).__name__})"
             ) from None
+        # v1.45.0 (Д13): маршрут ядра и строка индекса выбираются по ТЕКСТУ пути (`modules.rel_path`,
+        # «модуль соседнего расширения» `../cfe/…`), поэтому абсолютная форма и форма с `\` того же файла
+        # уходили мимо индекса («индекса нет») либо мимо маршрута расширения. Ядру передаётся канонический
+        # путь от корня сессии (`../…` у расширения); аргумент в другой форме — `_meta.requested_path`.
+        # Имя, разрешённое по каталогу, уже канонично; путь на другом диске (`relpath` бросает) — как прежде.
+        canonical = locator
+        if not arg_meta.get("resolved_from_name"):
+            try:
+                canonical = Path(os.path.relpath(resolved, _base_path_resolved)).as_posix()
+            except ValueError:
+                canonical = locator
         # Результат резолва ИСПОЛЬЗУЕТСЯ, а не выбрасывается: owner untrusted-пути
         # обязан считаться по containment (шаг 2 правила), иначе абсолютная и
         # `sub/../../cfe/…` формы того же файла молча получили бы `"main"`.
-        return _get_module_outline_core(
-            locator,
+        res = _get_module_outline_core(
+            canonical,
             include_methods,
             no_live,
             _arg_meta=arg_meta,
             trusted_catalog_path=False,
             _resolved_owner=_owner_for_resolved(resolved),
         )
+        if canonical != locator and isinstance(res.get("_meta"), dict):
+            res["_meta"]["requested_path"] = path
+        return res
 
     def _get_module_outline_core(
         path: str,
@@ -8369,7 +8875,12 @@ def make_bsl_helpers(
             # Module not in the index (valid 'not indexed') → live / skip.
             return _finish(_fallback("index_unavailable_or_table_missing"))
         if not data["methods"]:
-            # Module row present but no methods (stale) → live safety net / skip.
+            # v1.45.0 (Д14): модуль без процедур — законное состояние (7–9 % модулей боевых конфигураций,
+            # все совпадают с диском). Файл совпадает со строкой индекса (mtime/size) — ответ индекса;
+            # изменился после сборки — прежний live safety net / пропуск.
+            mod = data["module"]
+            if file_matches_index_stat(Path(base_path) / path, mod.get("mtime"), mod.get("size")):
+                return _finish(_assemble(data["regions"], [], mod, True, None))
             return _finish(_fallback("index_empty_for_module"))
         # Index path.
         return _finish(_assemble(data["regions"], data["methods"], data["module"], True, None))
@@ -9300,25 +9811,24 @@ def make_bsl_helpers(
         procedures with custom prefix, custom #Область regions, custom XML attributes.
         If custom_prefixes is not provided, uses auto-detected prefixes from the codebase.
 
-        Returns: dict with modifications list and custom_attributes.
+        Returns: dict with modifications list and custom_attributes (``hint?`` — фрагмент имени, v1.46.0).
 
         v1.44.0: префикс типа в любом регистре и путь — категория, и она строгая (как у
-        ``analyze_object``); голое имя — прежний выбор."""
+        ``analyze_object``). v1.46.0 (Д17, Д20): ответ — о спрошенном объекте, те же ветви, что у
+        ``analyze_object``: на омониме — модули одного объекта; точный объект без модулей —
+        ``modules_analyzed: 0``, ``modifications: []`` и ``custom_attributes`` из его описателя; фрагмент — модули
+        одного ближайшего объекта и ``hint``; объект основной в сессии на расширении — ``error``. Проверка
+        префиксов — первой: без них вопрос о доработках не решить ни для какого объекта."""
         category_arg, object_name = _object_arg(object_name, _strip_meta_prefix_arg)
         prefix_source = "user" if custom_prefixes else "auto"
         prefixes = custom_prefixes or _ensure_prefixes()
         if not prefixes:
             return {"error": "Нетиповые префиксы не обнаружены. Укажите custom_prefixes вручную."}
 
-        module_category = _module_search_category(category_arg)
-        modules = find_module(object_name, category=module_category) if module_category is not None else []
-        # v1.44.0: точные модули — и за потолком страницы find_module (см. `_exact_page_modules`).
-        exact = _exact_page_modules(modules, object_name, module_category or "")
-        if not exact and not category_arg:
-            exact = modules
-        if not exact:
-            where = f" в категории {category_arg}" if category_arg else ""
-            return {"error": f"Объект '{object_name}'{where} не найден"}
+        target = _asked_object_target(object_name, category_arg)
+        if "error" in target:
+            return {"error": target["error"]}
+        exact = target.get("modules") or []
 
         def _match_prefix(s: str) -> bool:
             sl = s.lower()
@@ -9360,11 +9870,17 @@ def make_bsl_helpers(
 
         custom_attributes: list[dict] = []
         parse_error: str | None = None
-        category = exact[0].get("category", "")
-        obj_name = exact[0].get("object_name", "")
+        if "card" in target:
+            # v1.46.0 (Д20): объект без модулей — реквизиты из его описателя (вложенная подсистема — по пути).
+            category, obj_name, descriptor = target["card"]
+            object_name = obj_name
+        else:
+            category = exact[0].get("category", "")
+            obj_name = exact[0].get("object_name", "")
+            descriptor = f"{category}/{obj_name}"
         if category and obj_name:
             try:
-                meta = parse_object_xml(f"{category}/{obj_name}")
+                meta = parse_object_xml(descriptor)
                 for attr in meta.get("attributes", []):
                     if _match_prefix(attr["name"]):
                         custom_attributes.append(attr)
@@ -9390,6 +9906,8 @@ def make_bsl_helpers(
         }
         if parse_error:
             result["parse_error"] = parse_error
+        if target.get("hint"):
+            result["hint"] = target["hint"]
         return result
 
     # ── Categories whose objects are pure metadata (no BSL module by default) ──
@@ -9521,7 +10039,7 @@ def make_bsl_helpers(
         if _module_search_category(prefer_category or "") is None:
             modules = []  # v1.44.0: категория без модулей (`DefinedTypes`) — модулей нет, а не отказ «категория неизвестна»
         else:
-            modules = find_module(name, category=prefer_category or "")
+            modules = _find_module_page(name, category=prefer_category or "")
         # v1.44.0: точные модули — и за потолком страницы find_module (см. `_exact_page_modules`); сама страница
         # остается источником close-match фолбэка Pass 3, как прежде.
         exact_modules = [
@@ -9727,6 +10245,25 @@ def make_bsl_helpers(
                 return cat
         return ""
 
+    def _dot_head_category(head: str) -> str:
+        """Категория головы ТОЧЕЧНОЙ формы ссылки (v1.46.0, Д1) либо ``''``: виды без ссылочного типа и
+        определяемый тип (``_REF_KIND_CATEGORIES``), множественное число RU/EN категорий с менеджером
+        (``Документы``, ``documents`` — ``_CALL_MANAGER_COLLECTIONS``) и точное имя каталога категории
+        (``CommonModules``, ``Subsystems``, ``DefinedTypes``; регистр, пробелы и ``_`` не важны — как у пути).
+        Запасного правила «+s» нормализатора категорий здесь нет: английское единственное число вида без
+        ссылочного типа (``Subsystem``, ``Role``) категорией не становится — у него нет русской пары
+        (``Подсистема.X`` — не ссылка), а единственное число видов со ссылочным типом разбирает
+        ``_split_typed_name``."""
+        h = head.casefold()
+        category = _REF_KIND_CATEGORIES.get(h) or _CALL_MANAGER_COLLECTIONS.get(h)
+        if category:
+            return category
+        key = h.replace(" ", "").replace("_", "")
+        for folder in (*_known_categories(), _DEFINED_TYPES_KIND[0]):
+            if folder.casefold() == key:
+                return folder
+        return ""
+
     # v1.44.0: прежний разбор на время вызова композита, чей аргумент — не ссылка (`analyze_document_flow`, секции
     # `get_object_profile`): производное имя (`Catalogs/X` из `Документ.Catalogs/X`) дочерний хелпер иначе разобрал
     # бы как ссылку. Режим — у потока: дочерние вызовы композита идут в его потоке, а параллельные вызовы (прогрев,
@@ -9757,7 +10294,11 @@ def make_bsl_helpers(
         мешают. Все прочее — голое имя, не-строка, пробелы, префикс или путь без имени, сегмент из пробелов, ``/``
         после префикса с точкой, ссылка на член объекта, прочие числовые символы Юникода в имени (``²``, ``Ⅻ``) —
         не ссылка: ее отвечает прежний разбор вызывающего хелпера, байт в байт как до v1.44.0. Внутри
-        ``_previous_parsing`` ссылкой не является ничто."""
+        ``_previous_parsing`` ссылкой не является ничто. v1.46.0 (Д1): голова точечной формы — и множественное
+        число категории с менеджером (``Documents.X``, ``Документы.X``), и имя каталога категории, известной
+        разбору (``_known_categories()`` и ``DefinedTypes``: ``CommonModules.X``, ``Subsystems.X``) —
+        ``_dot_head_category``; подписки, регламентные задания, функциональные опции и 14 каталогов без модулей
+        (``CommonPictures``…) разбор не знает — ни путь, ни точечная форма их объекта ссылкой не являются."""
         if not isinstance(raw, str) or getattr(_parsing_mode, "previous", 0):
             return None
         text = raw.strip()
@@ -9772,10 +10313,266 @@ def make_bsl_helpers(
             category, name = _split_typed_name(text)
             if not category:
                 kind, dot, rest = text.partition(".")
-                category, name = (_REF_KIND_CATEGORIES.get(kind.casefold(), ""), rest) if dot else ("", "")
+                category, name = (_dot_head_category(kind), rest) if dot else ("", "")
         if category and _is_object_name(name):
             return category, name
         return None
+
+    def _ref_head_category(head: str) -> str:
+        """Категория головы префикса типа (``Документ``, ``документ``, ``Document``, ``ДокументСсылка``,
+        ``ОбщийМодуль``, ``ОпределяемыйТип``…) — те же таблицы, что у ``_object_ref``/``_strip_meta_prefix``;
+        иначе ``''``. Пробная ссылка ``Голова.X`` разбирается ``_split_typed_name``. v1.46.0 (Д1): и голова
+        точечной формы ``_dot_head_category`` — ``Документы.``/``Documents.`` без имени — аргумент без имени."""
+        if not head:
+            return ""
+        category, _name = _split_typed_name(f"{head}.X")
+        if category:
+            return category
+        category = _dot_head_category(head)
+        if category:
+            return category
+        return "meta" if any(f"{head}.".casefold() == p.casefold() for p in _META_TYPE_PREFIXES) else ""
+
+    def _nameless_object_arg(raw) -> bool:
+        """v1.45.0 (Д8): аргумент объекта без имени — пустая или пробельная строка, префикс типа без имени
+        (``Документ.``, ``документ.   ``) либо путь категории без имени (``Documents/``, ``Справочники//``).
+        Не-строка и всё прочее — ``False``: ответ хелпера прежний. Проверяется ТОЛЬКО на публичной границе
+        (``_public_arg_guard``): хелперы зовут друг друга функциями замыкания мимо неё."""
+        if not isinstance(raw, str):
+            return False
+        text = raw.strip()
+        if not text:
+            return True
+        head, slash, tail = text.partition("/")
+        if slash:
+            return bool(_path_category(head, _REF_KIND_CATEGORIES)) and not any(tail.split("/"))
+        head, dot, rest = text.partition(".")
+        return bool(dot) and not rest and bool(_ref_head_category(head))
+
+    def _module_dir_arg(raw, *, resolves_names: bool) -> bool:
+        """v1.45.0 (Д8): у хелпера «путь или имя» аргумент — пустой путь или КАТАЛОГ (основной конфигурации
+        или соседнего расширения), который хелпер прочёл бы как модуль. Проверяется путь, который хелпер
+        РЕАЛЬНО прочтёт: после разрешения имени (``resolves_names`` — ``extract_procedures``, ``find_exports``,
+        ``get_module_outline``; модуль, выбранный по имени, каталогом не является — общий модуль ``Ext`` при
+        корневом ``Ext`` CF) либо сам аргумент (читающие путь буквально). Отказ разрешения — ``False``:
+        прежний ответ (неоднозначное имя, путь вне всех корней)."""
+        if not isinstance(raw, str):
+            return False
+        if not raw.strip():
+            return True
+        try:
+            locator = raw
+            if resolves_names:
+                locator, meta = _resolve_module_arg(raw)
+                if meta.get("chosen_module"):
+                    return False
+            return _ext_resolve_safe(locator).is_dir()
+        except Exception:
+            return False
+
+    def _nameless_refusal(name: str, raw, example: str) -> ValueError:
+        return ValueError(
+            f"{name}: аргумент без имени объекта {raw!r} — передайте имя или ссылку, например {example!r}"
+        )
+
+    def _bare_category_word(raw) -> str:
+        """v1.46.0 (Д2): категория, если ``raw`` — голое слово категории: строка без ``/`` и ``.``, после
+        ``strip()`` — идентификатор, и это голова точечной формы (``Documents``, ``Документы``, ``ОбщиеМодули``)
+        либо голова префикса типа (``Документ``, ``Перечисление``, ``ПланОбмена``, ``Задача``); иначе ``''``.
+        Головы ``_META_TYPE_PREFIXES`` без категории (``ПодпискаНаСобытие``) словом категории не считаются."""
+        if not isinstance(raw, str):
+            return ""
+        text = raw.strip()
+        if "/" in text or "." in text or not _is_object_name(text):
+            return ""
+        category = _dot_head_category(text) or _ref_head_category(text)
+        return "" if category == "meta" else category
+
+    def _category_word_refusal(name: str, raw, example: str) -> ValueError | None:
+        """v1.46.0 (Д2): отказ на голом слове категории (``Documents``, ``Справочники``, ``Перечисление``) — прежние
+        разборы отвечали на него первым объектом каталога, подстрочным совпадением или всей категорией. Объект
+        с таким ТОЧНЫМ именем в любой из 47 категорий (отчёт ``Задачи``, подсистема ``Справочники``) отказ
+        снимает; в сессии на расширении без основной рядом существование не проверить — ответ прежний."""
+        category = _bare_category_word(raw)
+        if not category or _existence_unknowable() or _object_exists_anywhere(raw.strip()):
+            return None
+        return ValueError(
+            f"{name}: {raw!r} — имя категории ({category}), а не объекта; передайте имя объекта или ссылку, "
+            f"например {example!r}"
+        )
+
+    def _module_dir_refusal(name: str, raw) -> ValueError:
+        return ValueError(
+            f"{name}: {raw!r} — пустой путь или каталог, а не модуль; пути модулей объекта — "
+            "find_module('Имя') или get_object_modules('Имя')"
+        )
+
+    def _public_arg_guard(name: str, fn, refusal, *, blank_as_empty: bool = False, param: str | None = None):
+        """Публичная граница хелпера (v1.45.0, Д8): аргумент объекта — параметр ``param`` функции (по умолчанию
+        первый, по ``inspect.signature``; v1.46.0 — и не первый: ``find_ext_overrides(…, object_name)``),
+        позиционно или по имени; ``refusal(raw)`` — исключение отказа либо ``None``. ``blank_as_empty``
+        (обзорные хелперы) заменяет строку из пробелов на ``''`` ДО разбора. Внутренние вызовы хелперов друг
+        другом идут к функции замыкания (``__wrapped__``) и стража не видят."""
+        params = list(inspect.signature(fn).parameters)
+        target = param or params[0]
+        position = params.index(target)
+
+        @functools.wraps(fn)
+        def guarded(*args, **kwargs):
+            if len(args) > position:
+                raw = args[position]
+            elif target in kwargs:
+                raw = kwargs[target]
+            else:
+                return fn(*args, **kwargs)
+            if blank_as_empty and isinstance(raw, str) and raw and not raw.strip():
+                if len(args) > position:
+                    args = (*args[:position], "", *args[position + 1 :])
+                else:
+                    kwargs = {**kwargs, target: ""}
+                raw = ""
+            exc = refusal(raw)
+            if exc is not None:
+                raise exc
+            return fn(*args, **kwargs)
+
+        return guarded
+
+    def _object_guard(name: str, example: str, *, overview: bool = False, existence: bool = True):
+        def refusal(raw):
+            if overview and raw == "":
+                return None  # обзорный режим: пустое значение по контракту означает «всё»
+            if _nameless_object_arg(raw):
+                return _nameless_refusal(name, raw, example)
+            # v1.46.0 (Д2): вторая проверка — голое слово категории; (Д3) третья — ссылка на несуществующий
+            # объект (`existence=False` — хелперы, чей ответ на несуществующий объект и так `{error}`).
+            exc = _category_word_refusal(name, raw, example)
+            if exc is None and existence:
+                exc = _missing_object_refusal(name, raw)
+            return exc
+
+        return refusal
+
+    def _existence_guard(name: str, example: str, *, existence: bool = True):
+        """v1.46.0 (Д2, Д3): страж хелперов-фильтров по объекту вне класса Д8 (``get_overrides``,
+        ``find_ext_overrides``, ``find_attributes``, ``find_predefined``, ``find_templates``, ``parse_form``):
+        отказ «имя категории» и отказ шлюза. Их пустое значение — «без фильтра» или своя прежняя ошибка,
+        поэтому проверки «без имени» здесь нет. ``existence=False`` — шлюз в теле хелпера (``parse_form``: его
+        прежний отказ «в категории не найден (есть в: …)» точнее, шлюз отвечает только там, где прежде был
+        молчаливый ``[]``)."""
+
+        def refusal(raw):
+            exc = _category_word_refusal(name, raw, example)
+            if exc is None and existence:
+                exc = _missing_object_refusal(name, raw)
+            return exc
+
+        return refusal
+
+    def _missing_where() -> str:
+        """Где искали объект — для текстов отказа шлюза и подсказок (v1.46.0, Д3; П11 — сессия на расширении)."""
+        if _current_root_role() == "extension":
+            return "ни в этом расширении, ни в основной конфигурации"
+        return "ни в основной конфигурации, ни в соседних расширениях"
+
+    def _typed_object_exists(category: str, name: str) -> bool:
+        """v1.46.0 (Д3): объект категории с ТОЧНЫМ именем есть — по описателям корней существования, затем
+        прежним союзом ``_object_exists`` (объект из индекса, которого нет на диске, по-прежнему «есть»)."""
+        return name.casefold() in _descriptor_index(category) or _object_exists(category, name)
+
+    def _missing_object_refusal(name: str, raw) -> ValueError | None:
+        """v1.46.0 (Д3, П2): отказ на КОРРЕКТНОЙ ссылке (``_object_ref``) на объект, которого в его категории нет
+        ни в основной конфигурации, ни в соседних расширениях; раньше ответ был неотличим от ответа по
+        существующему (подписки на наборы, роли по флагу, тихий ноль). Не-ссылка и сессия на расширении без
+        основной рядом — ``None``: ответ прежний."""
+        ref = _object_ref(raw)
+        if ref is None or _existence_unknowable():
+            return None
+        category, obj = ref
+        if _typed_object_exists(category, obj):
+            return None
+        return ValueError(
+            f"{name}: объекта {_typed_ref_of(raw)} нет — {_missing_where()}; проверьте имя: search_objects({obj!r})"
+        )
+
+    def _nonref_missing(raw, *, known_categories=()) -> bool:
+        """v1.46.0 (Д3): аргумент-не-ссылка (голое имя, фрагмент, иная строка), которому не соответствует ни
+        один объект. Тогда раскрытия на чтении (подписки на наборы, роли по флагу) к нему не применяются, а у
+        перехватов при нуле — подсказка. Сессия на расширении без основной рядом — ``False``: ответ прежний."""
+        if not isinstance(raw, str) or not raw.strip() or _object_ref(raw) is not None:
+            return False
+        if _existence_unknowable():
+            return False
+        return not _object_exists_anywhere(raw, known_categories=known_categories)
+
+    def _missing_object_hint(raw) -> str:
+        return (
+            f"Объекта с именем {raw.strip()!r} нет — {_missing_where()}; перехватов поэтому нет. "
+            f"Проверьте имя: search_objects({raw.strip()!r})"
+        )
+
+    def _path_guard(name: str, *, resolves_names: bool, nameless_too: bool = False):
+        def refusal(raw):
+            if _module_dir_arg(raw, resolves_names=resolves_names):
+                return _module_dir_refusal(name, raw)
+            if nameless_too and _nameless_object_arg(raw):
+                return _nameless_refusal(name, raw, "ОбщийМодуль.ОбщегоНазначения")
+            return None
+
+        return refusal
+
+    _DOC_EXAMPLE = "Документ.РеализацияТоваровУслуг"
+    # Хелперы класса Д8 → (отказ, обзорный?, параметр объекта — None: первый). Не входят: analyze_subsystem
+    # (свой отказ-словарь). v1.46.0: шлюз существования (Д3) — третья проверка `_object_guard`; у хелперов, чей
+    # ответ на несуществующий объект и так `{error}`, — без него (`existence=False`); фильтры по объекту
+    # (пустое = без фильтра) и parse_form — свой страж `_existence_guard` без проверки «без имени» (у parse_form
+    # шлюз — в теле: его прежний отказ «есть в: …» на ссылке объекта другой категории точнее).
+    _PUBLIC_ARG_GUARDS = {
+        **{
+            helper: (_object_guard(helper, example, existence=existence), False, None)
+            for helper, example, existence in (
+                ("get_object_full_structure", _DOC_EXAMPLE, False),
+                ("get_object_modules", _DOC_EXAMPLE, False),
+                ("get_object_profile", _DOC_EXAMPLE, False),
+                ("analyze_object", _DOC_EXAMPLE, False),
+                ("find_print_forms", _DOC_EXAMPLE, True),
+                ("find_based_on_documents", _DOC_EXAMPLE, True),
+                ("find_register_movements", _DOC_EXAMPLE, True),
+                ("analyze_document_flow", _DOC_EXAMPLE, True),
+                ("find_references_to_object", "Справочник.Контрагенты", True),
+                ("find_code_usages", "Справочник.Контрагенты", True),
+                ("find_roles", _DOC_EXAMPLE, True),
+                ("find_custom_modifications", _DOC_EXAMPLE, False),
+                ("find_enum_values", "Перечисление.СтатусыЗаказовКлиентов", False),
+                ("find_register_writers", "РегистрНакопления.ТоварыНаСкладах", True),
+                ("find_exchange_plan_content", "ПланОбмена.Полный", True),
+                ("find_defined_types", "ОпределяемыйТип.ВладелецФайлов", True),
+            )
+        },
+        "find_event_subscriptions": (
+            _object_guard("find_event_subscriptions", _DOC_EXAMPLE, overview=True),
+            True,
+            None,
+        ),
+        "find_functional_options": (_object_guard("find_functional_options", _DOC_EXAMPLE, overview=True), True, None),
+        **{
+            helper: (_existence_guard(helper, example, existence=existence), False, param)
+            for helper, example, param, existence in (
+                ("get_overrides", _DOC_EXAMPLE, None, True),
+                ("find_ext_overrides", _DOC_EXAMPLE, "object_name", True),
+                ("find_attributes", _DOC_EXAMPLE, "object_name", True),
+                ("find_predefined", "Справочник.Номенклатура", "object_name", True),
+                ("find_templates", _DOC_EXAMPLE, "owner", True),
+                ("parse_form", _DOC_EXAMPLE, None, False),
+            )
+        },
+        "extract_procedures": (_path_guard("extract_procedures", resolves_names=True), False, None),
+        "find_exports": (_path_guard("find_exports", resolves_names=True), False, None),
+        "get_module_outline": (_path_guard("get_module_outline", resolves_names=True, nameless_too=True), False, None),
+        "extract_queries": (_path_guard("extract_queries", resolves_names=False), False, None),
+        "code_metrics": (_path_guard("code_metrics", resolves_names=False), False, None),
+        "read_procedure": (_path_guard("read_procedure", resolves_names=False), False, None),
+    }
 
     def _object_arg(raw, legacy=None) -> tuple[str, str]:
         """``(категория, имя объекта)``: корректная ссылка (``_object_ref``) — ее разбор; любая иная форма —
@@ -9843,23 +10640,34 @@ def make_bsl_helpers(
         ссылка (``_object_ref``); объект другой категории — ``ValueError`` с маршрутом: прежде префикс молча
         отбрасывался, и отвечал одноимённый объект своей категории или уверенный ноль. Не-ссылка (голое имя и
         прочее) — ``legacy(raw)``, прежний разбор этого хелпера (по умолчанию ``_strip_meta_prefix``)."""
-        categories, what, only, example = _CATEGORY_ARG_KINDS[kind]
+        categories, _what, _only, _example = _CATEGORY_ARG_KINDS[kind]
         ref = _object_ref(raw)
         if ref is None:
             return (legacy or _strip_meta_prefix)(raw)
         category, name = ref
         if category not in categories:
-            # Маршрут — описатель объекта: `parse_object_xml` читает его у любого вида, с индексом и без
-            # (профиль и структура находят не все виды — общий макет, HTTP-сервис без модуля). Аргумент — литерал
-            # Python (`!r`): путь корня или каталога расширения бывает с апострофом (`O'Brien/…`).
-            route = f"описание объекта — parse_object_xml({_object_xml_route(category, name)!r})"
-            if category in _REGISTER_CATALOG_DIRS and kind != "registers":
-                route += f"; кто пишет в регистр — find_register_writers({name!r})"
-            raise ValueError(
-                f"{helper}: {raw.strip()!r} — не {what}, а объект категории {category}. Хелпер отвечает "
-                f"только {only} (голое имя, {example}); {route}."
-            )
+            raise _category_refusal(helper, raw, category, name, kind)
         return name
+
+    def _category_refusal(
+        helper: str, raw: str, category: str, name: str, kind: str, *, route_path: str | None = None
+    ) -> ValueError:
+        """Отказ хелпера одной категории на объекте другой категории (v1.44.0): категория и маршрут. Общий у
+        ``_category_arg`` и секции ``flow`` профиля — та знает категорию объекта, даже когда разбор аргумента ее
+        не распознает (v1.45.0). ``route_path`` (v1.46.0) — путь уже найденного описателя (``_object_card_target``):
+        прежний ``_object_xml_route`` ищет описатель только на верхнем уровне каталога категории, и у вложенной
+        подсистемы его маршрут неисполним; прочие вызывающие его не передают — маршрут прежний."""
+        _categories, what, only, example = _CATEGORY_ARG_KINDS[kind]
+        # Маршрут — описатель объекта: `parse_object_xml` читает его у любого вида, с индексом и без
+        # (профиль и структура находят не все виды — общий макет, HTTP-сервис без модуля). Аргумент — литерал
+        # Python (`!r`): путь корня или каталога расширения бывает с апострофом (`O'Brien/…`).
+        route = f"описание объекта — parse_object_xml({(route_path or _object_xml_route(category, name))!r})"
+        if category in _REGISTER_CATALOG_DIRS and kind != "registers":
+            route += f"; кто пишет в регистр — find_register_writers({name!r})"
+        return ValueError(
+            f"{helper}: {raw.strip()!r} — не {what}, а объект категории {category}. Хелпер отвечает "
+            f"только {only} (голое имя, {example}); {route}."
+        )
 
     def _object_xml_route(category: str, name: str) -> str:
         """Путь для маршрута ``parse_object_xml(...)``, исполнимый в этой сессии (v1.44.0): от текущего корня
@@ -10323,7 +11131,9 @@ def make_bsl_helpers(
                     if (s.get("object_name") or "").lower() == obj_name.lower() and (
                         not category or (s.get("category") or "").lower() == category.lower()
                     ):
-                        result["synonym"] = s.get("synonym") or None
+                        # v1.46.0 (Д9): ридер отдаёт хранимую форму «<Категория>: <синоним>» — наружу
+                        # синоним как в описателе (живая ветка и `find_enum_values` — тоже без префикса).
+                        result["synonym"] = strip_category_prefix(s.get("category"), s.get("synonym") or "") or None
                         break
 
             # Forms from form_elements (distinct form_name).
@@ -10486,10 +11296,13 @@ def make_bsl_helpers(
         for ref in enum_refs:
             short_name = ref.split(".", 1)[1] if "." in ref else ref
             try:
-                ev = find_enum_values(short_name)
+                # v1.46.0 (Д19, П9): ссылкой — только ТОЧНОЕ перечисление типа (прежде голым именем, и ридер отдавал
+                # первое, чьё имя СОДЕРЖИТ запрос: у `СтавкиНДС` — значения `СпособыЗаполненияСтавкиНДС`). Сверка
+                # имени — и под прежним разбором (`_previous_parsing`), где ссылка разбирается как голое имя.
+                ev = find_enum_values(f"Перечисление.{short_name}")
             except Exception:
                 continue
-            if isinstance(ev, dict) and not ev.get("error"):
+            if isinstance(ev, dict) and not ev.get("error") and (ev.get("name") or "").lower() == short_name.lower():
                 all_values = [
                     {"name": v.get("name", ""), "synonym": v.get("synonym", "") or ""} for v in (ev.get("values") or [])
                 ]
@@ -10620,7 +11433,7 @@ def make_bsl_helpers(
         result["objects"] = objects
         return result
 
-    def _resolve_object_for_modules(name: str, category: str = ""):
+    def _resolve_object_for_modules(name: str, category: str = "", *, exact_only: bool = False):
         """``(category, object_name, modules)`` для объекта одним прямым exact-сканом
         ``_index_state`` — НЕ через capped ``find_module`` и НЕ через
         ``_resolve_object_for_full_structure`` напрямую (оба возвращают на шаг раньше
@@ -10638,6 +11451,10 @@ def make_bsl_helpers(
         ``category`` (v1.43.0, канонический каталог из префикса типа ``Документ.X``) —
         объект ТОЛЬКО этой категории: прямой скан с фильтром категории, синонимный маршрут
         выбирает кандидата этой категории ДО выбора канона. Пусто — прежнее поведение.
+
+        ``exact_only`` (v1.46.0, Д20) — только первый шаг: прямой exact-скан, без синонимного и
+        подстрочного хода. Им ``get_object_modules`` проверяет точное имя ДО проверки объекта без
+        модулей: иначе синонимный ход ответил бы чужим объектом. ``False`` — прежний ход целиком.
         """
         _ensure_index()
 
@@ -10652,8 +11469,9 @@ def make_bsl_helpers(
             if not rows:
                 return None, None, []
             # Детерминированный выбор identity при коллизии одноимённых объектов в
-            # разных категориях: get_all_modules() без ORDER BY → порядок _index_state
-            # не гарантирован. Сорт по rel_path фиксирует, какая категория «первая».
+            # разных категориях: сорт по rel_path фиксирует, какая категория «первая».
+            # Индексный каталог с v1.46.0 (Д5) уже в порядке пути (get_all_modules() —
+            # ORDER BY rel_path), живой (обход ФС) — нет, поэтому сорт остаётся.
             rows.sort(key=lambda ri: ri[0])
             category = rows[0][1].category
             object_name = rows[0][1].object_name
@@ -10663,7 +11481,7 @@ def make_bsl_helpers(
 
         if category:
             found = _scan(name.lower(), category.lower())
-            if found[2]:
+            if found[2] or exact_only:
                 return found
             want = _normalize_category(category)
             try:
@@ -10676,20 +11494,21 @@ def make_bsl_helpers(
             except Exception:
                 hits = []
             # `search_objects` ищет ПОДСТРОКОЙ: принимается только доказанное совпадение — точное
-            # имя либо точный синоним (хвост после «Категория: », как у ранжира поиска). Иначе
-            # `Документ.Склад` отвечал бы `СкладАрхив`, а не «нет в категории».
+            # имя либо точный синоним. Иначе `Документ.Склад` отвечал бы `СкладАрхив`, а не «нет в
+            # категории». v1.46.0 (Д9): `search_objects` отдаёт синоним уже без префикса вида, и он
+            # сравнивается ЦЕЛИКОМ — второе снятие «до первого двоеточия» резало бы синоним с `': '`
+            # внутри («Отчет: продажи» → «продажи»).
             target = name.strip().lower()
             for r in hits if isinstance(hits, list) else []:
                 if not r.get("object_name") or _normalize_category(r.get("category") or "") != want:
                     continue
                 synonym = (r.get("synonym") or "").lower()
-                synonym = synonym.split(": ", 1)[-1] if ": " in synonym else synonym
                 if r["object_name"].lower() == target or synonym.strip() == target:
                     return _scan(r["object_name"].lower(), category.lower())
             return None, None, []
 
         category, object_name, modules = _scan(name.lower())
-        if modules:
+        if modules or exact_only:
             return category, object_name, modules
 
         # Прямой скан пуст → synonym→canon, затем повторный exact-скан по канону.
@@ -10703,20 +11522,27 @@ def make_bsl_helpers(
                 return category, object_name, modules
         return None, None, []
 
-    def _build_module_entries(modules, include_methods: bool, no_live: bool):
+    def _build_module_entries(modules, include_methods: bool, no_live: bool, *, live_extension_modules: bool = False):
         """Build per-module entries + roll-ups from a resolved ``[(rel, info)]`` list.
         Shared by ``get_object_modules`` and ``get_object_profile`` (modules section).
-        Returns ``(module_entries, totals, all_index_used, any_skipped_live)``."""
+        Returns ``(module_entries, totals, all_index_used, any_skipped_live, counts)``.
+
+        v1.45.0 (Д15): ``counts = {index, live, skipped}`` — каждый модуль ровно в одном: скелет из индекса;
+        живой разбор УДАЛСЯ; методы не прочитаны (пропуск живого разбора либо его отказ — ``parse_failed:``,
+        у которого ``_live`` отдаёт нули без ``skipped_live``). ``live_extension_modules`` (П1) — модули
+        соседних расширений (в индексе основной их нет по построению) разбираются живьём и при ``no_live``."""
         module_entries: list[dict] = []
         roll_methods = roll_exports = roll_overrides = 0
         all_index_used = True
         any_skipped_live = False
+        counts = {"index": 0, "live": 0, "skipped": 0}
         for rel, info in modules:
             # TRUSTED-строки каталога: путь по построению внутри разрешённых roots,
             # поэтому untrusted-оболочка (и её единственный path-resolve) не зовётся —
             # иначе fast-path списков подорожал бы на каждую строку.
+            module_no_live = no_live and not (live_extension_modules and _is_nearby_extension_path(rel))
             outline = _get_module_outline_core(
-                rel, include_methods=include_methods, no_live=no_live, _arg_meta={}, trusted_catalog_path=True
+                rel, include_methods=include_methods, no_live=module_no_live, _arg_meta={}, trusted_catalog_path=True
             )
             ov_methods: list[str] = []
             if idx_reader is not None:
@@ -10731,6 +11557,12 @@ def make_bsl_helpers(
                 all_index_used = False
             if m_meta.get("skipped_live"):
                 any_skipped_live = True
+            if m_meta.get("index_used"):
+                counts["index"] += 1
+            elif m_meta.get("skipped_live") or str(m_meta.get("fallback_reason") or "").startswith("parse_failed:"):
+                counts["skipped"] += 1
+            else:
+                counts["live"] += 1
             entry = {
                 "path": rel,
                 "module_type": info.module_type,
@@ -10769,7 +11601,7 @@ def make_bsl_helpers(
             "exports": roll_exports,
             "overrides": roll_overrides,
         }
-        return module_entries, totals_roll, all_index_used, any_skipped_live
+        return module_entries, totals_roll, all_index_used, any_skipped_live, counts
 
     def _modules_for_identity(category: str | None, object_name: str | None):
         """``[(rel, info)]`` modules of EXACTLY ``(category, object_name)`` — category-aware
@@ -10819,7 +11651,16 @@ def make_bsl_helpers(
                           _meta:{index_used, fallback_reason}}],
                totals: {modules, methods, exports, overrides},
                _meta: {index_used, modules_truncated}}``
-            либо ``{error, _meta}`` если объект не найден.
+            либо ``{error, _meta}`` если объект не найден. v1.46.0 (Д20): у существующего объекта без
+            модулей — ``error`` «У объекта Категория/Имя нет модулей (сам объект есть:
+            parse_object_xml('…'))», проверка точного имени — раньше синонимного и подстрочного хода (прежде
+            он отвечал чужим объектом); объект основной в сессии на расширении — ``error``, называющая это.
+
+            v1.46.0 (Д14, П4) — единицы: ``overrides.count`` модуля и ``totals.overrides`` — число перехваченных
+            МЕТОДОВ, а не строк перехватов (``get_overrides(объект)['total']`` считает строки); верхний
+            ``_meta.index_used=True`` — ВСЕ модули из индекса, ``False`` — хотя бы один разобран живьём или не
+            прочитан (разбивка — ``modules_index``/``modules_live``/``modules_skipped``), а не «индекс не
+            использован». Подпись называет обе единицы.
 
             ``orphan_methods`` присутствует в строке модуля ТОГДА И ТОЛЬКО ТОГДА,
             когда ``include_methods=True``; форма элемента — та же, что у
@@ -10839,15 +11680,32 @@ def make_bsl_helpers(
         """
         want_cat, bare = _object_arg(name, _split_object_arg)  # не-ссылка — прежним `_split_object_arg`
         name = _strip_meta_prefix(bare)
-        category, object_name, modules = _resolve_object_for_modules(name, want_cat)
+        error_meta = {"index_used": idx_reader is not None, "modules_truncated": False}
+        # v1.46.0 (Д20): точное имя — раньше синонимного и подстрочного хода: объект без модулей называется
+        # прямо, а не подменяется чужим объектом, которого находил этот ход (общая картинка `Отправить` → общая
+        # команда `ОтправитьИПолучитьЭДО`).
+        category, object_name, modules = _resolve_object_for_modules(name, want_cat, exact_only=True)
+        if not modules:
+            card = _object_card_target(name, want_cat)
+            if card is not None:
+                return {
+                    "error": (
+                        f"У объекта {card[0]}/{card[1]} нет модулей (сам объект есть: parse_object_xml({card[2]!r}))"
+                    ),
+                    "_meta": error_meta,
+                }
+            main_only = _main_only_object(name, want_cat)
+            if main_only is not None:
+                return {"error": _main_only_error(name, main_only), "_meta": error_meta}
+            category, object_name, modules = _resolve_object_for_modules(name, want_cat)
         if not modules:
             where = f" в категории {want_cat}" if want_cat else ""
             return {
                 "error": f"Объект '{name}'{where} не найден (нет модулей в индексе)",
-                "_meta": {"index_used": idx_reader is not None, "modules_truncated": False},
+                "_meta": error_meta,
             }
 
-        module_entries, totals_roll, all_index_used, any_skipped_live = _build_module_entries(
+        module_entries, totals_roll, all_index_used, any_skipped_live, counts = _build_module_entries(
             modules, include_methods, no_live
         )
         return {
@@ -10859,6 +11717,11 @@ def make_bsl_helpers(
                 "index_used": idx_reader is not None and all_index_used,
                 "modules_truncated": False,
                 "modules_skipped_live": any_skipped_live,
+                # v1.45.0 (Д15): верхний index_used «всё или ничего» гаснет от модулей соседних расширений,
+                # которых в индексе основной нет по построению; счётчики называют, откуда каждый модуль.
+                "modules_index": counts["index"],
+                "modules_live": counts["live"],
+                "modules_skipped": counts["skipped"],
             },
         }
 
@@ -10870,19 +11733,31 @@ def make_bsl_helpers(
         v1.44.0: префикс типа в любом регистре и путь (``Documents/X``, ``Документы/X``, путь модуля
         или описателя) — категория, и она строгая: объекта в ней нет — ``error`` (раньше префикс
         снимался регистрозависимо и отбрасывался: ``документ.X`` давал «не найден», а ``Документ.X``
-        на омониме смешивал модули объектов разных категорий). Голое имя — прежний выбор. Объект с точным
+        на омониме смешивал модули объектов разных категорий). Объект с точным
         именем находится и за потолком 50 подстрочных совпадений ``find_module`` (раньше — «не найден» или
-        чужие объекты)."""
+        чужие объекты).
+
+        v1.46.0 (Д17, Д20): ответ — о спрошенном объекте. На омониме — модули ОДНОГО объекта (категории первого
+        точного модуля), а не всех одноимённых. Точный объект без модулей (роль, подсистема — и вложенная,
+        общая картинка, перечисление без модуля… — любой из 47 категорий) — ``metadata`` его описателя и
+        ``modules: []`` (раньше «не найден» или чужой объект подстрочным отбором). Фрагмент имени — модули ОДНОГО
+        ближайшего по подстроке объекта и верхний ``hint``. Объект основной конфигурации в сессии на
+        расширении — ``error``, называющая это.
+
+        Returns: ``{name, category, metadata, modules, hint?}`` либо ``{error}``."""
         category_arg, name = _object_arg(name, _strip_meta_prefix_arg)
-        module_category = _module_search_category(category_arg)
-        modules = find_module(name, category=module_category) if module_category is not None else []
-        # v1.44.0: точные модули — и за потолком страницы find_module (см. `_exact_page_modules`).
-        exact = _exact_page_modules(modules, name, module_category or "")
-        if not exact and not category_arg:
-            exact = modules[:20]
-        if not exact:
-            where = f" в категории {category_arg}" if category_arg else ""
-            return {"error": f"Объект '{name}'{where} не найден"}
+        target = _asked_object_target(name, category_arg)
+        if "error" in target:
+            return {"error": target["error"]}
+        if "card" in target:
+            card_category, card_name, descriptor = target["card"]
+            card_metadata: dict = {}
+            try:
+                card_metadata = parse_object_xml(descriptor)
+            except Exception:
+                pass
+            return {"name": card_name, "category": card_category, "metadata": card_metadata, "modules": []}
+        exact = target["modules"]
 
         category = exact[0].get("category", "")
         obj_name = exact[0].get("object_name", "")
@@ -10918,12 +11793,15 @@ def make_bsl_helpers(
                 }
             )
 
-        return {
+        result = {
             "name": obj_name,
             "category": category,
             "metadata": metadata,
             "modules": module_details,
         }
+        if target.get("hint"):
+            result["hint"] = target["hint"]
+        return result
 
     # ── get_object_profile — one-shot compact object aggregate ───
     _PROFILE_DEFAULT_SECTIONS = (
@@ -10992,7 +11870,8 @@ def make_bsl_helpers(
             sections: ``None`` → дефолтный compact-набор
                 (structure, modules, registers, subscriptions, roles, functional_options);
                 список → ровно запрошенные (алиасы: attrs→structure, events→subscriptions,
-                movements→registers, права→roles, …).
+                movements→registers, права→roles, …). v1.46.0: неизвестное имя секции —
+                ``ValueError`` с перечнем (прежде секция молча выпадала с ``_meta.arg_warning``).
             include_flow: ``True`` → секция ``flow`` (полный analyze_document_flow,
                 читает тела — ДОРОГО). Дефолт ``False``.
             include_code_usages: ``True`` → секция ``code_usages`` (reverse code-usage).
@@ -11107,27 +11986,34 @@ def make_bsl_helpers(
             if (category and object_name)
             else (object_name or "")
         )
+        # v1.45.0 (решение владельца по переписи 6.3): секция flow — поток объекта ЭТОЙ категории: композит получает
+        # ссылку категории профиля вне прежнего разбора, у не-документа — названный ValueError (секция status='error'
+        # с маршрутом). Голое имя у профиля регистра-омонима документа отдавало поток документа (прежде — смесь
+        # подписок обоих). Корректное голое имя — тоже ссылкой: категорию профиль уже разрешил (ревью Codex, K1).
+        # Категория без головы ссылки (подсистема, роль, общий макет, пакет XDTO, …) — путем `Категория/Имя`.
+        # Прежним разбором — только ввод, который ни ссылка, ни имя (`Документ.Catalogs/X`): имя — как прежде.
+        _flow_head = _CATEGORY_TO_REF_HEAD.get(category or "") or _NONREF_KIND_HEADS.get(category or "")
+        flow_ref = (
+            (f"{_flow_head}.{object_name}" if _flow_head else f"{category}/{object_name}")
+            if category
+            and object_name
+            and (not previous or (isinstance(input_name, str) and _is_object_name(input_name)))
+            else None
+        )
 
         # ── which sections to run ──────────────────────────────────
         # v1.33.0: неизвестное имя секции больше не отбрасывается молча. Раньше
         # ЛЮБАЯ опечатка давала УСПЕШНЫЙ ответ с пустым sections — отличить её от
-        # «в конфигурации этого нет» было нельзя. Это недоделка арг-гардов 1.30.0:
-        # там ровно этот класс порчи закрыли через arg_warning, а этот путь пропустили.
-        section_warning: str | None = None
+        # «в конфигурации этого нет» было нельзя. v1.46.0 (Д4, П1): и не предупреждение
+        # `_meta.arg_warning` (с ним `sections={}` / молча выпавшая секция), а отказ.
         if sections is None:
             wanted = list(_PROFILE_DEFAULT_SECTIONS)
         else:
             wanted = []
-            unknown: list[str] = []
-            for s in sections:
-                key = _PROFILE_SECTION_ALIASES.get(str(s).strip().lower())
-                if key is None:
-                    unknown.append(str(s))
-                elif key not in wanted:
+            for alias in _closed_values("get_object_profile", "sections", sections, _PROFILE_SECTION_ALIASES):
+                key = _PROFILE_SECTION_ALIASES[alias]
+                if key not in wanted:
                     wanted.append(key)
-            if unknown:
-                accepted = ", ".join(sorted(set(_PROFILE_SECTION_ALIASES.values())))
-                section_warning = f"Неизвестные имена секций отброшены: {', '.join(unknown)}. Принимаются: {accepted}."
         if include_flow and "flow" not in wanted:
             wanted.append("flow")
         if include_code_usages and "code_usages" not in wanted:
@@ -11247,7 +12133,11 @@ def make_bsl_helpers(
             if not has_index:
                 return _unavailable("no_index")
             mods = _modules_for_identity(category, object_name)
-            entries, totals_roll, all_idx, skipped = _build_module_entries(mods, include_methods=False, no_live=True)
+            # v1.45.0 (П1): модули соседних расширений — живым разбором (как секция `registers`): в индексе
+            # основной конфигурации их нет по построению, и пропуск делал секцию «неполной» на полном индексе.
+            entries, totals_roll, all_idx, skipped, _counts = _build_module_entries(
+                mods, include_methods=False, no_live=True, live_extension_modules=True
+            )
             if not entries:
                 return {
                     "status": "empty",
@@ -11258,6 +12148,10 @@ def make_bsl_helpers(
                     "has_more": False,
                     "_meta": {"source": "index"},
                 }
+
+            def _read_failed(e: dict) -> bool:
+                return str(e["_meta"].get("fallback_reason") or "").startswith("parse_failed:")
+
             items = [
                 {
                     "path": e["path"],
@@ -11267,9 +12161,12 @@ def make_bsl_helpers(
                     "overrides": e["overrides"]["count"],
                     "skipped_live": e["_meta"]["skipped_live"],
                     **_module_provenance(e["path"]),
+                    # v1.45.0 (П1): отказ живого разбора — у строки причина, нули её не «прочитаны»
+                    **({"fallback_reason": e["_meta"]["fallback_reason"]} if _read_failed(e) else {}),
                 }
                 for e in entries[: max(0, int(limit))]
             ]
+            read_failed = any(_read_failed(e) for e in entries)
             # Aggregate ОБЯЗАН потреблять ТОТ ЖЕ резолвер, что и строки: с membership
             # `_extension_paths_set` standalone CFE (`extension_paths=[]`) получал бы
             # `items[].is_extension=True`, но `summary.extension_modules=0`. Счёт по
@@ -11279,18 +12176,19 @@ def make_bsl_helpers(
             # were not read to avoid live). Mark the whole section 'skipped', not 'ok', so the
             # zero counts aren't mistaken for the truth — caller can get_object_modules(no_live=False).
             meta = {"source": "index" if all_idx else "mixed", "modules_skipped_live": skipped}
-            if skipped:
-                # v1.44.0: пропущенный модуль соседнего расширения — не признак устаревшего индекса.
+            if skipped or read_failed:
+                # v1.45.0 (П1): модули соседних расширений читаются живьём, поэтому пропуск здесь — только
+                # устаревший модуль основной конфигурации; отказ живого чтения — `module_read_failed`.
                 stale_main = any(
                     e["_meta"].get("skipped_live")
                     and e["_meta"].get("fallback_reason") != "extension_module_not_indexed"
                     for e in entries
                 )
-                meta["reason"] = "stale_modules_skipped_live" if stale_main else "extension_modules_skipped_live"
+                meta["reason"] = "stale_modules_skipped_live" if stale_main else "module_read_failed"
             if _ext_paths_raw:
                 meta["extension_visibility"] = extension_visibility
             return {
-                "status": "skipped" if skipped else "ok",
+                "status": "skipped" if (skipped or read_failed) else "ok",
                 "summary": {**totals_roll, "extension_modules": ext_modules},
                 "items": items,
                 "total": len(entries),
@@ -11520,6 +12418,10 @@ def make_bsl_helpers(
             if not has_index:
                 return _unavailable("no_index")
             rows = idx_reader.get_event_subscriptions_exact(ref)
+            if rows:
+                # v1.45.0 (Д22): та же пометка, что у find_event_subscriptions (секция читает ридер напрямую).
+                rows = list(rows)
+                _mark_unreachable_posting_events(rows, category or "", object_name)
 
             def _sub_summary(rs) -> dict:
                 # #2: split exact vs universal (empty-source catch-all) so the count
@@ -11541,6 +12443,7 @@ def make_bsl_helpers(
                     "event": r.get("event"),
                     "handler": r.get("handler"),
                     "scope": r.get("scope"),
+                    **({"event_reachable": r["event_reachable"]} if "event_reachable" in r else {}),
                 },
             )
 
@@ -11625,8 +12528,12 @@ def make_bsl_helpers(
             )
 
         def _sec_flow() -> dict:
-            # Heavy, opt-in: analyze_document_flow reads bodies (source=mixed).
-            flow = analyze_document_flow(object_name)
+            # Heavy, opt-in: analyze_document_flow reads bodies (source=mixed). Аргумент — `flow_ref` (выше). У
+            # не-документа — отказ композита тем же текстом и маршрутом: его разбор аргумента распознает не всякую
+            # категорию (у функциональной опции, регламентного задания, подписки нет ни головы, ни пути).
+            if flow_ref and category != "Documents":
+                raise _category_refusal("analyze_document_flow", flow_ref, category, object_name, "documents")
+            flow = analyze_document_flow(flow_ref or object_name)
             subs = flow.get("event_subscriptions") or []
             movements = flow.get("register_movements") or {}
             jobs = flow.get("related_scheduled_jobs") or []
@@ -11637,7 +12544,14 @@ def make_bsl_helpers(
                 "related_scheduled_jobs": len(jobs),
                 "is_postable": flow.get("is_postable"),
             }
-            items = [{"event": s.get("event"), "handler": s.get("handler")} for s in subs[: max(0, int(limit))]]
+            items = [
+                {
+                    "event": s.get("event"),
+                    "handler": s.get("handler"),
+                    **({"event_reachable": s["event_reachable"]} if "event_reachable" in s else {}),
+                }
+                for s in subs[: max(0, int(limit))]
+            ]
             return {
                 "status": "ok",
                 "summary": summary,
@@ -11720,7 +12634,8 @@ def make_bsl_helpers(
                 continue
             s_t0 = _time_prof.monotonic()
             try:
-                with _previous_parsing(previous):
+                # секция flow со ссылкой категории профиля — вне прежнего разбора (иначе ссылка в композите — не ссылка)
+                with _previous_parsing(previous and not (sec_name == "flow" and flow_ref)):
                     sec = builder()
             except Exception as exc:  # per-section isolation — never roll up to the profile
                 sec = {
@@ -11750,9 +12665,9 @@ def make_bsl_helpers(
                 }
             )
 
-        # Оба гарда пишут в ОДИН ключ _meta.arg_warning (как на границе
-        # find_callers_context): у потребителя не должно быть двух мест, куда смотреть.
-        _profile_warning = " ".join(w for w in (_w_limit, section_warning) if w)
+        # Предупреждение о limit — в _meta.arg_warning (как на границе find_callers_context);
+        # неизвестная секция с v1.46.0 — отказ, а не предупреждение.
+        _profile_warning = _w_limit or ""
         return {
             "object_name": object_name,
             "category": category,
@@ -11811,6 +12726,39 @@ def make_bsl_helpers(
     def _ensure_event_subscriptions() -> list[dict]:
         return _event_sub_lazy.ensure(_build_event_subscriptions)
 
+    def _config_subscription_events() -> list[str]:
+        """События подписок этой конфигурации (индекс, иначе живой разбор) — для проверки ``event_filter``."""
+        rows = idx_reader.get_event_subscriptions("") if idx_reader is not None else None
+        if rows is None:
+            rows = _ensure_event_subscriptions()
+        return [r.get("event") or "" for r in rows]
+
+    def _check_event_filter(event_filter) -> None:
+        """v1.46.0 (Д4, П1): элемент ``event_filter`` допустим, если он подстрока (без учёта регистра) хотя бы
+        одного события платформы (``_SUBSCRIPTION_EVENTS``) либо события подписок этой конфигурации; иначе —
+        ``ValueError``. Прежде русское имя обработчика (``ПередЗаписью``) давало тихий ``[]``: в поле ``event`` —
+        английское имя события из XML подписки."""
+        known = [e.casefold() for e in _SUBSCRIPTION_EVENTS]
+        config_events: list[str] | None = None
+        unknown: list = []
+        for item in event_filter:
+            if not isinstance(item, str):
+                unknown.append(item)
+                continue
+            needle = item.casefold()
+            if any(needle in event for event in known):
+                continue
+            if config_events is None:
+                config_events = [e.casefold() for e in _config_subscription_events()]
+            if not any(needle in event for event in config_events):
+                unknown.append(item)
+        if unknown:
+            raise ValueError(
+                f"find_event_subscriptions: event_filter — неизвестные значения {unknown!r}; в поле event — "
+                "английское имя события из XML подписки (русское имя обработчика, например 'ПередЗаписью', не "
+                f"совпадет никогда); допустимые: {sorted(_SUBSCRIPTION_EVENTS)}"
+            )
+
     def find_event_subscriptions(
         object_name: str = "",
         custom_only: bool = False,
@@ -11832,6 +12780,9 @@ def make_bsl_helpers(
                          ('Documents/X', путь модуля или описателя) — тот же префикс (v1.44.0).
                          Голое имя — category-blind. Пустое значение = вернуть все.
                          Universal-подписки (пустой source_types) включаются всегда.
+                         v1.46.0: имя, которому не соответствует ни один объект (и
+                         фрагмент), — без строк подписок на наборы (scope=set); ссылка на
+                         несуществующий объект — ValueError (шлюз существования).
                          ПРИ НЕПУСТОМ object_name каждая строка несет scope:
                          exact | partial | universal (без object_name — прежний компактный
                          список БЕЗ scope и без source_types).
@@ -11843,7 +12794,9 @@ def make_bsl_helpers(
                           вернёт все подписки, у которых event содержит 'beforewrite'.
                           В поле event — английское имя события, как в XML
                           подписки: русское имя обработчика ('ПередЗаписью')
-                          не совпадает никогда.
+                          не совпадает никогда — v1.46.0: элемент, который не
+                          подстрока ни одного события платформы и подписок этой
+                          конфигурации, — ValueError с перечнем имен событий.
                           Допустима **одна строка** ('BeforeWrite') — она будет
                           автоматически обёрнута в [event_filter] (типичная ошибка
                           агентов: голая строка раньше итерировалась по символам
@@ -11867,6 +12820,7 @@ def make_bsl_helpers(
         # Явный префикс (Документ./Document./Справочник.) → canonical ref: матчинг станет
         # category-AWARE и сойдётся с get_object_profile (он всегда ходит по canonical ref).
         # Голое имя оставляем category-blind — обратная совместимость.
+        raw_object = object_name
         object_ref = ""
         if object_name:
             from rlm_tools_bsl.bsl_xml_parsers import canonicalize_type_ref as _ctr
@@ -11898,6 +12852,8 @@ def make_bsl_helpers(
         # substring-matcher ловит почти все события — фильтр де-факто игнорируется.
         if isinstance(event_filter, str):
             event_filter = [event_filter] if event_filter else None
+        if event_filter:
+            _check_event_filter(event_filter)
 
         # --- Fast path: SQLite index ---
         result: list[dict] | None = None
@@ -11981,6 +12937,16 @@ def make_bsl_helpers(
                 prefixes = _ensure_prefixes()
                 if prefixes:
                     result = [s for s in result if any(s["name"].lower().startswith(p) for p in prefixes)]
+
+        # v1.45.0 (Д22): проведение у непроводимого документа — после обеих веток, как и проекция ниже.
+        if object_name and (not object_ref or object_ref.split(".", 1)[0] == "Document"):
+            result = list(result)
+            _mark_unreachable_posting_events(result, "Documents" if object_ref else "", object_name)
+
+        # v1.46.0 (Д3): не-ссылка, которой не соответствует ни один объект, — без строк подписок на наборы: набор
+        # раскрывался для любого имени, и ответ на несуществующее имя был неотличим от ответа по объекту.
+        if object_name and _nonref_missing(raw_object, known_categories=target_refs):
+            result = [row for row in result if row.get("scope") != "set"]
 
         # Адресный вопрос не тащит весь список источников (Задача 5 v1.38.0).
         # Проекция стоит ЗДЕСЬ, после обеих веток: иначе одна конфигурация ответила
@@ -12262,6 +13228,28 @@ def make_bsl_helpers(
             return {}
         _postable_memo[memo_key] = res
         return res
+
+    _POSTING_EVENTS = frozenset({"posting", "undoposting"})
+
+    def _mark_unreachable_posting_events(rows: list[dict], category: str, name: str) -> None:
+        """v1.45.0 (Д22): строке подписки с событием ``Posting``/``UndoPosting`` при адресном вопросе по
+        документу с ``Posting=Deny`` — ``event_reachable: False`` (событие при Deny не наступает; раньше строка
+        выдавалась без пометки). Документ — ``category='Documents'`` либо голое имя (``category=''``), чьи
+        точные объекты — только документ: на омониме пометки нет. Проведение не определено — ключа нет.
+        Строка заменяется копией: ридер может отдавать общие словари."""
+        if not rows or not name:
+            return
+        if category and category != "Documents":
+            return
+        if not any((r.get("event") or "").casefold() in _POSTING_EVENTS for r in rows):
+            return
+        if not category and _object_categories(name) != {"Documents"}:
+            return
+        if _check_document_postable(name).get("is_postable") is not False:
+            return
+        for i, r in enumerate(rows):
+            if (r.get("event") or "").casefold() in _POSTING_EVENTS:
+                rows[i] = {**r, "event_reachable": False}
 
     def _extract_live_procedure_code(module_body: str, method_name: str) -> str:
         """Return one procedure/function from live BSL with comments and strings removed.
@@ -12827,7 +13815,11 @@ def make_bsl_helpers(
                         for m in idx_movements
                         if m["source"] in ("code", "manager_code")
                     ],
-                    "modules_scanned": cfe_modules_scanned,
+                    # v1.45.0: ObjectModule документа, чьи движения учтены в ответе, — тот же смысл,
+                    # что и без индекса: основной конфигурации первым (её строки — из снимка),
+                    # затем расширений, прочитанные живьём. Прежде здесь стояли только модули
+                    # расширений, и при строках основной конфигурации список был пуст.
+                    "modules_scanned": [*_live_main_object_module_paths(document_name), *cfe_modules_scanned],
                     "erp_mechanisms": [m["register_name"] for m in idx_movements if m["source"] == "erp_mechanism"],
                     "manager_tables": [m["register_name"] for m in idx_movements if m["source"] == "manager_table"],
                     "adapted_registers": [m["register_name"] for m in idx_movements if m["source"] == "adapted"],
@@ -12873,7 +13865,7 @@ def make_bsl_helpers(
             and info.object_name
             and info.object_name.casefold() == exact_document_name
         ]
-        modules = exact_modules or find_by_type("Documents", document_name)
+        modules = exact_modules or _find_by_type_page("Documents", document_name)
         obj_modules = [m for m in modules if m.get("module_type") == "ObjectModule"]
 
         if not obj_modules:
@@ -12963,7 +13955,11 @@ def make_bsl_helpers(
         result = {
             "document": document_name,
             "code_registers": list(code_registers.values()),
-            "modules_scanned": modules_scanned,
+            # основная конфигурация первой — как на индексном маршруте
+            "modules_scanned": [
+                *(p for p in modules_scanned if p not in _extension_paths_set),
+                *(p for p in modules_scanned if p in _extension_paths_set),
+            ],
         }
         if suppressed_main:
             result["suppressed_main_code_registers"] = suppressed_main
@@ -13514,6 +14510,9 @@ def make_bsl_helpers(
         # ПРИЧИНА развилки; профиль (live-чтение запрещено контрактом) на любом получателе даёт
         # развилку либо НЕ ОПОЗНАН, а сильные утверждения остаются live-маршруту хелпера.
         attributes: set[str] = set()
+        # v1.46.0 (Д12, П5): имена табличных частей — отдельно (они же и в `attributes`): метод табличной части у
+        # такого получателя — не делегат (`_platform_collection_call`). Только из ЖИВОГО описателя, как `attributes`.
+        tabular_sections: set[str] = set()
         attrs_source = "none"
         if idx_reader is not None:
             try:
@@ -13533,6 +14532,7 @@ def make_bsl_helpers(
                     nm = (ts.get("name") or "") if isinstance(ts, dict) else ""
                     if nm:
                         attributes.add(str(nm).casefold())
+                        tabular_sections.add(str(nm).casefold())
 
             try:
                 meta = parse_object_xml(f"Documents/{document_name}") or {}
@@ -13742,6 +14742,15 @@ def make_bsl_helpers(
                 kind = "unknown"
                 if head in ("этотобъект", "thisobject") and len(segs) == 2 and segs[1] in attributes:
                     kind = "attribute"
+                if (
+                    head in ("этотобъект", "thisobject")
+                    and len(segs) == 2
+                    and _platform_collection_call(segs[1], kind, ml, tabular_sections)
+                ):
+                    # v1.46.0 (Д12, П5): `ЭтотОбъект.ДополнительныеСвойства.Вставить()`, `ЭтотОбъект.Товары.Выгрузить()`
+                    # — метод платформенной коллекции своего объекта, не делегат. Чужая цепочка с тем же последним
+                    # звеном (`Сервис.ДополнительныеСвойства.Вставить()`) своего свойства не доказывает — ниже.
+                    continue
                 live_homonyms, indexed_homonym = _live_common_modules(segs[-1])
                 delegates.append(
                     {
@@ -13789,6 +14798,10 @@ def make_bsl_helpers(
             # в record_sets — либо `Новый ...`); непрослеженный источник -> вызов ПОКАЗЫВАЕМ,
             # с оговоркой о платформенном имени.
             if ml in _DELEGATE_METHOD_NOISE and kind == "variable" and _platform_sourced(receiver):
+                continue
+            if _platform_collection_call(rl, kind, ml, tabular_sections):
+                # v1.46.0 (Д12, П5): `ДополнительныеСвойства.Вставить()`, `Товары.Выгрузить()` — метод платформенной
+                # коллекции прослеженного получателя (свойство-Структура объекта, табличная часть документа).
                 continue
             delegates.append(
                 {
@@ -13916,11 +14929,14 @@ def make_bsl_helpers(
             "свежих правок, а неполный живой обход помечен partial"
         )
 
-    def _decl_search_route(meth: str, known_module: str = "") -> str:
+    def _decl_search_route(meth: str, known_module: str = "", *, with_note: bool = True) -> str:
         """Маршрут поиска объявления ПРОЗОЙ (вызов + оговорка источника). known_module — когда
         модуль-получатель уже разрешен и объявление можно искать прямо в нем (safe_grep живой,
-        индекса и git не требует)."""
+        индекса и git не требует). ``with_note=False`` (v1.45.0) — только исполнимый вызов: оговорку
+        подсказка проведения уже дала при первом упоминании."""
         if not _want_git_search and known_module:
+            if not with_note:
+                return f"safe_grep({meth!r}, {known_module!r})"
             return (
                 f"safe_grep({meth!r}, {known_module!r}) — git_search не зарегистрирован (исходники "
                 "не под git), но модуль-получатель уже известен: ищем объявление прямо в нем, живьем"
@@ -13931,7 +14947,7 @@ def make_bsl_helpers(
                 "исчерпывающего поиска по дереву в этой песочнице НЕТ — сузь кандидатов через "
                 f"find_module и проверь каждого: safe_grep({meth!r}, 'ИмяМодуля')"
             )
-        return f"{call} ({_decl_search_note()})"
+        return f"{call} ({_decl_search_note()})" if with_note else call
 
     def _register_search_route() -> str:
         """Куда идти за ОСТАЛЬНЫМИ писателями регистра, найденного набором/менеджером записи."""
@@ -14166,6 +15182,36 @@ def make_bsl_helpers(
         # На каждый вызов строится крупный маршрут, поэтому подробно раскрывается только
         # фиксированное число вызовов. Остальные имена уже включены в compact_page вместе
         # с record set facts: теряется только повторяющийся шаблон маршрута.
+        #
+        # v1.45.0: развёрнутое пояснение вида делегата и вызова без точки — ОДИН раз на вид; у
+        # следующих того же вида — только исполнимые шаги с пометкой `same_kind`. Оговорка
+        # источника поиска объявления (`_decl_search_note`) — тоже один раз на подсказку. Прежде
+        # одна и та же проза повторялась на каждый делегат, и общий print съедал лимит вывода.
+        explained: set[str] = set()
+        same_kind = "проверки — как у первого делегата этого вида"
+
+        def _once(key: str) -> bool:
+            if key in explained:
+                return False
+            explained.add(key)
+            return True
+
+        def _route(meth: str, known_module: str = "") -> str:
+            general_key = "note:" + _decl_search_note()
+            if not (known_module and not _want_git_search):
+                return _decl_search_route(meth, with_note=_once(general_key))
+            if not _once("note:known"):
+                return _decl_search_route(meth, known_module, with_note=False)
+            if general_key in explained:  # «git_search не зарегистрирован» подсказка уже сказала
+                return (
+                    f"safe_grep({meth!r}, {known_module!r}) — модуль-получатель уже известен: ищем объявление "
+                    "прямо в нем, живьем"
+                )
+            return _decl_search_route(meth, known_module)
+
+        def _note_part(*, live: bool = False) -> str:
+            note = _decl_search_note(live=live)
+            return f" ({note})" if _once("note:" + note) else ""
 
         for d in facts["delegates"][:_MAX_DELEGATE_ROUTES]:
             recv, meth, kind = d["receiver"], d["method"], d["kind"]
@@ -14173,6 +15219,7 @@ def make_bsl_helpers(
             # У цепочки свойств «модулем-однофамильцем» может быть только ПОСЛЕДНЕЕ звено — ровно
             # его агент подставил бы в find_definition. У одиночного получателя это он сам.
             module_ref = f"ОбщийМодуль.{recv.split('.')[-1]}"
+            first_of_kind = kind == "manager_module" or _once("kind:" + kind)
             if kind == "manager_module":
                 manager_path = d["module_path"]
                 parts.append(
@@ -14189,18 +15236,35 @@ def make_bsl_helpers(
                     if profile
                     else "Живой ManagerModule прочитать/разобрать не удалось. "
                 )
-                if route_call is not None:
+                if route_call is not None and not first_of_kind:
+                    parts.append(
+                        f"ВЫЗОВ {recv}.{meth}(...): {label}, {same_kind}: ({step}) {route_call} -> "
+                        f"объявление{_note_part()}. "
+                    )
+                    step += 1
+                elif route_call is not None:
                     parts.append(
                         f"ВЫЗОВ {recv}.{meth}(...): {label}. {profile_note}"
                         f"Не считай его платформенным без проверки: ({step}) {route_call} -> "
-                        f"ищи объявление метода по всему доступному дереву ({_decl_search_note()}). "
+                        f"ищи объявление метода по всему доступному дереву{_note_part()}. "
                     )
                     step += 1
                 else:
                     parts.append(
                         f"ВЫЗОВ {recv}.{meth}(...): {label}. {profile_note}"
-                        f"Не считай его платформенным без проверки; {_decl_search_route(meth)}. "
+                        f"Не считай его платформенным без проверки; {_route(meth)}. "
                     )
+            elif kind == "common_module" and not first_of_kind:
+                parts.append(
+                    f"ДЕЛЕГАТ: {recv}.{meth}(...) — {label}, {same_kind}: "
+                    f"({step}) d = find_definition({meth!r}, {module_ref!r}) -> определение; "
+                )
+                step += 1
+                parts.append(
+                    f"({step}) read_procedure(d['definitions'][0]['file'], {meth!r}) if d.get('definitions') else None "
+                    "-> тело. "
+                )
+                step += 1
             elif kind == "common_module":
                 # Факт разрешен ТОЛЬКО live-источнику (структурный потолок в классификации),
                 # поэтому формулировка одна и не нуждается в оговорках «может отставать»:
@@ -14221,12 +15285,16 @@ def make_bsl_helpers(
                     f"({step}) read_procedure(d['definitions'][0]['file'], {meth!r}) if d.get('definitions') else None "
                     "-> тело делегата. Guard обязателен: пустой результат это definitions=[] (НЕ ошибка), а без "
                     f"индекса ключа 'definitions' нет вовсе. Пусто -> делегат новее индекса: "
-                    f"{_decl_search_route(meth, known_module=recv.split('.')[-1])}. "
+                    f"{_route(meth, recv.split('.')[-1])}. "
                     "НЕ ПОДТВЕРЖДАЙ результат проверкой category == 'CommonModules': префикс 'ОбщийМодуль.' уже "
                     "фильтрует запрос по ЭТОЙ ЖЕ категории в SQL, поэтому проверка ВСЕГДА истинна и не подтверждает "
                     "НИЧЕГО. Получателя уже разрешил сервер — см. выше. "
                 )
                 step += 1
+            elif kind == "module_unverified" and not first_of_kind:
+                parts.append(
+                    f"ВЫЗОВ {recv}.{meth}(...): {label}, {same_kind}: маршрут по всему дереву — {_route(meth)}. "
+                )
             elif kind == "module_unverified":
                 # Развилка, а не факт. Причина зависит от источника: 'index' — снимок мог отстать
                 # от XML (успешный SQL-запрос полноту не доказывает), 'none' — проверить нечем
@@ -14272,8 +15340,15 @@ def make_bsl_helpers(
                     "не о полноте): он может не видеть свежий реквизит или, наоборот, помнить уже УДАЛЕННЫЙ. "
                     "Поэтому при любом ответе НЕ ходи в find_definition по 'ОбщийМодуль.<получатель>' — маршрут "
                     "один и тот же, "
-                    f"по всему дереву: {_decl_search_route(meth)}; он найдет объявление и в общем модуле, "
+                    f"по всему дереву: {_route(meth)}; он найдет объявление и в общем модуле, "
                     f"если получатель был им. {recheck}"
+                )
+                step += 1
+            elif kind == "shadow_risk" and not first_of_kind:
+                parts.append(
+                    f"ВЫЗОВ {recv}.{meth}(...): {label}, {same_kind}: '{recv}' присваивается -> {_route(meth)}; "
+                    f"только сравнивается -> ({step}) d = find_definition({meth!r}, {module_ref!r}) -> определение, "
+                    f"далее read_procedure(d['definitions'][0]['file'], {meth!r}) if d.get('definitions') else None. "
                 )
                 step += 1
             elif kind == "shadow_risk":
@@ -14287,7 +15362,7 @@ def make_bsl_helpers(
                     "МОЖЕТ быть сравнением, а не присваиванием (в BSL '=' означает и то, и другое) — поэтому "
                     "получателя сервер НЕ разрешил и гадать не станет. РЕШИ ПО ТЕЛУ (шаг 1): "
                     f"если '{recv}' там ПРИСВАИВАЕТСЯ — это переменная, маршрут поиска объявления: "
-                    f"{_decl_search_route(meth)}; "
+                    f"{_route(meth)}; "
                     f"если только СРАВНИВАЕТСЯ — это общий модуль: "
                     f"({step}) d = find_definition({meth!r}, {module_ref!r}) -> определение делегата, далее "
                     f"read_procedure(d['definitions'][0]['file'], {meth!r}) if d.get('definitions') else None. "
@@ -14321,12 +15396,21 @@ def make_bsl_helpers(
                     )
                 force_live_decl = bool(d.get("stale_homonym_module"))
                 route_call = _live_decl_search_call(meth) if force_live_decl else _decl_search_call(meth)
-                if route_call is not None:
+                # Ловушка, stale-однофамилец и платформенное имя — ФАКТЫ этого делегата, а не
+                # пояснение вида: они остаются у каждого.
+                if route_call is not None and not first_of_kind:
+                    parts.append(
+                        f"ВЫЗОВ {recv}.{meth}(...): получатель '{recv}' — {label}, {same_kind}. "
+                        f"{trap}{stale_note}{platform_note}"
+                        f"({step}) {route_call} -> объявление{_note_part(live=force_live_decl)}. "
+                    )
+                    step += 1
+                elif route_call is not None:
                     parts.append(
                         f"ВЫЗОВ {recv}.{meth}(...): получатель '{recv}' — {label}, а НЕ общий модуль. "
                         f"{trap}{stale_note}{platform_note}"
                         "Тип получателя по имени не восстановить, поэтому ищи ОБЪЯВЛЕНИЕ метода ПО ВСЕМУ ДЕРЕВУ: "
-                        f"({step}) {route_call} -> объявление ({_decl_search_note(live=force_live_decl)}). "
+                        f"({step}) {route_call} -> объявление{_note_part(live=force_live_decl)}. "
                     )
                     step += 1
                 else:
@@ -14335,18 +15419,30 @@ def make_bsl_helpers(
                     parts.append(
                         f"ВЫЗОВ {recv}.{meth}(...): получатель '{recv}' — {label}, а НЕ общий модуль. "
                         f"{trap}{stale_note}{platform_note}"
-                        f"Тип получателя по имени не восстановить; {_decl_search_route(meth)}. "
+                        f"Тип получателя по имени не восстановить; {_route(meth)}. "
                     )
 
         for call in facts["local_calls"][:_MAX_CALL_ROUTES]:
             name, local_path = call["name"], call["path"]
+            explain = (
+                " метод объявлен в ЭТОМ ЖЕ модуле (вызов без точки), find_definition не нужен."
+                if _once("kind:local")
+                else ""
+            )
             parts.append(
-                f"ЛОКАЛЬНЫЙ ВЫЗОВ {name}(...): метод объявлен в ЭТОМ ЖЕ модуле (вызов без точки), find_definition "
-                f"не нужен. ({step}) read_procedure({local_path!r}, {name!r}) -> его тело. "
+                f"ЛОКАЛЬНЫЙ ВЫЗОВ {name}(...):{explain} ({step}) read_procedure({local_path!r}, {name!r}) -> его тело. "
             )
             step += 1
 
         for name in facts["global_calls"][:_MAX_CALL_ROUTES]:
+            if not _once("kind:global"):
+                parts.append(
+                    f"ВЫЗОВ БЕЗ ТОЧКИ {name}(...), проверки — как у первого вызова без точки: "
+                    f"({step}) d = find_definition({name!r}) -> кандидаты. "
+                    + (f"Пусто -> {_decl_search_call(name)}. " if _want_git_search else "")
+                )
+                step += 1
+                continue
             # Под git доступен полный live-каталог BSL: он нужен и без индекса, и когда snapshot
             # отстал и дал definitions=[]. Без git при живом индексе find_definition — единственный
             # полный маршрут; без git и без индекса повторный find_definition был бы циклом.
@@ -14740,6 +15836,9 @@ def make_bsl_helpers(
 
         Returns: dict with register, writers, total_documents_scanned, total_writers,
                  returned, has_more, runtime_filtered=False, and an interpretation hint.
+                 v1.46.0 (Д7): на индексе строка — пара (документ, источник, файл) без повторов,
+                 ``total_writers`` — их число до среза ``limit``, ``total_documents_scanned=None``
+                 (файлы не читались); без индекса — прежний ответ.
 
         v1.44.0: префикс типа в любом регистре и путь (``AccumulationRegisters/X``,
         ``РегистрыНакопления/X``) — тот же регистр; объект не-регистра — ``ValueError`` с маршрутом."""
@@ -14758,17 +15857,25 @@ def make_bsl_helpers(
         if idx_reader is not None:
             idx_writers = idx_reader.get_register_writers(register_name)
             if idx_writers is not None:
-                all_writers = [
-                    {"document": w["document_name"], "source": w["source"], "file": w["file"]} for w in idx_writers
-                ]
-                page = all_writers[:limit]
+                # v1.46.0 (Д7): строка таблицы движений — на ВХОЖДЕНИЕ, поэтому пара (документ, источник, файл)
+                # приходила столько раз, сколько упоминаний в модуле, а `total_writers` считал вхождения. Теперь —
+                # пары без повторов в порядке первого появления, затем страница `limit` (v1.36.0).
+                # `total_documents_scanned=None`: на индексе файлы не читались (прежде константа 0).
+                writers: list[dict] = []
+                seen_pairs: set[tuple] = set()
+                for w in idx_writers:
+                    key = (w["document_name"], w["source"], w["file"])
+                    if key not in seen_pairs:
+                        seen_pairs.add(key)
+                        writers.append({"document": w["document_name"], "source": w["source"], "file": w["file"]})
+                page = writers[:limit]
                 return {
                     "register": register_name,
                     "writers": page,
-                    "total_documents_scanned": 0,
-                    "total_writers": len(all_writers),
+                    "total_documents_scanned": None,
+                    "total_writers": len(writers),
                     "returned": len(page),
-                    "has_more": len(all_writers) > len(page),
+                    "has_more": len(writers) > len(page),
                     "runtime_filtered": False,
                     "hint": runtime_hint,
                 }
@@ -14844,9 +15951,22 @@ def make_bsl_helpers(
         # разбирает как ссылку.
         previous = _object_ref(document_name) is None
         document_name = _category_arg(document_name, "analyze_document_flow", "documents")
+        # v1.45.0 (Д7): композит документный — метаданные и подписки берутся у ДОКУМЕНТА (`Документ.X` вне
+        # прежнего разбора). Ссылка категорию документа задаёт явно (`_category_arg` уже отверг другие
+        # категории), голое имя — если документ с этим именем есть. Раньше голое имя и даже `Документ.X`
+        # отвечали объектом первой категории каталога (одноимённый регистр), а подписки — category-blind.
+        # Голое имя без документа (только омоним другой категории) и не-ссылка (`Catalogs/X`) — прежний разбор.
+        doc_ref = (
+            f"Документ.{document_name}"
+            if isinstance(document_name, str)
+            and _is_object_name(document_name)
+            and (not previous or "Documents" in _object_categories(document_name))
+            else None
+        )
+        with _previous_parsing(previous and doc_ref is None):
+            obj = analyze_object(doc_ref or document_name)
+            subs = find_event_subscriptions(doc_ref or document_name)
         with _previous_parsing(previous):
-            obj = analyze_object(document_name)
-            subs = find_event_subscriptions(document_name)
             movements = find_register_movements(document_name)
 
             # Find scheduled jobs referencing this document
@@ -15059,7 +16179,10 @@ def make_bsl_helpers(
         ОбработкаЗаполнения), сканируется ОбработкаЗаполнения всех остальных
         ObjectModule в Documents/ и собираются документы, у которых ссылка на
         наш `document_name` есть в этой процедуре. Записи помечаются
-        `"via": "back_scan"`.
+        `"via": "back_scan"`. v1.46.0: ``line`` такой записи — строка ПЕРВОГО упоминания
+        ``ДокументСсылка.<имя>`` в теле (как у прямой ветки), а не начало процедуры (Д10);
+        кандидаты — модули объекта в обеих раскладках, CF ``Documents/*/Ext/ObjectModule.bsl``
+        и EDT ``Documents/*/ObjectModule.bsl`` (Д18: прежде только CF, и на EDT скан был пуст).
 
         Вход category-aware: bare-имя и `Документ./Document.` → полный обход (FS + метаданные);
         типизированный НЕ-документ (`Справочник.X`) → только метаданные, document-specific
@@ -15157,7 +16280,7 @@ def make_bsl_helpers(
                     is_document_input = False
                     resolved_ref = canon
             if is_document_input:
-                modules = exact_modules if exact_document_exists else find_by_type("Documents", document_name)
+                modules = exact_modules if exact_document_exists else _find_by_type_page("Documents", document_name)
 
         # --- ManagerModule: ДобавитьКомандыСозданияНаОсновании ---
         mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
@@ -15222,10 +16345,20 @@ def make_bsl_helpers(
         # Ищется `ДокументСсылка.<name>` → осмысленно только для документо-входа
         # (для `Справочник.X` это ссылка на ОМОНИМИЧНЫЙ документ, а не на наш справочник).
         if is_document_input and not result["can_create_from_here"]:
+            # v1.46.0 (Д18, П8): модуль объекта документа — в обеих раскладках: CF —
+            # `Documents/<Имя>/Ext/ObjectModule.bsl`, EDT — `Documents/<Имя>/ObjectModule.bsl`. Прежде маска
+            # была только CF, и на EDT обратный скан не находил ничего. Маски не пересекаются (`*` — ровно
+            # один уровень), отказ одной другую не гасит. Маски — литералами: растяжка
+            # `test_exact_glob_calls_go_through_the_hint_filter` видит маску со `*` только в литерале.
+            obj_paths: list[str] = []
             try:
-                obj_paths = glob_files_fn("Documents/*/Ext/ObjectModule.bsl") or []
+                obj_paths.extend(glob_files_fn("Documents/*/Ext/ObjectModule.bsl") or [])
             except Exception:
-                obj_paths = []
+                pass
+            try:
+                obj_paths.extend(glob_files_fn("Documents/*/ObjectModule.bsl") or [])
+            except Exception:
+                pass
 
             doc_lower = document_name.lower()
             # Pattern: ДокументСсылка.<our_name> с границей слова, case-insensitive.
@@ -15245,15 +16378,19 @@ def make_bsl_helpers(
                     body = read_procedure(raw_path, "ОбработкаЗаполнения")
                 except Exception:
                     continue
-                if not body or not ref_re.search(body):
+                mention = ref_re.search(body) if body else None
+                if mention is None:
                     continue
                 seen.add(other)
+                # v1.46.0 (Д10): `line` — строка упоминания `ДокументСсылка.<имя>`, как у прямой ветки
+                # (`proc_line` + смещение совпадения в теле), а не начало `ОбработкаЗаполнения`.
+                proc_line = _procedure_start_line(raw_path, "ОбработкаЗаполнения")
                 result["can_create_from_here"].append(
                     {
                         "document": other,
                         "category": "Documents",
                         "file": raw_path,
-                        "line": _procedure_start_line(raw_path, "ОбработкаЗаполнения"),
+                        "line": (proc_line + body.count("\n", 0, mention.start())) if proc_line else None,
                         "via": "back_scan",
                     }
                 )
@@ -15418,6 +16555,37 @@ def make_bsl_helpers(
         cats.update(cat for cat, obj_name, _rel in (_extension_metadata_xml or ()) if obj_name.casefold() == target)
         return cats
 
+    _BARE_REF_MISSING_HINT = (
+        "Объекта с таким именем нет; передайте ссылку с префиксом типа, например 'Справочник.X' или 'Документ.X'."
+    )
+
+    def _resolve_bare_object_ref(name, helper: str) -> str | None:
+        """v1.45.0 (Д9): голое имя объекта у хелперов «ссылок» (``find_references_to_object``,
+        ``find_code_usages``). Объект с ТОЧНЫМ именем в одной категории — каноническая ссылка
+        ``Head.<имя в написании выгрузки>``; в нескольких — ``ValueError`` с перечнем категорий и примером
+        префикса; ни в одной — ``None`` (ответ прежний плюс верхний ``hint``). Раньше голое имя не
+        канонизировалось и давало тихий ноль."""
+        if not isinstance(name, str):
+            return None
+        bare = name.strip()
+        if not _is_object_name(bare):
+            return None
+        heads = [
+            (cat, head)
+            for cat in sorted(_object_categories(bare))
+            if (head := _CATEGORY_TO_REF_HEAD.get(cat) or _NONREF_KIND_HEADS.get(cat))
+        ]
+        if not heads:
+            return None
+        if len(heads) > 1:
+            cats = ", ".join(cat for cat, _head in heads)
+            raise ValueError(
+                f"{helper}: имя {bare!r} неоднозначно — объекты с ним есть в категориях {cats}; передайте ссылку "
+                f"с префиксом типа, например {heads[0][1] + '.' + bare!r}"
+            )
+        cat, head = heads[0]
+        return f"{head}.{_object_spelling(cat, bare)}"
+
     def _object_spelling(category: str, name: str) -> str:
         """Имя объекта категории в написании выгрузки (сравнение без учёта регистра): модули сессии,
         XML-only объекты расширений, затем каталог категории текущего корня; не найдено — как
@@ -15456,6 +16624,271 @@ def make_bsl_helpers(
             cats = {c for c in cats if _normalize_category(c) == want}
         return bool(cats)
 
+    # ── v1.46.0 (Д2, Д3, Д20): точки существования объекта ─────────────────────────────────────
+    # Существование судится по ОПИСАТЕЛЯМ в каталогах категорий (CF — `Категория/Имя.xml`, EDT —
+    # `Категория/Имя/Имя.mdo`): описатель есть у любого объекта, в том числе без модулей, синонима и
+    # реквизитов, а прежний союз `_object_categories` полон лишь для 22 категорий каскада. Кроме 33 категорий
+    # индекса (`_CATEGORY_RU`) на боевых выгрузках встречаются 14 каталогов верхнего уровня без модулей;
+    # служебные `Ext` (CF) и `Configuration` (EDT) — не категории.
+    _DESCRIPTOR_ONLY_CATEGORIES = (
+        "Bots",
+        "CommandGroups",
+        "CommonAttributes",
+        "CommonPictures",
+        "DocumentNumerators",
+        "FunctionalOptionsParameters",
+        "IntegrationServices",
+        "Interfaces",
+        "Languages",
+        "Sequences",
+        "SessionParameters",
+        "StyleItems",
+        "Styles",
+        "WSReferences",
+    )
+    _EXISTENCE_CATEGORIES = (*_CATEGORY_RU, *_DESCRIPTOR_ONLY_CATEGORIES)
+    # (категория, корень) → {имя.casefold(): (имя как на диске, путь описателя от корня)}. Кеш на сессию —
+    # законен: индекс и исходники в течение сессии неизменны.
+    _descriptor_cache: dict[tuple[str, str], dict[str, tuple[str, str]]] = {}
+
+    def _main_config_root() -> str:
+        """v1.46.0 (П11): корень основной конфигурации рядом с расширением, переданный сервером в сессию на
+        расширении, либо ``''``."""
+        return _foundation["main_root"]
+
+    def _existence_roots() -> list[Path]:
+        """Корни, по описателям которых судится существование объекта: текущий корень и соседние расширения; в
+        сессии на расширении с основной рядом (П11) — текущий корень и корень основной."""
+        if _current_root_role() == "extension" and _main_config_root():
+            return [Path(_current_root_path()), Path(_main_config_root())]
+        return [Path(_current_root_path()), *_ext_roots_resolved]
+
+    def _existence_unknowable() -> bool:
+        """Существование объектов основной конфигурации в этой сессии не проверить: сессия открыта на расширении,
+        а корня основной рядом нет (соседей сессия не знает, повторный детект в ней запрещён). Тогда отказы «имя
+        категории» и «объекта нет» и правила не-ссылки не применяются — ответ прежний."""
+        return _current_root_role() == "extension" and not _main_config_root()
+
+    def _ext_dir_descriptor(ext_dir: Path) -> str:
+        """Имя описателя в каталоге ``Имя/Ext`` (запасная раскладка сборщика, ``_iter_metadata_xml_files``): первый
+        по имени ``.xml``, кроме ``Predefined.xml`` (предопределённые, а не объект); нет — ``''``."""
+        try:
+            with os.scandir(ext_dir) as it:
+                names = sorted(e.name for e in it if e.name.casefold().endswith(".xml") and e.is_file())
+        except OSError:
+            return ""
+        return next((n for n in names if n.casefold() != "predefined.xml"), "")
+
+    def _root_descriptors(category: str, root: Path) -> dict[str, tuple[str, str]]:
+        """Описатели одной категории одного корня: CF ``Категория/Имя.xml``, EDT ``Категория/Имя/Имя.mdo``;
+        подсистемы — рекурсивно (``Subsystems/<Имя>/Subsystems/…``). Ошибка чтения каталога — пусто. У корня
+        выгрузки Конфигуратора каталоги объектов на ``.mdo`` не проверяются: лишний ``stat`` на каждый объект.
+        Каталог объекта без ``Имя.xml`` рядом — как у сборщика (``_iter_metadata_xml_files``): ``Имя/Имя.mdo`` (и у
+        корня с ``Configuration.xml`` — смешанное дерево), затем третья раскладка ``Имя/Ext/<Тип>.xml``
+        (``_ext_dir_descriptor``): такой объект существует для сборщика и прочих хелперов. На боевых выгрузках
+        описатель рядом есть у каждого объекта CF, поэтому лишнего обхода там нет."""
+        key = (category, str(root))
+        cached = _descriptor_cache.get(key)
+        if cached is not None:
+            return cached
+        out: dict[str, tuple[str, str]] = {}
+        cf_root = os.path.isfile(root / "Configuration.xml")
+
+        def found(name: str, rel: str, rel_dir: str) -> None:
+            out.setdefault(name.casefold(), (name, rel))
+            if category == "Subsystems":
+                scan(f"{rel_dir}/{name}/Subsystems")
+
+        def scan(rel_dir: str) -> None:
+            try:
+                with os.scandir(root / rel_dir) as it:
+                    entries = list(it)
+            except OSError:
+                return
+            stems: set[str] = set()
+            bare_dirs: list[str] = []
+            for entry in entries:
+                name = entry.name
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if not is_dir and name.casefold().endswith(".xml"):
+                    stem = name[:-4]
+                    if stem:
+                        stems.add(stem.casefold())
+                        found(stem, f"{rel_dir}/{name}", rel_dir)
+                elif is_dir and not cf_root and os.path.isfile(root / rel_dir / name / f"{name}.mdo"):
+                    found(name, f"{rel_dir}/{name}/{name}.mdo", rel_dir)
+                elif is_dir:
+                    bare_dirs.append(name)
+            for name in bare_dirs:
+                if name.casefold() in stems:
+                    continue
+                if cf_root and os.path.isfile(root / rel_dir / name / f"{name}.mdo"):
+                    found(name, f"{rel_dir}/{name}/{name}.mdo", rel_dir)
+                    continue
+                ext_xml = _ext_dir_descriptor(root / rel_dir / name / "Ext")
+                if ext_xml:
+                    found(name, f"{rel_dir}/{name}/Ext/{ext_xml}", rel_dir)
+
+        scan(category)
+        _descriptor_cache[key] = out
+        return out
+
+    def _descriptor_index(category: str, roots=None) -> dict[str, tuple[str, str, Path]]:
+        """``{имя.casefold(): (имя как на диске, путь описателя от корня, корень)}`` по каталогам
+        ``<корень>/<category>`` корней ``roots`` (по умолчанию ``_existence_roots()``); первый корень побеждает."""
+        merged: dict[str, tuple[str, str, Path]] = {}
+        for root in _existence_roots() if roots is None else roots:
+            for key, (name, rel) in _root_descriptors(category, root).items():
+                merged.setdefault(key, (name, rel, root))
+        return merged
+
+    # Каталоги 47 категорий по ключу без регистра — разбор пути в `_object_exists_anywhere`.
+    _EXISTENCE_FOLDER_KEYS = {category.casefold(): category for category in _EXISTENCE_CATEGORIES}
+
+    def _path_objects_of(text: str) -> list[tuple[str, str]]:
+        """Все пары ``(категория, имя объекта)`` пути: сегмент — каталог любой из 47 категорий (регистр, пробелы и ``_``
+        не важны), следующий за ним — имя объекта (суффикс описателя ``.xml``/``.mdo`` снимается). Так разбираются и
+        путь модуля, и путь объекта расширения ``../cfe/<Расш>/…``. Все пары, а не первая: имя расширения может совпасть
+        с каталогом категории (``../cfe/Reports/Catalogs/X.xml``). Пустой сегмент повторного разделителя и ``.``
+        пропускаются (``CommonPictures//X``, ``CommonPictures/./X`` — путь, который разрешает и ``parse_object_xml``);
+        сегмент из пробелов — нет: именем объекта он не является (``Documents/ /``)."""
+        segments = [s for s in re.split(r"[\\/]", text) if s not in ("", ".")]
+        pairs: list[tuple[str, str]] = []
+        for i, segment in enumerate(segments[:-1]):
+            category = _EXISTENCE_FOLDER_KEYS.get(segment.replace(" ", "").replace("_", "").casefold())
+            if not category:
+                continue
+            obj = segments[i + 1].strip()
+            if obj.casefold().endswith((".xml", ".mdo")):
+                obj = obj[:-4]
+            if _is_object_name(obj):
+                pairs.append((category, obj))
+        return pairs
+
+    def _name_exists_anywhere(text: str) -> bool:
+        """Объект с этим ТОЧНЫМ именем (без учёта регистра) есть в какой-либо из 47 категорий. Порядок — от дешёвого:
+        модули сессии, XML-only объекты расширений, описатели (кеш), и только затем прежний союз
+        ``_object_categories`` (объект из индекса, которого нет на диске, по-прежнему «есть»)."""
+        if not text:
+            return False
+        target = text.casefold()
+        _ensure_index()
+        if any((info.object_name or "").casefold() == target for _rel, info in _index_state):
+            return True
+        if any(obj_name.casefold() == target for _cat, obj_name, _rel in (_extension_metadata_xml or ())):
+            return True
+        if any(target in _descriptor_index(category) for category in _EXISTENCE_CATEGORIES):
+            return True
+        return bool(_object_categories(text))
+
+    def _object_exists_anywhere(name: str, *, known_categories=()) -> bool:
+        """Есть ли объект, которому соответствует строка, в какой-либо из 47 категорий ``_EXISTENCE_CATEGORIES`` — в
+        основной конфигурации или в соседних расширениях. Строка судится по ЛЮБОМУ своему толкованию: имя до первой
+        точки и имя после неё (голова — категория в любом написании: ``Role.X``, ``Подсистема.X``,
+        ``CommonPictures.X``; ссылка на член ``Document.X.Attribute.Z`` — по объекту ``X``) и объект пути
+        ``Категория/Имя`` (``_path_objects_of``; у гибрида ``Документ.Catalogs/X`` — остаток после точки). «Нет» — только
+        когда объекта нет ни при одном толковании: правило не-ссылки снимает раскрытия лишь у имени, которому не
+        соответствует ни один объект. Прежде голова снималась, только если её знал разбор ссылки, а путь не
+        разбирался вовсе — существующий объект в форме ``Role.X``, ``CommonPictures/X`` или гибрида терял роли по флагу
+        и строки подписок на наборы. Категории, уже вычисленные вызывающим, — сразу «есть»."""
+        if any(known_categories):
+            return True
+        text = (name or "").strip() if isinstance(name, str) else ""
+        _head, dot, rest = text.partition(".")
+        for piece in (text, rest) if dot and rest else (text,):
+            if "/" in piece or "\\" in piece:
+                if any(_typed_object_exists(*pair) for pair in _path_objects_of(piece)):
+                    return True
+            elif _name_exists_anywhere(piece.partition(".")[0].strip()):
+                return True
+        return False
+
+    def _descriptor_hit(name, category: str, roots: list[Path]) -> tuple[str, str, Path, str] | None:
+        """``(категория, имя как на диске, корень, путь описателя от корня)`` объекта с ТОЧНЫМ именем (без учёта
+        регистра) по описателям ``roots``: ``category`` задана — только она, иначе первая по порядку
+        ``_EXISTENCE_CATEGORIES`` (33 категории индекса, затем 14 каталогов без модулей). Имя — как передано, без
+        снятия пробелов: так же сравнивают точные модули (``_exact_page_modules``), и голое имя с пробелами по краям
+        (не-ссылка) отвечается как прежде, а не карточкой «объект без модулей» про объект с модулями."""
+        if not isinstance(name, str) or not name.strip():
+            return None
+        target = name.casefold()
+        for cat in [category] if category else _EXISTENCE_CATEGORIES:
+            hit = _descriptor_index(cat, roots).get(target)
+            if hit is not None:
+                disk_name, rel, root = hit
+                return cat, disk_name, root, rel
+        return None
+
+    def _object_card_target(name: str, category: str = "") -> tuple[str, str, str] | None:
+        """v1.46.0 (Д20, П10): ``(категория, имя как на диске, путь описателя от корня сессии)`` объекта с ТОЧНЫМ
+        именем по описателям корней СЕССИИ — текущего корня и соседних расширений (корень основной в сессии на
+        расширении сюда не входит: её файлы сессия не читает). Путь исполним в ``parse_object_xml`` (у объекта
+        расширения — ``../cfe/…``; вложенная подсистема — путь её описателя)."""
+        hit = _descriptor_hit(name, category, [Path(_current_root_path()), *_ext_roots_resolved])
+        if hit is None:
+            return None
+        cat, disk_name, root, rel = hit
+        try:
+            path = Path(os.path.relpath(Path(root).resolve() / rel, _base_path_resolved)).as_posix()
+        except (OSError, ValueError):
+            path = rel
+        return cat, disk_name, path
+
+    def _main_only_object(name: str, category: str = "") -> tuple[str, str, str] | None:
+        """v1.46.0 (Д20, П11): объект с ТОЧНЫМ именем по описателям одной основной конфигурации — в сессии на
+        расширении с корнем основной рядом; иначе ``None``. ``(категория, имя как на диске, путь от корня
+        основной)``."""
+        if _current_root_role() != "extension" or not _main_config_root():
+            return None
+        hit = _descriptor_hit(name, category, [Path(_main_config_root())])
+        return None if hit is None else (hit[0], hit[1], hit[3])
+
+    def _main_only_error(name: str, found: tuple[str, str, str]) -> str:
+        return (
+            f"Объект '{name}' — основной конфигурации ({found[0]}/{found[1]}); в этом расширении его нет — анализ: "
+            "rlm_start на основной конфигурации"
+        )
+
+    def _asked_object_target(name: str, category_arg: str) -> dict:
+        """v1.46.0 (Д17 по П7, Д20 по П10): что разбирают ``analyze_object`` и ``find_custom_modifications``.
+
+        Ветви по порядку: точные модули есть — модули ОДНОГО объекта (категории первого точного модуля; прежде —
+        всех одноимённых объектов); точный объект без модулей — ``{'card': (категория, имя, путь описателя)}``;
+        объект только основной в сессии на расширении — ошибка, называющая это; категория в аргументе — прежняя
+        ошибка; фрагмент (голое имя, подстрочная страница непуста) — модули ОДНОГО объекта первой строки страницы
+        и ``hint`` (прежде — первые 20/50 модулей разных объектов под именем спрошенного); иначе прежняя ошибка.
+        Ответ — ``{'modules': [...], 'hint'?}`` | ``{'card': …}`` | ``{'error': текст}``."""
+        module_category = _module_search_category(category_arg)
+        modules = _find_module_page(name, category=module_category) if module_category is not None else []
+        # v1.44.0: точные модули — и за потолком страницы find_module (см. `_exact_page_modules`).
+        exact = _exact_page_modules(modules, name, module_category or "")
+        if exact:
+            first_category = exact[0].get("category")
+            return {"modules": [m for m in exact if m.get("category") == first_category]}
+        card = _object_card_target(name, category_arg)
+        if card is not None:
+            return {"card": card}
+        main_only = _main_only_object(name, category_arg)
+        if main_only is not None:
+            return {"error": _main_only_error(name, main_only)}
+        if category_arg:
+            return {"error": f"Объект '{name}' в категории {category_arg} не найден"}
+        if modules:
+            category, object_name = modules[0].get("category"), modules[0].get("object_name")
+            return {
+                "modules": [
+                    m for m in modules if m.get("category") == category and m.get("object_name") == object_name
+                ],
+                "hint": (
+                    f"объекта с именем {name!r} нет; ответ — ближайший по подстроке: {category}/{object_name}; "
+                    f"точное имя — search_objects({name!r})"
+                ),
+            }
+        return {"error": f"Объект '{name}' не найден"}
+
     def _pf_delegate_module(receiver: list[str], caller_path: str, method: str) -> str | None:
         """Модуль получателя делегата: ``Модуль`` — общий модуль; ``Документы.X`` и прочие
         коллекции менеджеров — модуль менеджера; иное — ``None``.
@@ -15482,6 +16915,165 @@ def make_bsl_helpers(
         if main:
             return main[0]
         return own[0] if own else None
+
+    def _command_module_rel(owner_dir: str, command: str) -> str | None:
+        """Модуль команды объекта/журнала (CF — ``…/Commands/<К>/Ext/CommandModule.bsl``, EDT — без ``Ext``)."""
+        for tail in ("Ext/CommandModule.bsl", "CommandModule.bsl"):
+            rel = f"{owner_dir}/Commands/{command}/{tail}"
+            if os.path.isfile(os.path.join(base_path, rel)):
+                return rel
+        return None
+
+    def _journal_print_routes(document_name: str) -> list[dict]:
+        """v1.45.0 (Д20): команды журналов документов ТЕКУЩЕГО корня, где документ зарегистрирован, — живой
+        обход описателей (``DocumentJournals/*.xml`` CF, ``DocumentJournals/*/*.mdo`` EDT, по имени журнала);
+        строки ``{kind: 'journal_command', owner, command, module_path}`` (``module_path=None`` — модуля нет)."""
+        prefix = _current_rel_prefix_raw()
+        jdir = f"{prefix}/DocumentJournals" if prefix else "DocumentJournals"
+        descriptors: list[tuple[str, str]] = []
+        try:
+            with os.scandir(os.path.join(base_path, jdir)) as it:
+                for entry in it:
+                    if entry.is_file() and entry.name.casefold().endswith(".xml"):
+                        descriptors.append((entry.name[:-4], f"{jdir}/{entry.name}"))
+                    elif entry.is_dir() and os.path.isfile(os.path.join(entry.path, f"{entry.name}.mdo")):
+                        descriptors.append((entry.name, f"{jdir}/{entry.name}/{entry.name}.mdo"))
+        except OSError:
+            return []
+        target = f"Document.{document_name}".casefold()
+        rows: list[dict] = []
+        for journal, rel in sorted(descriptors):
+            try:
+                parsed = parse_document_journal(read_file_fn(rel))
+            except Exception:
+                continue
+            if not parsed or target not in {ref.casefold() for ref in parsed["registered"]}:
+                continue
+            rows.extend(
+                {
+                    "kind": "journal_command",
+                    "owner": f"DocumentJournal.{journal}",
+                    "command": command,
+                    "module_path": _command_module_rel(f"{jdir}/{journal}", command),
+                }
+                for command in parsed["commands"]
+            )
+        return rows
+
+    def _descriptor_owner_dir(rel: str) -> str:
+        """Каталог объекта по пути его описателя: CF ``<Кат>/<Имя>.xml`` и ``<Кат>/<Имя>/Ext/<Тип>.xml``,
+        EDT ``<Кат>/<Имя>/<Имя>.mdo`` — ``<Кат>/<Имя>`` (префикс пути — корня сессии или расширения — сохраняется)."""
+        path = rel.replace("\\", "/")
+        if path.casefold().endswith(".mdo"):
+            return path.rpartition("/")[0]
+        if path.casefold().endswith(".xml"):
+            stem = path[:-4]
+            parent = stem.rpartition("/")[0]
+            return parent[:-4] if parent.casefold().endswith("/ext") else stem
+        return path
+
+    def _object_command_routes(category: str, name: str, head: str) -> list[dict]:
+        """v1.45.0 (Д20): команды объекта из ВСЕХ его описателей в сессии — текущего корня и соседних расширений
+        (расширение дополняет заимствованный объект своими командами, собственный объект расширения описан только
+        там; локаторы — уже собранные ``_extension_metadata_xml``, нового обхода нет). ``module_path`` — рядом с
+        описателем, где команда объявлена; одноименная команда — первое вхождение (текущий корень первым)."""
+        prefix = _current_rel_prefix_raw()
+        descriptors: list[str] = []
+        try:
+            descriptors.append(_resolve_object_xml(f"{prefix}/{category}/{name}" if prefix else f"{category}/{name}"))
+        except Exception:
+            pass
+        target = name.casefold()
+        descriptors.extend(
+            rel
+            for cat, obj_name, rel in _extension_metadata_xml or ()
+            if cat == category and obj_name.casefold() == target
+        )
+        rows: list[dict] = []
+        seen_paths: set[str] = set()
+        seen_commands: set[str] = set()
+        for rel in descriptors:
+            key = os.path.normcase(os.path.normpath(rel))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            try:
+                commands = parse_object_xml(rel).get("commands") or []
+            except Exception:
+                continue
+            owner_dir = _descriptor_owner_dir(rel)
+            for command in commands:
+                if str(command).casefold() in seen_commands:
+                    continue
+                seen_commands.add(str(command).casefold())
+                rows.append(
+                    {
+                        "kind": "object_command",
+                        "owner": f"{head}.{name}",
+                        "command": command,
+                        "module_path": _command_module_rel(owner_dir, command),
+                    }
+                )
+        return rows
+
+    def _attach_print_route(
+        result: dict, category: str, object_name: str, managers: list[str], bodies: list[str]
+    ) -> None:
+        """v1.45.0 (Д20): пустой ``print_forms`` у СУЩЕСТВУЮЩЕГО объекта — ``hint`` и
+        ``_meta.command_candidates``: команды журналов, где документ зарегистрирован (только у документа),
+        затем команды самого объекта из всех его описателей (``_object_command_routes``); общие команды —
+        маршрутом, не перечнем.
+        ``managers`` — модули менеджера объекта из каталога модулей сессии, ``bodies`` — те из них, чья
+        ``ДобавитьКомандыПечати`` прочитана: пустой разбор ее тела — не «команд нет»."""
+        name = _object_spelling(category, object_name)
+        head = _CATEGORY_TO_REF_HEAD.get(category) or category
+        candidates = _journal_print_routes(name) if category == "Documents" else []
+        candidates.extend(_object_command_routes(category, name, head))
+        ru_ref = f"{_RU_META_FORMS.get(head + '.', {}).get('ru_singular') or head}.{name}"
+        journals = list(
+            dict.fromkeys(c["owner"].split(".", 1)[1] for c in candidates if c["kind"] == "journal_command")
+        )
+        first = next((c for c in candidates if c["module_path"]), None)
+        # Нераскрытый делегат (модуль не найден, процедуры нет, предел переходов…) — не «команд нет»: список мог
+        # заполнить он, и маршрут к нему — первым.
+        unexpanded = [e for e in result["_meta"].get("delegates_expanded") or [] if e.get("status") != "expanded"]
+        if unexpanded:
+            parts = [
+                f"ДобавитьКомандыПечати передает список делегатам, {len(unexpanded)} из них не раскрыто "
+                "(_meta.delegates_expanded[i].status) — проверь их первыми; ниже — другие маршруты печати."
+            ]
+        elif bodies:
+            # Статический разбор пуст — еще не «команд нет» (ревью Codex, K2): блок `К = Команды.Добавить()` и
+            # помощник `ДобавитьКомандуПечати(…)` с идентификатором не литералом разборщик пропускает.
+            parts = [
+                "Разбор ДобавитьКомандыПечати команд не нашел, но идентификатор не литералом (переменная, "
+                f"выражение) он не распознает — проверь тело: read_procedure({bodies[0]!r}, 'ДобавитьКомандыПечати')."
+            ]
+        elif managers:  # модули прочитаны, процедуры в них нет
+            where = "модуле" if len(managers) == 1 else "модулях"
+            parts = [f"В {where} менеджера ({', '.join(managers)}) процедуры ДобавитьКомандыПечати нет."]
+        else:
+            # «Нет» — только о каталоге модулей сессии: с индексом это каталог индекса на старте, и модуль,
+            # добавленный после сборки, в нем не виден — отсутствие на диске не утверждается (ревью Codex, K2).
+            parts = ["Модуля менеджера в каталоге модулей сессии нет."]
+        if candidates:
+            # где найдены команды — по самим кандидатам: журналы без команд объекта «самого объекта» не называют
+            places = [f"журналов документов ({', '.join(journals)})"] if journals else []
+            if any(c["kind"] == "object_command" for c in candidates):
+                places.append("самого объекта")
+            parts.append(
+                f"Печать может быть командой {' и '.join(places)}: _meta.command_candidates ({len(candidates)})."
+            )
+        else:
+            parts.append("Команд журналов документов и самого объекта нет.")
+        if first:
+            parts.append(f"Тело команды — read_procedure({first['module_path']!r}, 'ОбработкаКоманды').")
+        parts.append(
+            "Общие команды с параметром этого типа — "
+            f"find_references_to_object({ru_ref!r}, kinds=['command_parameter_type'])."
+        )
+        result["hint"] = " ".join(parts)
+        result["_meta"]["command_candidates"] = candidates
 
     def find_print_forms(object_name: str) -> dict:
         """Find print forms registered for an object by parsing ДобавитьКомандыПечати in ManagerModule.
@@ -15542,13 +17134,13 @@ def make_bsl_helpers(
             # категория сохраняется. СУЩЕСТВУЮЩИЙ объект без модуля менеджера сюда не попадает:
             # иначе документ без печати получил бы команды однокоренного документа.
             modules = (
-                find_by_type(want_cat or "Documents", object_name)
+                _find_by_type_page(want_cat or "Documents", object_name)
                 if _module_search_category(want_cat) is not None
                 else []
             )
             mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
             if not mgr_modules and not want_cat:
-                modules = find_module(object_name)
+                modules = _find_module_page(object_name)
                 mgr_modules = [m for m in modules if m.get("module_type") == "ManagerModule"]
 
         seen_ids: set[str] = set()
@@ -15612,11 +17204,13 @@ def make_bsl_helpers(
                 _expand(sub, module, depth + 1)
                 stack.discard(key)
 
+        bodies: list[str] = []  # модули, чья ДобавитьКомандыПечати прочитана (подсказка пустого разбора)
         for mod in mgr_modules:
             path = mod["path"]
             body = read_procedure(path, "ДобавитьКомандыПечати")
             if not body:
                 continue
+            bodies.append(path)
             root_key = (path.casefold(), "добавитькомандыпечати")
             best_depth[root_key] = 0
             mod_rows, mod_delegates = _parse_print_commands(body, path)
@@ -15629,6 +17223,16 @@ def make_bsl_helpers(
             stack.discard(root_key)
         if expanded:
             result["_meta"]["delegates_expanded"] = expanded
+        if not rows and _object_exists(want_cat, object_name):
+            # v1.45.0 (Д20): пустой ответ по существующему объекту — маршрут к командам журналов и объекта
+            # (раньше — пустой список без маршрута). Категория — заданная, затем модуля менеджера, затем документ.
+            cats = sorted(_object_categories(object_name))
+            category = (
+                want_cat
+                or (mgr_modules[0].get("category") if mgr_modules else "")
+                or ("Documents" if "Documents" in cats else cats[0])
+            )
+            _attach_print_route(result, category, object_name, [m["path"] for m in mgr_modules], bodies)
         return result
 
     # ── Form XML parsing helper ──────────────────────────────────
@@ -15641,6 +17245,8 @@ def make_bsl_helpers(
 
         ``object_name`` — имя объекта; префикс типа или путь ``Категория/Имя`` — категория
         (v1.44.0), объекта в ней нет, а в других есть — ``ValueError`` с перечнем категорий.
+        v1.46.0: объекта нет ни в одной категории — ``ValueError`` шлюза существования «объекта … нет;
+        проверьте имя: search_objects(…)» (прежде ``[]``); голое слово категории — отказ «имя категории».
 
         Returns: list of dicts grouped by form, each with:
             category, object_name, form_name, file, module_path,
@@ -15653,14 +17259,31 @@ def make_bsl_helpers(
                 "parse_form: object_name — строка с именем объекта, получено "
                 f"{type(object_name).__name__}; формы нескольких объектов — вызов на каждый объект"
             )
+        if _nameless_object_arg(object_name):
+            # v1.45.0 (Д8): пробельное имя, префикс или путь категории без имени — тот же отказ, что у пустой
+            # строки (раньше — формы случайного объекта или всех объектов категории).
+            raise ValueError("object_name is required, e.g. parse_form('РеализацияТоваровУслуг')")
         # v1.44.0: префикс типа (`Справочник.X`, `справочник.X`, `Catalog.X`, `ОбщаяФорма.X`, путь
         # `Catalogs/X`, `Справочники/X`) — категория, как у get_object_modules (v1.43.0); голое
         # имя — прежний отбор по всем категориям.
         # Только у корректной ссылки (`_object_ref`): не-ссылка — пробелы, путь без имени, `/` после префикса с
         # точкой, гибрид (`Документ.Documents/X`) — разбирается выражением 1.43.0 (`_strip_meta_prefix` ниже).
         want_cat, path_form = "", ""
-        if _object_ref(object_name) is not None:
-            want_cat, object_name = _split_object_arg(object_name.strip())
+        raw_arg = object_name  # для отказа шлюза существования (v1.46.0, Д3) в конце
+        ref = _object_ref(object_name)
+        if ref is not None:
+            stripped = object_name.strip()
+            want_cat, object_name = _split_object_arg(stripped)
+            if (
+                not want_cat
+                and "/" not in stripped
+                and not _REF_KIND_CATEGORIES.get(stripped.partition(".")[0].casefold())
+            ):
+                # v1.46.0 (Д1): множественное число категории и имя каталога с точкой (`Documents.X`,
+                # `Документы.X`, `CommonModules.X`) — категория и имя из `_object_ref`: прежний `_split_object_arg`
+                # их голов не знает, и ответ был молчаливым []. Головы, которые `_object_ref` знал и прежде
+                # (определяемый тип), — прежний разбор.
+                want_cat, object_name = ref
             if want_cat and "/" in object_name:
                 # Путь глубже `Категория/Имя` — путь формы (`Catalogs/X/Forms/Ф`) или её файла
                 # (`…/Forms/Ф/Ext/Form.xml`, `CommonForms/X/Ext/Form.xml`): объект — первый сегмент,
@@ -15840,6 +17463,14 @@ def make_bsl_helpers(
                     f"Объект {object_name!r} в категории {want_cat} не найден (есть в: "
                     f"{', '.join(sorted(cats))}). Передайте имя с верным префиксом типа или без префикса."
                 )
+            if not cats:
+                # v1.46.0 (Д3, П2): объекта нет ни в одной категории — отказ шлюза существования (прежде молчаливый
+                # []). Шлюз здесь, а не на публичной границе: объект другой категории получает прежний, более
+                # точный отказ выше («есть в: …», v1.44.0). Объект категории без форм, известный только
+                # описателю (каскад его категорию не знает), — прежний честный [] (`_typed_object_exists`).
+                exc = _missing_object_refusal("parse_form", raw_arg)
+                if exc is not None:
+                    raise exc
         return results
 
     def _group_form_rows(raw_rows: list[dict], handler_filter: str = "") -> list[dict]:
@@ -15944,17 +17575,59 @@ def make_bsl_helpers(
 
     # ── Enum / FunctionalOption / Roles helpers ──────────────────
 
+    def _enum_other_category_refusal(raw: str, name: str) -> ValueError | None:
+        """v1.46.0 (Д19, П9): голое имя, точного перечисления с которым нет, — объект ДРУГОЙ категории с этим точным
+        именем: отказ текстом ``_category_arg`` («не перечисление, а объект категории …»). Сперва описатели корней
+        сессии (``_object_card_target``: 47 категорий, маршрут — путь найденного описателя, у вложенной подсистемы
+        тоже исполним), затем прежний союз ``_object_categories`` (прежний маршрут). Перечисление с этим именем есть
+        (описатель или союз) — ``None``: это не «другая категория»."""
+        if _object_card_target(name, "Enums") is not None:
+            return None
+        card = _object_card_target(name)
+        if card is not None:
+            return _category_refusal("find_enum_values", raw, card[0], card[1], "enums", route_path=card[2])
+        cats = _object_categories(name)
+        if not cats or "Enums" in cats:
+            return None
+        category = next((c for c in _EXISTENCE_CATEGORIES if c in cats), min(cats))
+        return _category_refusal("find_enum_values", raw, category, name, "enums")
+
     def _find_enum_values_one(enum_name: str) -> dict:
-        """Scalar core of find_enum_values (single enum_name). See find_enum_values."""
+        """Scalar core of find_enum_values (single enum_name). See find_enum_values.
+
+        v1.46.0 (Д19, П9): точное имя перечисления (без учёта регистра) — первым на обоих маршрутах. Ссылка
+        (``Перечисление.X``, путь ``Enums/X``) — только точное имя, иначе ``{error}``; голое имя без точного
+        перечисления — объект другой категории с этим точным именем — ``ValueError`` (``_enum_other_category_refusal``);
+        иначе прежний подстрочный выбор и верхний ``hint`` «ближайшее по подстроке»."""
+        raw = enum_name
         # v1.44.0: префикс типа в любом регистре и путь — то же перечисление; другая категория —
         # названная ошибка (в списочном режиме — `{error}` под своим ключом).
+        is_ref = _object_ref(enum_name) is not None
         enum_name = _category_arg(enum_name, "find_enum_values", "enums")
+        name_lower = enum_name.lower()
+
+        def _answer(found: dict | None) -> dict:
+            if found is not None and not found.get("error") and (found.get("name") or "").lower() == name_lower:
+                return found
+            if is_ref:
+                return {"error": f"Перечисление '{enum_name}' не найдено"}
+            refusal = _enum_other_category_refusal(raw, enum_name)
+            if refusal is not None:
+                raise refusal
+            if found is None:
+                return {"error": f"Перечисление '{enum_name}' не найдено"}
+            if not found.get("error"):
+                found["hint"] = (
+                    f"перечисления с именем {enum_name!r} нет; ответ — ближайшее по подстроке: {found.get('name')}; "
+                    f"точное имя — search_objects({enum_name!r})"
+                )
+            return found
 
         # --- Fast path: SQLite index ---
         if idx_reader is not None:
             result = idx_reader.get_enum_values(enum_name)
             if result is not None:
-                return result
+                return _answer(result)
 
         # --- Fallback: glob + XML parse ---
         patterns = [
@@ -15966,19 +17639,38 @@ def make_bsl_helpers(
             found_files.extend(_glob_hits(p))
         found_files = list(dict.fromkeys(found_files))
 
-        for f in found_files:
+        parsed_cache: dict[str, dict | None] = {}
+
+        def _parsed(f: str) -> dict | None:
+            if f not in parsed_cache:
+                try:
+                    parsed_cache[f] = parse_enum_xml(read_file_fn(f))
+                except Exception:
+                    parsed_cache[f] = None
+            return parsed_cache[f]
+
+        # v1.46.0 (Д19): точное имя — первым: описатель с именем файла, равным запросу (CF `Имя.xml`, EDT
+        # `Имя/Имя.mdo`); затем прежний выбор — первый в порядке масок, чьё имя содержит запрос. Маска на
+        # регистрозависимой ФС (Linux) имя в другом регистре не находит — тогда описатель точного имени берётся без
+        # учёта регистра из каталога Enums текущего корня (`_descriptor_hit`, как у проверки существования).
+        exact = [f for f in found_files if Path(f).stem.lower() == name_lower]
+        hit = None if exact else _descriptor_hit(enum_name, "Enums", [Path(_current_root_path())])
+        if hit is not None:
             try:
-                content = read_file_fn(f)
-            except Exception:
-                continue
-            parsed = parse_enum_xml(content)
-            if parsed is None:
-                continue
-            if enum_name.lower() in parsed["name"].lower():
+                exact = [Path(os.path.relpath(Path(hit[2]).resolve() / hit[3], _base_path_resolved)).as_posix()]
+            except (OSError, ValueError):
+                exact = [hit[3]]
+        for f in exact:
+            parsed = _parsed(f)
+            if parsed is not None and parsed["name"].lower() == name_lower:
                 parsed["file"] = f
                 return parsed
-
-        return {"error": f"Перечисление '{enum_name}' не найдено"}
+        for f in found_files:
+            parsed = _parsed(f)
+            if parsed is not None and name_lower in parsed["name"].lower():
+                parsed["file"] = f
+                return _answer(parsed)
+        return _answer(None)
 
     def find_enum_values(enum_name) -> dict:
         """Find an enumeration by name and return its values.
@@ -15989,8 +17681,25 @@ def make_bsl_helpers(
                 Изоляция: ненайденное перечисление даёт ``{error}`` под своим ключом,
                 не роняя батч.
 
-        Returns: dict with name, synonym, values, file — or error (str-режим);
-            dict by name (list-режим)."""
+        v1.46.0 (Д19, П9): точное имя (без учёта регистра) — первым, с индексом и без; ``Перечисление.X`` —
+        только точное имя (нет — ``{error}``); голое имя объекта другой категории — ``ValueError`` с категорией и
+        маршрутом ``parse_object_xml(<путь описателя>)``; фрагмент — прежний подстрочный выбор и ``hint``.
+
+        Returns: dict with name, synonym, values, file, hint? (фрагмент: ответ — ближайшее по подстроке) — or
+            error (str-режим); dict by name (list-режим)."""
+        if isinstance(enum_name, (list, tuple)):
+            # v1.45.0 (Д8): элемент списка без имени — `{error}` под своим ключом (страж публичной границы
+            # видит только список; внутренние вызовы передают имя строкой).
+            def _one(name):
+                if _nameless_object_arg(name):
+                    raise _nameless_refusal("find_enum_values", name, "Перечисление.СтатусыЗаказовКлиентов")
+                # v1.46.0 (Д2): голое слово категории — тот же отказ, что у скалярного вызова.
+                exc = _category_word_refusal("find_enum_values", name, "Перечисление.СтатусыЗаказовКлиентов")
+                if exc is not None:
+                    raise exc
+                return _find_enum_values_one(name)
+
+            return _single_or_map(enum_name, _one)
         return _single_or_map(enum_name, _find_enum_values_one)
 
     # Predefined items only exist for these categories (CF + EDT).
@@ -16417,9 +18126,16 @@ def make_bsl_helpers(
 
         v1.41.0: имя объекта в ``name`` (пустой ответ) — ``ValueError`` с маршрутом
         ``object_name=`` вместо молчаливого нуля. Решение — по НОРМАЛИЗОВАННОМУ ``limit``:
-        ``0.5`` — это законная пустая страница (0), ``None`` — дефолт 500."""
+        ``0.5`` — это законная пустая страница (0), ``None`` — дефолт 500.
+
+        ``kind`` — ``attribute`` | ``dimension`` | ``resource`` | ``ts_attribute`` (колонка табличной
+        части; регистр не важен); v1.46.0: иное значение — ``ValueError`` (прежде тихий ноль)."""
         limit, _w = _coerce_bound(limit, 500, "limit", _FIND_ATTRIBUTES_SIG)
         _warn_bound(_w)
+        # v1.46.0 (Д4, П1): неизвестный вид — отказ (прежде тихий ноль; колонка табличной части — `ts_attribute`,
+        # а не `column`, как называла справка). Пустое — «без фильтра».
+        if isinstance(kind, str) and kind.strip():
+            kind = _closed_values("find_attributes", "kind", [kind], _ATTR_KINDS)[0]
         rows = _find_attributes_rows(name, object_name, category, kind, limit)
         if not rows and name and not object_name and not kind and limit:
             exact = idx_reader is not None and (
@@ -17351,7 +19067,14 @@ def make_bsl_helpers(
 
         v1.44.0: префикс в любом регистре и путь (``Documents/X``, путь модуля или описателя)
         снимаются до имени объекта — раньше регистрозависимый strip оставлял ``документ.X``, и
-        подстрока не совпадала ни с одним правом (в ответе были только роли, раздающие права флагом)."""
+        подстрока не совпадала ни с одним правом (в ответе были только роли, раздающие права флагом).
+        v1.46.0: имя, которому не соответствует ни один объект, — без ролей по флагу (флаг покрывает
+        любое имя); ссылка на член ``Document.X.Attribute.Z`` судится по объекту X; ссылка на
+        несуществующий объект — ``ValueError`` (шлюз существования)."""
+        # v1.46.0 (Д3): не-ссылка, которой не соответствует ни один объект, — без ролей по флагу «для новых
+        # объектов»: флаг покрывает любое имя, и ответ на несуществующее имя был неотличим от ответа по объекту.
+        # Ссылка на член (`Document.X.Attribute.Z`) судится по объекту X.
+        no_flagged = _nonref_missing(object_name)
         object_name = _object_arg(object_name, _strip_meta_prefix_arg)[1]
         effective_details, _details_warning = _normalize_role_details_limit(details_limit)
         _warn_bound(_details_warning)
@@ -17361,6 +19084,8 @@ def make_bsl_helpers(
             idx_roles = idx_reader.get_roles(object_name, details_limit=effective_details)
             if idx_roles is not None:
                 flagged, flags_available = _flag_covered_roles(object_name)
+                if no_flagged:
+                    flagged = []
                 return _roles_payload(object_name, idx_roles, flagged, flags_available, case_sensitive=False)
 
         # Fallback: glob + XML parse
@@ -17402,7 +19127,7 @@ def make_bsl_helpers(
             # Не читать его значило бы развести индексную и живую ветки, чего проект
             # не допускает.
             meta = parse_rights_meta(content)
-            if meta.get("set_for_new_objects"):
+            if meta.get("set_for_new_objects") and not no_flagged:
                 own = [
                     {"right_name": right}
                     for entry in meta.get("exclusions") or []
@@ -18004,6 +19729,9 @@ def make_bsl_helpers(
                 limit=10**9))``. ``limit`` на счёт не влияет.
 
         Returns: list of dicts {object_name, category, synonym, file, owner}.
+                 ``synonym`` — как в описателе, без префикса вида (v1.46.0); поиск и
+                 ранжирование идут по хранимой форме «<Категория>: <синоним>», поэтому
+                 запрос по виду (``'Документ:'``) по-прежнему находит объекты вида.
                  Empty list if index not available or no synonyms built.
                  При ``count_only=True`` — dict ``{total, total_exact, partial,
                  source, truncated, scope, extensions_included, _meta}``
@@ -18074,7 +19802,15 @@ def make_bsl_helpers(
         # `_extension_paths_set`, ни в `_extension_root_for` (их заполняет только
         # BSL-pass). Правило «нет в карте ⇒ main» пометило бы КАЖДУЮ ext-строку как
         # "main" — на ТЁПЛЫХ картах, то есть в нормальной сессии.
-        return [_with_owner(r, r.get("file")) for r in result[:limit]]
+        rows = [_with_owner(r, r.get("file")) for r in result[:limit]]
+        # v1.46.0 (Д9): синоним наружу — без префикса вида. Поиск и ранжирование выше шли по ХРАНИМОЙ
+        # форме «<Категория>: <синоним>» (как прежде: запрос по виду находит объекты вида), префикс
+        # снимается только при выдаче — у строк индекса и у живых строк расширений одинаково. Строки —
+        # копии (`_with_owner`): ни ридер, ни кеш синонимов расширений не мутируются.
+        for row in rows:
+            if row.get("synonym"):
+                row["synonym"] = strip_category_prefix(row.get("category"), row["synonym"])
+        return rows
 
     def _is_empty_query(query: str) -> bool:
         """Единый предикат «пустого» запроса для count- и list-ветки search_*.
@@ -18175,7 +19911,12 @@ def make_bsl_helpers(
                 # ключ расширения мог не встретиться в main вовсе.
                 ext_counts: dict = {}
                 for r in ext_rows:
-                    k = r.get("category") if by == "category" else r.get("name")
+                    # v1.45.0 (Д17): у модуля без категории ключ — по пути (как у индекса), а не None
+                    k = (
+                        (r.get("category") or _group_key(r.get("module_path") or ""))
+                        if by == "category"
+                        else r.get("name")
+                    )
                     ext_counts[k] = ext_counts.get(k, 0) + 1
                 # `counts` здесь — ВСЕ main-ключи (см. read_limit выше), поэтому
                 # `k not in counts` действительно означает «в main такого нет».
@@ -18211,8 +19952,8 @@ def make_bsl_helpers(
                 строк. Считает SQLite по полному набору; ``limit`` режет уже готовые
                 группы. Нужен потому, что списочная ветка при пустом query идёт
                 ``ORDER BY name``, и топ-N по её срезу систематически неверен.
-                Неизвестное значение даёт пустые ``groups`` + ``_meta.arg_warning``
-                (тот же контракт, что у ``kinds=`` в find_references_to_object).
+                Неизвестное значение — ``ValueError`` с перечнем допустимых (v1.46.0; тот же
+                контракт, что у ``kinds=`` в find_references_to_object; регистр не важен).
                 При одновременном ``count_only=True`` побеждает ``group_by``: он
                 строго информативнее — его ``groups`` дают и разбивку, и итог.
             count_only: если True — вернуть само-описательный dict вместо списка.
@@ -18238,22 +19979,8 @@ def make_bsl_helpers(
             # Гард ПЕРЕД count_only: group_by — более специфичный запрос, и молчаливое
             # проглатывание опечатки здесь дало бы ровно тот класс, что чинили у
             # sections=/kinds= — успешный ответ, неотличимый от «данных нет».
-            if group_by not in _VALID_REGION_GROUP_BY:
-                return {
-                    "group_by": group_by,
-                    "groups": [],
-                    "groups_total": 0,
-                    "groups_returned": 0,
-                    "truncated": False,
-                    "source": "unavailable",
-                    "scope": "main_index",
-                    "_meta": {
-                        "arg_warning": (
-                            f"group_by: неизвестное значение {group_by!r} — ответ пустой. "
-                            f"Допустимые: {list(_VALID_REGION_GROUP_BY)}."
-                        )
-                    },
-                }
+            # v1.46.0 (Д4, П1): неизвестное значение — отказ (прежде пустые `groups` + `_meta.arg_warning`).
+            group_by = _closed_values("search_regions", "group_by", [group_by], _VALID_REGION_GROUP_BY)[0]
             return _group_regions_payload(query, group_by, limit, empty_query)
         if count_only:
             return _count_only_payload(
@@ -18517,22 +20244,42 @@ def make_bsl_helpers(
         results = [row for b, n in zip(buckets, alloc) for row in b[:n]]
         return results[:limit]
 
+    _index_status_memo: list[tuple[str, str]] = []
+
     def get_index_info() -> dict:
-        """Return index metadata: version, capabilities, staleness."""
-        if idx_reader is None:
-            return {"status": "no_index"}
+        """Return index metadata: version, capabilities, staleness.
+
+        v1.45.0 (Д29): ``index_status`` и ``content_sample`` — метка свежести и итог выборочной сверки СТАРТА
+        сессии (те же, что ``rlm_start.index``; ``status`` — прежний: индекс читается или нет); без ридера —
+        ``bsl_index.index_status_label`` от маркера незавершённой сборки. ``regions_count``,
+        ``module_headers_count`` (без ридера — ``None``)."""
         # An in-place rebuild leaves build_in_progress=1; reporting status:"ok" with zeros
         # would be a lie ("index empty and ok"). get_index_db_path is NOT imported at the
         # bsl_helpers top level → local import (mirrors _git_grep usage elsewhere).
         from rlm_tools_bsl.bsl_index import (
+            check_index_usable,
+            content_sample_status,
             get_index_db_path,
             index_incomplete,
+            index_status_label,
             stats_indicate_load_failure,
         )
 
         db_path = get_index_db_path(base_path)
+
+        def _not_loaded(status: str) -> dict:
+            return {
+                "status": status,
+                "index_status": index_status_label(None, reader_loaded=False, incomplete=index_incomplete(db_path)),
+                "content_sample": "not_checked",
+                "regions_count": None,
+                "module_headers_count": None,
+            }
+
+        if idx_reader is None:
+            return _not_loaded("no_index")
         if index_incomplete(db_path):
-            return {"status": "incomplete"}
+            return _not_loaded("incomplete")
         stats = idx_reader.get_statistics()
         # Race guard (codex High): get_statistics is _transient_safe → a concurrent rebuild's
         # DROP window yields a zero/load-failure sentinel (not an exception). Re-check the
@@ -18541,10 +20288,27 @@ def make_bsl_helpers(
         # cleared so stats_indicate_load_failure is False — the marker is the only signal.
         # Mirror rlm_start's combined post-read check. Don't report status:"ok" with zeros.
         if index_incomplete(db_path) or stats_indicate_load_failure(stats):
-            return {"status": "incomplete"}
+            return _not_loaded("incomplete")
         builder = int(stats.get("builder_version") or 0)
+        # Метка и итог выборки — СТАРТА сессии (едут через index_start_status): случайная выборка, взятая
+        # заново, на частично разошедшемся индексе давала бы то одну, то другую метку. Хелперы без старта
+        # (прямое создание) считают их один раз на набор.
+        if not _index_status_memo:
+            start = index_start_status or {}
+            label = start.get("index_status") or index_status_label(
+                check_index_usable(db_path, base_path), reader_loaded=True, incomplete=False
+            )
+            sample = start.get("content_sample") if start.get("index_status") else None
+            if sample is None:
+                sample = content_sample_status(db_path, base_path) if label == "stale_age" else "not_checked"
+            _index_status_memo.append((label, sample))
+        index_status, content_sample = _index_status_memo[0]
         return {
             "status": "ok",
+            "index_status": index_status,
+            "content_sample": content_sample,
+            "regions_count": idx_reader.count_regions(""),
+            "module_headers_count": idx_reader.count_module_headers(""),
             "builder_version": builder,
             "config_name": stats.get("config_name", ""),
             "config_version": stats.get("config_version", ""),
@@ -19170,7 +20934,8 @@ def make_bsl_helpers(
         result = {
             "config_role": ctx.current.role.value,
             "config_name": ctx.current.name,
-            "config_prefix": ctx.current.name_prefix,
+            # v1.46.0 (Д11): нет префикса — None, как `extension_context.current_prefix` старта (прежде '').
+            "config_prefix": ctx.current.name_prefix or None,
             "warnings": ctx.warnings,
             "nearby_extensions": [
                 {
@@ -19194,7 +20959,12 @@ def make_bsl_helpers(
     def find_ext_overrides(extension_path: str, object_name: str = "") -> dict:
         """Найти перехваченные методы в расширении.
         extension_path — путь к расширению (из detect_extensions).
-        object_name — имя объекта для прицельного поиска ('' = все)."""
+        object_name — имя объекта для прицельного поиска ('' = все).
+
+        Возвращает: {extension_path, object_filter, overrides (первые 200), total, truncated, partial,
+        _meta?: {scan_diagnostics}, hint?}. ``hint`` (v1.46.0) — только при ``total=0`` по имени, которому не
+        соответствует ни один объект: маршрут ``search_objects``; ссылка с префиксом на несуществующий объект —
+        ``ValueError`` (шлюз существования)."""
         from rlm_tools_bsl.extension_detector import find_extension_overrides as _feo
 
         # v1.43.0: `Справочник.X`/`Catalogs/X` — объект в категории (раньше молчаливый ноль).
@@ -19248,8 +21018,13 @@ def make_bsl_helpers(
             "truncated": len(overrides) > 200,
             "partial": not diagnostics.get("complete", True),
         }
+        # v1.45.0 (Д10): привязка к основной конфигурации — на срезе, после нормализации (порядок прежний).
+        _bind_live_override_rows(result["overrides"])
         if result["partial"]:
             result["_meta"] = {"scan_diagnostics": diagnostics}
+        # v1.46.0 (Д3): ноль по имени, которому не соответствует ни один объект, — с подсказкой.
+        if not result["total"] and _nonref_missing(object_name):
+            result["hint"] = _missing_object_hint(object_name)
         return result
 
     _OVERRIDES_CAP = 200
@@ -19410,6 +21185,87 @@ def make_bsl_helpers(
         out["extension_file"] = _override_extension_file(out)
         return out
 
+    _live_binding_cache: dict[str, dict] = {}
+
+    def _main_module_by_identity() -> dict[tuple, str]:
+        """``{идентичность модуля: rel_path}`` модулей ОСНОВНОЙ конфигурации (v1.45.0, Д10); две физические
+        копии одной идентичности — ключа нет (точной привязки к произвольной копии не бывает). В сессии на
+        расширении основной конфигурации нет — пусто. Один раз на сессию."""
+        cached = _live_binding_cache.get("main")
+        if cached is not None:
+            return cached
+        out: dict[tuple, str] = {}
+        if _current_root_role() != "extension":
+            _ensure_index()
+            dup: set = set()
+            for rel, _info in _index_state:
+                if _is_extension_owned_path(rel):
+                    continue
+                ident = _module_identity(rel)
+                if ident is None:
+                    continue
+                if ident in out and out[ident] != rel:
+                    dup.add(ident)
+                out.setdefault(ident, rel)
+            for ident in dup:
+                out.pop(ident, None)
+        _live_binding_cache["main"] = out
+        return out
+
+    def _extension_purposes() -> dict[str, str]:
+        """``{ключ корня расширения: назначение}`` из детектора (как ``extension_purpose`` индекса)."""
+        cached = _live_binding_cache.get("purposes")
+        if cached is not None:
+            return cached
+        out: dict[str, str] = {}
+        try:
+            from rlm_tools_bsl.extension_detector import detect_extension_context as _det
+
+            ctx = _det(base_path)
+            for info in [ctx.current, *ctx.nearby_extensions]:
+                if info.path and info.purpose:
+                    out[_root_key_safe(info.path)] = info.purpose
+        except Exception:
+            pass
+        _live_binding_cache["purposes"] = out
+        return out
+
+    def _bind_live_override_rows(rows: list[dict]) -> None:
+        """v1.45.0 (Д10): живые строки перехватов (без ``source_path``) — привязка к модулю основной
+        конфигурации тем же правилом, что у индексной строки: модуль — по идентичности пути модуля в
+        расширении, ``target_method_line`` — строка объявления метода-цели в нём, ``source_module_id`` —
+        id модуля индекса (без ридера ``None``); ``id=None``, ``extension_purpose`` — назначение расширения.
+        Зовётся ПОСЛЕ сортировки и среза: ключ сортировки и состав страницы не меняются."""
+        unbound = [r for r in rows if not r.get("source_path")]
+        if not unbound:
+            return
+        main = _main_module_by_identity()
+        purposes = _extension_purposes()
+        for r in unbound:
+            r.setdefault("id", None)
+            if not r.get("extension_purpose"):
+                r["extension_purpose"] = purposes.get(_root_key_safe(r.get("extension_root") or ""), "")
+            rel = main.get(_override_row_identity(r))
+            if rel is None:
+                continue
+            r["source_path"] = rel
+            target = (r.get("target_method") or "").casefold()
+            line = None
+            try:
+                for proc in extract_procedures(rel):
+                    if proc["name"].casefold() == target:
+                        line = proc["line"]
+                        break
+            except Exception:
+                line = None
+            r["target_method_line"] = line
+        if idx_reader is not None:
+            bound = [r["source_path"] for r in unbound if r.get("source_path")]
+            ids = (idx_reader.get_module_ids(bound) if bound else {}) or {}
+            for r in unbound:
+                if r.get("source_path"):
+                    r["source_module_id"] = ids.get(r["source_path"])
+
     def _overrides_payload(
         rows: list[dict],
         source: str,
@@ -19466,6 +21322,7 @@ def make_bsl_helpers(
         by_annotation: dict[str, list] = {}
         methods: set[str] = set()
         object_methods: set[tuple[str, str, str]] = set()
+        config_level = 0
         for r in rows:
             obj = r.get("object_name") or ""
             ext = r.get("extension_name") or ""
@@ -19476,6 +21333,17 @@ def make_bsl_helpers(
                 _bump(by_extension, ext)
             if ann:
                 _bump(by_annotation, ann)
+            # v1.45.0 (Д11): модуль уровня конфигурации (сеанса, приложения) — объекта у него нет; такие
+            # строки не входят ни в unique_objects/by_object_top, ни в пары объект+метод, а считаются
+            # отдельным агрегатом (раньше сегмент `Ext` служил им «категорией» в unique_object_methods).
+            ext_file_name = (
+                str(r.get("ext_module_path") or r.get("module_path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+            )
+            if not obj and ext_file_name.casefold() in _CONFIG_LEVEL_MODULE_FILES:
+                config_level += 1
+                if r.get("target_method"):
+                    methods.add(str(r["target_method"]).lower())
+                continue
             if r.get("target_method"):
                 methods.add(str(r["target_method"]).lower())  # та же нормализация, что у фильтра
                 # v1.37.0: `unique_methods` считает ИМЕНА, а имя поля читается как
@@ -19532,6 +21400,8 @@ def make_bsl_helpers(
         # Пагинация режет ТУ ЖЕ последовательность (v1.34.0) — новых ключей в
         # `_sort_key` нет, поэтому страницы идут без пропусков и дублей.
         page = ordered[offset : offset + limit]
+        if source == "live":
+            _bind_live_override_rows(page)  # v1.45.0 (Д10): после сортировки и среза
         payload = {
             "overrides": page,
             "total": total,
@@ -19557,6 +21427,7 @@ def make_bsl_helpers(
             # (ИМЕНА) и не то же, что `unique_objects` (ИМЕНА объектов).
             "unique_object_methods": len(object_methods),
             "unique_extensions": len(by_extension),
+            "config_level_overrides": config_level,
         }
         if failed_extension_roots:
             payload["_meta"] = {"failed_extension_roots": failed_extension_roots}
@@ -19572,10 +21443,17 @@ def make_bsl_helpers(
                      source: "index"|"live"|"unavailable",
                      by_annotation, by_object_top, by_extension_top,
                      unique_objects, unique_methods, unique_object_methods,
-                     unique_extensions}.
+                     unique_extensions, config_level_overrides, hint?}.
+        ``hint`` (v1.46.0) — только при ``total=0`` по имени, которому не соответствует ни один объект
+        (основной конфигурации и соседних расширений): маршрут ``search_objects``; ссылка с префиксом на
+        несуществующий объект — ``ValueError`` (шлюз существования).
         ``unique_object_methods`` (v1.37.0) считает ПАРЫ (категория, объект, метод),
         тогда как ``unique_objects``/``unique_methods`` считают ИМЕНА: `Документ.Заказ`
         и `Справочник.Заказ` в парах РАЗНЫЕ, а в именах схлопываются в одно.
+        ``config_level_overrides`` (v1.45.0) — число ПЕРЕХВАТОВ модулей уровня конфигурации
+        (сеанса, приложения, внешнего соединения): объекта у них нет, в пары и
+        ``unique_objects`` они не входят; это строки, а не методы — один метод модуля
+        сеанса могут перехватить несколько расширений.
         Без аргументов ``overrides`` отдает ПЕРВЫЕ 200 перехватов, детерминированно
         ОТСОРТИРОВАННЫХ. ``total`` — полное число перехватов; ``truncated`` сигналит,
         что список неполон ОТНОСИТЕЛЬНО total (а не «есть следующая страница»).
@@ -19610,6 +21488,14 @@ def make_bsl_helpers(
         # типизированное имя давало молчаливый ноль. v1.44.0: путь модуля или описателя — тот же
         # объект (`_object_arg`).
         want_cat, bare = _object_arg(object_name, _split_object_arg)  # не-ссылка — прежним `_split_object_arg`
+        payload = _get_overrides_payload(want_cat, bare, method_name, limit, offset)
+        # v1.46.0 (Д3): ноль по имени, которому не соответствует ни один объект, — с подсказкой.
+        if not payload["total"] and _nonref_missing(object_name):
+            payload["hint"] = _missing_object_hint(object_name)
+        return payload
+
+    def _get_overrides_payload(want_cat: str, bare: str, method_name: str, limit: int, offset: int) -> dict:
+        """Тело ``get_overrides`` после разбора аргументов: индекс, иначе живой обход расширений."""
         # Try index first
         if idx_reader is not None:
             result = idx_reader.get_extension_overrides(bare, method_name)
@@ -19948,22 +21834,29 @@ def make_bsl_helpers(
 
         Args:
             object_ref: e.g. 'Справочник.Контрагенты' or 'Catalog.Контрагенты'.
-            kinds: optional filter by ref_kind (see _REF_KIND_PRIORITY for the list).
+            kinds: optional filter by ref_kind (see _REF_KIND_PRIORITY for the list). v1.46.0: неизвестный
+                вид (в том числе один из нескольких) — ``ValueError`` с перечнем; регистр не важен.
             limit: maximum references returned (default 1000).
             include_code: also include in-code usages (find_code_usages) under
                 top-level keys code_usages/code_total/code_by_kind/code_truncated/
                 code_partial/code_meta. Metadata keys are unchanged.
 
         Returns:
-            {object, references, total, truncated, partial, by_kind,
+            {object, references, total, truncated, partial, by_kind, hint?,
              _meta:{source, index_coverage, extensions_included, kinds_requested,
-                    kinds_applied, unsupported_kinds}}
+                    kinds_applied, unsupported_kinds, expanded_on_read, resolved_ref?}}
             (+ code_* keys when include_code=True).
 
         ``kinds_requested`` / ``kinds_applied`` (v1.37.0) say what was ASKED and what
         actually ran after the route was chosen — a kind can be dropped by the ROUTE,
         not by the filter. ``unsupported_kinds`` describes the LIVE parser only and is
         always empty on the index source, so it must NOT be read as «the kind ran».
+
+        ``expanded_on_read`` (v1.45.0) — сколько строк каждого вида раскрыто при ЧТЕНИИ
+        (подписки на набор типов, роли по флагу «для новых объектов»): в ``by_kind``/``total``
+        они слиты с объявленными, ``{}`` — раскрытия не было. Голое имя (v1.45.0): объект одной
+        категории — ответ по его ссылке и ``resolved_ref``; нескольких — ``ValueError``;
+        объекта нет — прежний ответ и верхний ``hint``.
         """
         # Без гарда битый limit роняет индексный запрос, голый `except Exception`
         # ниже его глушит, и управление уходит в live-скан ВСЕЙ конфигурации —
@@ -19973,21 +21866,12 @@ def make_bsl_helpers(
         limit, _w = _coerce_bound(limit, 1000, "limit", "find_references_to_object(object_ref, kinds=None, limit=1000)")
         _warn_bound(_w)
 
-        # Неизвестный вид ссылки не совпадает ни с одной строкой, и раньше это давало
-        # МОЛЧАЛИВЫЙ `total=0` — ответ, неотличимый от честного «ссылок нет». Тот же
-        # класс порчи, что закрыт для `get_object_profile(sections=...)`: аргумент
-        # отбрасывается, а потребитель об этом не узнаёт. Здесь `kinds` не мутируется —
-        # валидные виды продолжают фильтровать как прежде, добавляется только
-        # `_meta.arg_warning` (ключ появляется ТОЛЬКО при наличии предупреждения).
-        _kind_warning: str | None = None
+        # v1.46.0 (Д4, П1): неизвестный вид ссылки — отказ. Прежде он не совпадал ни с одной строкой и давал
+        # `total=0` (у частично неизвестного списка — молча выпавший вид) с одним `_meta.arg_warning`, а «ссылок
+        # этого вида нет» читалось как факт. Регистр и пробелы по краям не важны; эхо ввода — `kinds_requested`.
+        kinds_echo = kinds
         if kinds:
-            _unknown = [k for k in kinds if k not in _REF_KIND_PRIORITY]
-            if _unknown:
-                _kind_warning = (
-                    f"kinds: неизвестные виды {_unknown} ни с чем не совпадут"
-                    + (" — отобраны только остальные. " if len(_unknown) < len(kinds) else " — ответ будет пустым. ")
-                    + f"Допустимые: {sorted(_REF_KIND_PRIORITY)}."
-                )
+            kinds = _closed_values("find_references_to_object", "kinds", kinds, _REF_KIND_PRIORITY)
 
         def _finish(res: dict) -> dict:
             if include_code:
@@ -19998,8 +21882,6 @@ def make_bsl_helpers(
                 res["code_truncated"] = code["truncated"]
                 res["code_partial"] = code["partial"]
                 res["code_meta"] = code["_meta"]
-            if _kind_warning:
-                res.setdefault("_meta", {})["arg_warning"] = _kind_warning
             return res
 
         # Старый falsy-контракт: `kinds=[]` == `kinds=None` == все публичные виды.
@@ -20031,13 +21913,29 @@ def make_bsl_helpers(
                 # `kinds_requested` — эхо ввода как он пришёл; `kinds_applied`
                 # считается ПОСЛЕ выбора маршрута и по умолчанию пуст: здесь ещё
                 # ничего не читалось (ранний структурный ответ / unavailable).
-                "kinds_requested": list(kinds) if kinds else [],
+                "kinds_requested": (
+                    (list(kinds_echo) if isinstance(kinds_echo, (list, tuple, set, frozenset)) else [kinds_echo])
+                    if kinds_echo
+                    else []
+                ),
                 "kinds_applied": [],
+                # v1.45.0 (Д23): сколько строк каждого вида раскрыто НА ЧТЕНИИ (подписки на набор типов,
+                # роли по флагу) — в `by_kind`/`total` они слиты с объявленными; всегда есть, пусто — {}.
+                "expanded_on_read": {},
             },
         }
         if not canonical or "." not in canonical:
-            # Ранний структурный ответ на неканоничный ref: ничего не читалось.
-            return _finish(result)
+            # v1.45.0 (Д9): голое имя — ссылка единственной категории объекта с этим именем (омоним —
+            # ValueError), а не тихий ноль; объекта нет — прежний структурный ответ с маршрутом.
+            resolved = _resolve_bare_object_ref(object_ref, "find_references_to_object")
+            if resolved is None:
+                result["hint"] = _BARE_REF_MISSING_HINT
+                # Ранний структурный ответ на неканоничный ref: ничего не читалось.
+                return _finish(result)
+            object_ref = resolved
+            canonical, _ = _normalize_object_ref(object_ref)
+            result["object"] = canonical
+            result["_meta"]["resolved_ref"] = resolved
 
         if idx_reader is not None:
             cap_pre = _read_build_capabilities()
@@ -20106,6 +22004,7 @@ def make_bsl_helpers(
                 result["references"] = merged
                 result["_meta"]["source"] = "index"
                 result["_meta"]["index_coverage"] = index_coverage
+                result["_meta"]["expanded_on_read"] = _count_by_kind(set_refs)
                 # На INDEX-маршруте `unsupported_kinds` ВСЕГДА пуст: это
                 # capability-карта LIVE-parser'а, и смешивать две причины нельзя.
                 result["_meta"]["unsupported_kinds"] = []
@@ -20223,12 +22122,19 @@ def make_bsl_helpers(
         Args:
             from_object / to_object: prefixed refs (RU or EN prefix accepted).
             max_depth: max edges in the path (clamped 1..8, default 4).
-            kinds: optional ref_kind filter (see find_references_to_object).
+            kinds: optional ref_kind filter (see find_references_to_object); неизвестный вид — ``ValueError``
+                (v1.46.0; прежде — окончательное «не достижим»).
 
         Returns:
             {found, from:from_canon, to:to_canon,
-             path:[{from, to, kind, used_in, path, line}]|None, depth, partial,
+             path:[{from, to, kind, used_in, path, line}]|None, depth, partial, error?, hint?,
              _meta:{max_depth, nodes_expanded, node_budget, budget_exceeded, kinds}}
+
+            ``error``+``hint`` — структурный ответ без обхода: конец без распознанного префикса либо (v1.46.0)
+            конец-ссылка на объект, которого в его категории нет ни в основной конфигурации, ни в соседних
+            расширениях (маршрут ``search_objects``). ``hint`` без ``error`` — неокончательный промах.
+            v1.46.0 (Д6): узел последнего уровня (``depth + 1 == max_depth``) с полной страницей ссылок
+            усечённым не считается — его дети не раскрывались бы и так, прямая ссылка проверена точечно.
 
             Each path element is an EDGE (``from`` references ``to``). ``partial=True``
             ⇔ the index lacks metadata_references (no live fallback) or a scan hit
@@ -20250,8 +22156,12 @@ def make_bsl_helpers(
             # ±inf — выход за диапазон, а не «не число»: тот же clamp, что ниже.
             max_depth_int = 8 if max_depth > 0 else 1
         max_depth_int = max(1, min(8, max_depth_int))
+        # v1.46.0 (Д4, П1): неизвестный вид ссылки — отказ; прежде он давал окончательное «не достижим».
+        if kinds:
+            kinds = _closed_values("find_data_path", "kinds", kinds, _REF_KIND_PRIORITY)
 
         # v1.44.0: путь объекта — тот же префикс типа (раньше — отказ «нужен префикс»).
+        to_arg = to_object  # v1.45.0: аргумент как передан — для маршрута проверки в hint
         from_object = _typed_ref_of(from_object)
         to_object = _typed_ref_of(to_object)
         from_canon, _ = _normalize_object_ref(from_object)
@@ -20287,6 +22197,27 @@ def make_bsl_helpers(
                 "_meta": base_meta,
             }
 
+        # v1.46.0 (Д3, П2): конец-ссылка на объект, которого в его категории нет ни в основной конфигурации, ни в
+        # соседних расширениях, — структурная ошибка (форма прежней ошибки префикса), а не обход: раньше промах
+        # по несуществующему концу читался как «не достижим» или «НЕ доказывает недостижимость». Категория конца —
+        # по голове канонической ссылки (`Subsystem.`, `Role.`…): `_object_ref` знает не все головы.
+        if not _existence_unknowable():
+            for canon in (from_canon, to_canon):
+                head, _dot, obj = canon.partition(".")
+                category = prefix_to_category.get(head)
+                if category and _is_object_name(obj) and not _typed_object_exists(category, obj):
+                    return {
+                        "found": False,
+                        "from": from_canon,
+                        "to": to_canon,
+                        "path": None,
+                        "depth": 0,
+                        "partial": False,
+                        "error": f"объекта {canon} нет — {_missing_where()}",
+                        "hint": f"проверьте имя: search_objects({obj!r})",
+                        "_meta": base_meta,
+                    }
+
         to_canon_cf = to_canon.casefold()
 
         # Trivial self-path.
@@ -20310,6 +22241,7 @@ def make_bsl_helpers(
                 "path": None,
                 "depth": 0,
                 "partial": True,
+                "hint": _data_path_miss_hint(to_arg, [], False, True, no_index=True),
                 "_meta": base_meta,
             }
 
@@ -20323,6 +22255,19 @@ def make_bsl_helpers(
         nodes_expanded = 0
         budget_exceeded = False
         partial = False
+        # v1.45.0 (Д2): узлы, чья страница исходящих ссылок полна (`_DATA_PATH_REFS_PAGE`).
+        truncated_nodes: list[dict] = []
+        truncated_total = 0
+
+        def _edge_of(src: str, r: dict) -> dict:
+            return {
+                "from": src,
+                "to": r.get("ref_object") or "",
+                "kind": r.get("ref_kind"),
+                "used_in": r.get("used_in"),
+                "path": r.get("path"),
+                "line": r.get("line"),
+            }
 
         while queue and hit_id is None:
             if nodes_expanded >= _DATA_PATH_NODE_BUDGET:
@@ -20338,7 +22283,9 @@ def make_bsl_helpers(
 
             bare = cur_canon.split(".", 1)[-1]
             cat = _prefix_category(cur_canon)
-            rows = idx_reader.find_metadata_refs_from(bare, source_category=cat, kinds=kinds)
+            rows = idx_reader.find_metadata_refs_from(
+                bare, source_category=cat, kinds=kinds, limit=_DATA_PATH_REFS_PAGE
+            )
             nodes_expanded += 1
             if rows is None:
                 partial = True
@@ -20348,40 +22295,57 @@ def make_bsl_helpers(
                 next_canon = r.get("ref_object") or ""
                 if not next_canon:
                     continue
-                edge = {
-                    "from": cur_canon,
-                    "to": next_canon,
-                    "kind": r.get("ref_kind"),
-                    "used_in": r.get("used_in"),
-                    "path": r.get("path"),
-                    "line": r.get("line"),
-                }
                 counter += 1
                 cid = counter
-                nodes[cid] = {"canon": next_canon, "in_edge": edge, "parent_id": cur_id}
+                nodes[cid] = {"canon": next_canon, "in_edge": _edge_of(cur_canon, r), "parent_id": cur_id}
                 if next_canon.casefold() == to_canon_cf:
                     hit_id = cid
                     break
                 if next_canon.casefold() not in visited:
                     queue.append((next_canon, depth + 1, cid))
 
+            if hit_id is None and len(rows) >= _DATA_PATH_REFS_PAGE:
+                # Страница полна — узел усечён: прямая ссылка на `to` проверяется точечным
+                # запросом, а промах больше не окончателен (раньше молчаливое «не достижим»).
+                # v1.46.0 (Д6): у узла ПОСЛЕДНЕГО уровня (`depth + 1 == max_depth`) дети не раскрывались бы
+                # вовсе — после точечной проверки промах окончателен, и усечённым узел не считается.
+                if depth + 1 < max_depth_int:
+                    truncated_total += 1
+                    if len(truncated_nodes) < _TRUNCATED_NODES_SHOWN:
+                        truncated_nodes.append({"object": cur_canon, "refs_returned": len(rows)})
+                direct = idx_reader.find_metadata_refs_from(
+                    bare, source_category=cat, kinds=kinds, limit=1, ref_object=to_canon
+                )
+                if direct is None:
+                    partial = True
+                elif direct:
+                    counter += 1
+                    nodes[counter] = {"canon": to_canon, "in_edge": _edge_of(cur_canon, direct[0]), "parent_id": cur_id}
+                    hit_id = counter
+
         meta = {
             "max_depth": max_depth_int,
             "nodes_expanded": nodes_expanded,
             "node_budget": _DATA_PATH_NODE_BUDGET,
-            "budget_exceeded": budget_exceeded,
+            "budget_exceeded": budget_exceeded or (hit_id is None and truncated_total > 0),
             "kinds": kinds,
         }
         if hit_id is None:
-            return {
+            miss: dict = {
                 "found": False,
                 "from": from_canon,
                 "to": to_canon,
                 "path": None,
                 "depth": 0,
                 "partial": partial,
-                "_meta": meta,
             }
+            if meta["budget_exceeded"] or partial:
+                if truncated_nodes:
+                    meta["truncated_nodes"] = truncated_nodes
+                    meta["truncated_nodes_total"] = truncated_total
+                miss["hint"] = _data_path_miss_hint(to_arg, truncated_nodes, budget_exceeded, partial, no_index=False)
+            miss["_meta"] = meta
+            return miss
 
         # Reconstruct forward edge path [from→…→to]: walk parent_id from the hit
         # node back to start, collecting incoming edges, then reverse.
@@ -20439,6 +22403,7 @@ def make_bsl_helpers(
                 ТОЛЬКО на индексном маршруте: живой фолбэк вид обращения не
                 определяет и метит строки 'unknown', поэтому там фильтр
                 неприменим — факт публикуется в `_meta.kind_filter_applied`.
+                v1.46.0: регистр не важен; неизвестное значение — ``ValueError``.
             limit: maximum usages returned (default 1000).
 
         Returns:
@@ -20451,6 +22416,10 @@ def make_bsl_helpers(
         # глушится, и управление уходит в live-скан. Здесь он ограничен
         # max_files=40, поэтому не виснет, а падает позже на сравнении с None.
         limit, _w = _coerce_bound(limit, 1000, "limit", "find_code_usages(object_ref, kind=None, limit=1000)")
+        # v1.46.0 (Д4, П1): неизвестный вид обращения — отказ (прежде тихий ноль); регистр не важен
+        # (`kind='Manager'` — то же, что `'manager'`; прежде — ноль). Пустое значение (`''`, `[]`) — как прежде.
+        if kind:
+            kind = _closed_values("find_code_usages", "kind", [kind], _CODE_USAGE_KINDS)[0]
         object_ref = _typed_ref_of(object_ref)  # v1.44.0: путь — как префикс типа (раньше ноль)
         canonical, _ = _normalize_object_ref(object_ref)
         result: dict = {
@@ -20471,9 +22440,17 @@ def make_bsl_helpers(
             },
         }
         if not canonical or "." not in canonical:
-            # Ранний структурный ответ: ничего не читалось, поэтому источника нет.
-            # Shape при этом не зависит от аргумента.
-            return result
+            # v1.45.0 (Д9): голое имя — ссылка единственной категории (омоним — ValueError).
+            resolved = _resolve_bare_object_ref(object_ref, "find_code_usages")
+            if resolved is None:
+                result["hint"] = _BARE_REF_MISSING_HINT
+                # Ранний структурный ответ: ничего не читалось, поэтому источника нет.
+                # Shape при этом не зависит от аргумента.
+                return result
+            object_ref = resolved
+            canonical, _ = _normalize_object_ref(object_ref)
+            result["object"] = canonical
+            result["_meta"]["resolved_ref"] = resolved
 
         if idx_reader is not None:
             cap_pre = _read_build_capabilities()
@@ -20523,7 +22500,8 @@ def make_bsl_helpers(
                 # оба запроса ридера. Ключ парный к живой ветке, где применить его
                 # нечем; без него «отфильтровано» и «классифицировать не смогли»
                 # неотличимы (см. `_meta.unsupported_kinds` у соседнего хелпера).
-                result["_meta"]["kind_filter_applied"] = True
+                # v1.45.0 (Д25): без запрошенного `kind` — None (раньше True безусловно).
+                result["_meta"]["kind_filter_applied"] = True if kind is not None else None
                 if index_proof == "incomplete":
                     result["partial"] = True
                     result["_meta"]["index_proof"] = index_proof
@@ -20571,7 +22549,8 @@ def make_bsl_helpers(
             # recall на безындексном маршруте незачем), но неприменимость фильтра
             # объявлена машинно — тем же приёмом, что `unsupported_kinds`
             # у `find_references_to_object`.
-            result["_meta"]["kind_filter_applied"] = kind is None
+            # v1.45.0 (Д25): без запрошенного `kind` — None, как на индексе (раньше True).
+            result["_meta"]["kind_filter_applied"] = False if kind is not None else None
             for key in (
                 "scanned_files",
                 "scanned_extension_files",
@@ -21206,6 +23185,8 @@ def make_bsl_helpers(
                   (``DuringSession`` / ``DuringRequest`` / ``DontUse``).
                   Редкие значения и есть самые полезные: на боевой конфигурации
                   привилегированных модулей 2, глобальных 40 при 3918 общих.
+                  v1.46.0: неизвестное значение — ``ValueError`` с перечнем (прежде
+                  тихий ноль); регистр не важен, пусто — без фильтра.
             limit: размер страницы (v1.39.0). Некорректное значение (``None``,
                   строка, список, ``NaN``/``inf``, отрицательное, ``bool``) не
                   роняет вызов, а восстанавливает документированный дефолт 200 —
@@ -21245,6 +23226,12 @@ def make_bsl_helpers(
         }
         eff_limit, _wl = _coerce_bound(limit, 200, "limit", "find_common_modules(name='', flag='', limit=200)")
         _warn_bound(_wl)
+        # v1.46.0 (Д4, П1): неизвестный флаг — отказ (прежде уходил в сравнение с `return_values_reuse` и давал
+        # тихий ноль). Пустое значение — «без фильтра», не-строка — как прежде.
+        if isinstance(flag, str) and flag.strip():
+            flag = _closed_values(
+                "find_common_modules", "flag", [flag], (*_COMMON_MODULE_FLAG_KEYS, *_COMMON_MODULE_REUSE_VALUES)
+            )[0]
         # Ридеру уходит НЕ ноль: оконный счёт приезжает колонкой строки, и `LIMIT 0`
         # обнулил бы его вместе с ней. Публичную границу держит срез ниже.
         reader_limit = max(1, eff_limit)
@@ -21397,7 +23384,8 @@ def make_bsl_helpers(
             name: фрагмент имени макета.
             template_type: точное значение типа (``SpreadsheetDocument``,
                    ``DataCompositionSchema``, ``TextDocument``, ``BinaryData``, …).
-                   Набор ОТКРЫТ: неизвестное значение хранится как есть.
+                   Хранится как в описателе; запрос — v1.46.0: один из десяти типов
+                   макетов платформы (регистр не важен), неизвестное — ``ValueError``.
             limit: размер страницы. Некорректное значение (``None``, строка,
                    список, ``NaN``/``inf``, отрицательное, ``bool``) не роняет
                    вызов, а восстанавливает документированный дефолт 200 —
@@ -21434,6 +23422,9 @@ def make_bsl_helpers(
             limit, 200, "limit", "find_templates(owner='', name='', template_type='', limit=200)"
         )
         _warn_bound(_wl)
+        # v1.46.0 (Д4, П1): неизвестный тип макета — отказ (прежде тихий ноль). Пустое — «без фильтра».
+        if isinstance(template_type, str) and template_type.strip():
+            template_type = _closed_values("find_templates", "template_type", [template_type], _TEMPLATE_TYPES)[0]
         # Ридеру уходит НЕ ноль: `COUNT(*) OVER ()` приезжает колонкой строки, и
         # `LIMIT 0` обнулил бы вместе с ней полный счёт. Публичную границу держит
         # срез ниже — он же сохраняет прежнее предусловие сторонних адаптеров,
@@ -21531,10 +23522,11 @@ def make_bsl_helpers(
         "count_matches(pattern, file_types='bsl', path='', regex=False, ignore_case=True, top=20, "
         "group_by='category') -> {files_matched, occurrences, top:[dict], groups:[dict], truncated, "
         "source, extensions_included, ...}"
-        "  # АГРЕГАТ вместо тел; там, где grep отказывает (>5000)",
+        "  # АГРЕГАТ вместо тел; вне bsl/mdo/xml — обход файлов, до десятков с",
         "discovery",
         ["сколько", "count", "инвентаризац", "посчитать", "во всей конфигурации", "how many"],
         "COUNT MATCHES (инвентаризация по ВСЕЙ конфигурации):\n"
+        "  # АГРЕГАТ вместо тел; там, где grep отказывает (>5000)\n"
         "  # Вопрос «в скольких модулях встречается X» grep НЕ решает: его отказ\n"
         "  #   статический (>5000 файлов в каталоге), и под него уходит корень\n"
         "  #   и почти всякий крупный каталог боевой конфигурации.\n"
@@ -21545,6 +23537,8 @@ def make_bsl_helpers(
         "  print(res['files_matched'], 'файлов,', res['occurrences'], 'строк')\n"
         "  for g in res['groups']:      # по умолчанию group_by='category'\n"
         "      print(g['key'], g['count'])\n"
+        "  # ключ группы — категория от СВОЕГО корня (файлы расширений — по их категории, не '..');\n"
+        "  #   'Configuration' — модули уровня конфигурации и файлы в корне; категория вне словаря — сегмент пути.\n"
         "  for t in res['top']:         # самые «густые» файлы\n"
         "      print(t['file'], t['count'])\n"
         "  # ГРАНУЛЯРНОСТЬ — СТРОКА, а не вхождение (как у grep/ripgrep/git grep -c):\n"
@@ -21554,6 +23548,11 @@ def make_bsl_helpers(
         "  # По умолчанию регистр НЕ учитывается (1С регистронезависима);\n"
         "  #   ignore_case=False — точное написание.\n"
         "  # file_types — не только bsl: 'rights', 'form', 'dcs' перечисляются обходом файлов.\n"
+        "  #   ЦЕНА: вне навигационного индекса (bsl/mdo/xml) — обход ВСЕХ файлов типа: крупная\n"
+        "  #   ERP, file_types='form' — 8 717 файлов, ~12 с/вызов. Не больше ОДНОГО такого вызова на\n"
+        "  #   rlm_execute (таймаут по умолчанию 45 с убьет воркер вместе с переменными); сужай path:\n"
+        "  #   path-каталог обходится только своим поддеревом (обход Documents — доли секунды, чтение\n"
+        "  #   файлов — по их числу), а повтор той же маски в сессии обход не повторяет.\n"
         "  # source: index | live | index+live (смешанный набор расширений файлов или\n"
         "  #   соседние расширения — их модули перечисляются живьем).\n"
         "  # path — ОТНОСИТЕЛЬНОЕ поддерево ('CommonModules'); абсолютный путь,\n"
@@ -21622,15 +23621,18 @@ def make_bsl_helpers(
     _reg(
         "find_module",
         find_module,
-        "find_module(name='', module_type='', category='', limit=50) -> [{path, category, object_name, module_type, form_name, owner}]  # name — опц. фрагмент; limit — страница",
+        "find_module(name='', module_type='', category='', limit=50) -> [{path, category|None, object_name|None, module_type, form_name, owner}]  # name — опц. фрагмент; limit — страница",
         "discovery",
         None,
         "FIND MODULE:\n"
         "  # name — ОПЦИОНАЛЬНЫЙ фрагмент имени: пусто = любой модуль.\n"
         "  # Фильтры module_type/category тоже опциональны и работают БЕЗ name.\n"
+        "  # category/object_name = None — модуль уровня конфигурации (сеанса, приложения) или категории\n"
+        "  #   вне словаря (Sequences, IntegrationServices, Bots): фильтр category их не находит.\n"
         "  mods = find_module('Заказ', module_type='ObjectModule')\n"
-        "  # limit — размер СТРАНИЦЫ, а не отбор лучших: порядок выдачи\n"
-        "  # НЕ релевантность, поэтому усечение режет произвольные строки.\n"
+        "  # limit — размер СТРАНИЦЫ. С name точный объект — ПЕРВЫМ (модуль объекта, менеджера,\n"
+        "  #   остальные), затем подстрочные совпадения в порядке каталога; без name — проход каталога\n"
+        "  #   (НЕ релевантность: усечение режет произвольные строки).\n"
         "  for m in mods:\n"
         "      print(m['path'], m['category'], m['module_type'], m['owner'])",
     )
@@ -21646,6 +23648,7 @@ def make_bsl_helpers(
         "  # Принимаются и сокращенные/единственное число (Document, InformationRegister),\n"
         "  # и русские (Документ, Справочник, РегистрСведений).\n"
         "  docs = find_by_type('Documents', limit=50)\n"
+        "  # С name — точный объект ПЕРВЫМ (модуль объекта, менеджера, остальные), затем подстрочные.\n"
         "  # Строка выдачи — МОДУЛЬ, а не объект: «сколько документов» отвечает\n"
         "  # count_only=True -> unique_objects (один проход, без break).\n"
         "  census = find_by_type('Documents', count_only=True)\n"
@@ -21655,11 +23658,12 @@ def make_bsl_helpers(
     _reg(
         "extract_procedures",
         extract_procedures,
-        "extract_procedures(path|object_name) -> [{name, type, line, end_line, is_export, params(list)}]  "
+        "extract_procedures(path|object_name) -> [{name, type, line, end_line, is_export, params(list), overridden_by?}]  "
         "# path ИЛИ имя объекта; неоднозначно → ValueError",
         "code",
         None,
         "EXTRACT PROCEDURES:\n"
+        "  # Пустой путь и путь КАТАЛОГА (Documents/, ../cfe/Р/CommonModules) — ValueError, а не модуль.\n"
         "  # Первый аргумент — путь ИЛИ имя объекта. По имени модуль выбирается\n"
         "  # автоматически по паре (category, module_type).\n"
         "  # Неоднозначное имя → ValueError; за прозрачным разрешением по имени\n"
@@ -21740,6 +23744,13 @@ def make_bsl_helpers(
         "              print(e['name'], '<-', c['caller_name'], c['file'], 'line:', c['line'])\n"
         "          if data['_meta']['has_more']:\n"
         "              print('  ... more callers, increase offset')\n"
+        "  # НЕЭКСПОРТНАЯ цель (_meta.non_export_target=True): вызывающие — только вызовы без точки из своего\n"
+        "  #   модуля (и точные ребра заимствованного модуля расширения); строки «по имени» из чужих модулей\n"
+        "  #   не приходят. Граница: `Модуль.` ⏎ `Метод(` (перенос или пробел после точки) сборщик пишет\n"
+        "  #   голым вызовом — точная строка своего модуля бывает таким вызовом: проверь строку line и предыдущую.\n"
+        "  # СТРАНИЦА: на индексе offset/limit/total_callers — в СТРОКАХ; на FS-маршруте\n"
+        "  #   (_meta.exact_available=False) offset/limit/has_more — в ФАЙЛАХ-кандидатах, а total_callers —\n"
+        "  #   строки ЭТОЙ страницы: листай offset += limit, пока has_more. Добор — с тем же module_hint.\n"
         "  # BATCH: вместо цикла по экспортам — один вызов со списком имён → {name: {callers,_meta}|{error}}.\n"
         "  #   module_hint/offset/limit — ОБЩИЕ на все имена; упавший элемент изолирован своим {error}:\n"
         "  by_name = find_callers_context([e['name'] for e in exports], '', 0, 50)\n"
@@ -21750,6 +23761,9 @@ def make_bsl_helpers(
         "  # _meta.fallback_rows — эвристические, по ИМЕНИ метода (возможны однофамильцы).\n"
         "  # _meta.exact_available — поддерживает ли схема индекса точный режим;\n"
         "  # _meta.target_exact — разрешилась ли сама цель в один модуль (иначе передай module_hint=find_module('X')[i]['path']).\n"
+        "  #   Это про ЦЕЛЬ, не про вызывающих: target_exact=True при exact_rows=0 — строки найдены по имени\n"
+        "  #   (edge_exact=False), среди них вызовы одноименных методов других объектов (_meta.hint):\n"
+        "  #   сверяй получатель по строке. Вызов через выражение (ПолучитьОбъект().Метод()) граф не видит.\n"
         "  # ФОРМЫ module_hint: ТОЧНАЯ — rel_path, готовый в find_module('X')[i]['path'];\n"
         "  #   'Документ.X' и голое имя объекта задают уровень ОБЪЕКТА, и цель разрешается точно\n"
         "  #   ТОЛЬКО когда искомое имя внутри объекта уникально. Иначе голый hint сужает поиск к\n"
@@ -21813,7 +23827,11 @@ def make_bsl_helpers(
         "              print(f\"  L{c['level']} {c['caller_name']} <- {c['object_name']} ({c['module_path']}:{c['line']})\")\n"
         "      for t in res['truncated_targets']:  # callers>200 на узле — дерево неполное\n"
         "          print(f\"  TRUNCATED: {t['name']} (L{t['level']}): {t['returned']}/{t['total']}\")\n"
-        "          # полный список callers метода — find_callers_context(t['name'], '', offset=200, limit=200)\n"
+        "          # остаток — с ПОДСКАЗКОЙ УЗЛА (target_hint), не '': без нее запрос идет по имени и листает\n"
+        "          #   ДРУГОЙ список. FS-маршрут (exact_available=False): offset/limit/has_more — в ФАЙЛАХ,\n"
+        "          #   total — строки страницы; листай offset += 200, пока has_more.\n"
+        "          node = next(n for n in res['tree'] if n['name'] == t['name'] and n['callers'][0]['level'] == t['level'])\n"
+        "          rest = find_callers_context(t['name'], node['target_hint'] or '', offset=200, limit=200)\n"
         "  # ТОЧНОСТЬ (exact-режим): для ОДНОИМЕННЫХ методов (один и тот же метод в сотнях объектов)\n"
         "  #   передай ТОЧНЫЙ module_hint (rel_path) — привяжет КОРЕНЬ к одному модулю и уберет\n"
         "  #   ложные звенья от однофамильцев. NB: у платформенных обработчиков (см. выше) hint не\n"
@@ -21836,11 +23854,15 @@ def make_bsl_helpers(
         "  #   _meta.exact_available — поддерживает ли схема индекса точный режим (callee_key);\n"
         "  #   _meta.root_exact      — включился ли exact на корне (иначе корень по имени, возможны однофамильцы);\n"
         "  #   _meta.exact_rows/fallback_rows — сколько рёбер точные vs эвристические (по имени);\n"
-        "  #   node['meta'].target_exact — точен ли конкретный узел; node['target_key'] = rel_path::метод.\n"
+        "  #   node['meta'].target_exact — разрешилась ли ЦЕЛЬ узла в один модуль, а не точность его ребер;\n"
+        "  #   ребра узла — node['meta'].exact_rows/fallback_rows: точно — exact_rows>0 и fallback_rows==0,\n"
+        "  #   по имени — exact_rows==0, иначе смешанно; node['target_key'] = rel_path::метод.\n"
         "  # Одноимённые методы без hint возвращают список носителей — выбирай по object_name/category.\n"
         "  #   _meta.node_budget_exceeded=True — широкий корень упёрся в visited_cap, дерево частичное\n"
         "  #     (по уровням): передай module_hint=om['path'], чтобы и сузить, и ускорить обход.\n"
         "  # Для глубины 1 эффективнее обычный find_callers_context().\n"
+        "  # НЕЭКСПОРТНЫЙ узел: вызывающие — только из своего модуля (вызов без точки); ложная точная строка\n"
+        "  #   своего модуля возможна у `Модуль.` ⏎ `Метод(` — сборщик пишет его голым (проверь line и предыдущую).\n"
         "  # ТРИГГЕРЫ (include_triggers=True — ПО УМОЛЧАНИЮ с v1.36.0): метод вызывается не только\n"
         "  #   из кода. Подмешивает на КАЖДЫЙ узел node['triggers'] — не-call ребра (подписки/события\n"
         "  #   форм/рег.задания/CFE). Ключ triggers присутствует ВСЕГДА (=[] если нечего показать);\n"
@@ -21867,9 +23889,9 @@ def make_bsl_helpers(
         "find_path",
         find_path,
         "find_path(from_name, to_name, max_depth=4, from_hint='', to_hint='', include_triggers=True) -> "
-        "{found, from, to, path:[{name, module_path, call_line, call_kind, triggers?}]|None, depth, "
+        "{found, from, to, path:[{name, module_path, call_line, call_kind, triggers?}]|None, depth, hint?, "
         "_meta:{max_depth, nodes_expanded, visited_cap, budget_exceeded, from_key, to_exact, to_key, "
-        "precision:'exact'|'heuristic', direction:'callers-reverse'}} | "
+        "precision:'exact'|'heuristic', direction}} | "
         "{found:False, error, hint, candidates:[{object_name, category, module_type, file, line}], _meta:{ambiguous, ambiguous_arg}}  "
         "# call_line — строка РЕБРА; сначала проверяй 'error'",
         "code",
@@ -21883,6 +23905,7 @@ def make_bsl_helpers(
             "путь между методами",
         ],
         "FIND PATH (достижим ли to_name из from_name по графу ВЫЗОВОВ, from → … → to):\n"
+        "  # _meta.direction='callers-reverse': обход идет от to вверх по вызывающим.\n"
         "  # call_line у ТЕРМИНАЛЬНОГО узла (to) равен None — ребра дальше нет.\n"
         "  # Многозначное имя без своего hint → ранний {error, hint, candidates}: проверяй\n"
         "  #   'error' in res ПЕРЕД found/budget_exceeded и добавь to_hint/from_hint из candidates.\n"
@@ -21898,7 +23921,7 @@ def make_bsl_helpers(
         "          print(f\"  {el['name']} ({el['module_path']}) call_line={el['call_line']}\")\n"
         "      # call_line — строка ВЫЗОВА к СЛЕДУЮЩЕМУ узлу (ребро), НЕ определения; у to call_line=None\n"
         "  else:\n"
-        "      print('путь не найден' if not res['_meta']['budget_exceeded'] else 'обход обрезан — сузь hint/уменьши max_depth')\n"
+        "      print('путь не найден' if not res['_meta']['budget_exceeded'] else res['hint'])  # hint — маршрут добора\n"
         "  # ТОЧНОСТЬ: _meta.precision='exact' ⇔ to разрешён точно И все рёбра пути по callee_key;\n"
         "  #   'heuristic' (старый индекс/FS/имя) → found=True = достижимость ПО ИМЕНИ, не доказанный путь.\n"
         "  # Одноимённые методы: from_hint/to_hint. ТОЧНАЯ форма — rel_path (res['candidates'][i]['file']\n"
@@ -21906,6 +23929,12 @@ def make_bsl_helpers(
         "  #   пинится точно ТОЛЬКО когда имя внутри объекта уникально.\n"
         "  # _meta.budget_exceeded=True → обход обрезан (visited_cap ИЛИ у узла >одной страницы callers),\n"
         "  #   found=False НЕ доказывает отсутствие; только found=False+budget_exceeded=False И без 'error' — точно «не достижим».\n"
+        "  # УСЕЧЕННЫЙ УЗЕЛ: прямое ребро from → узел проверяется по ВСЕМ вызывающим (индекс, слой расширений);\n"
+        "  #   промах несет res['hint'] с исполнимым добором и _meta.truncated_nodes (первые 10, счет —\n"
+        "  #   truncated_nodes_total): [{name, module_path, expanded, next_offset, page_unit, total_callers}].\n"
+        "  #   Добор — с ПОДСКАЗКОЙ УЗЛА, не '': без нее запрос идет по имени и листает ДРУГОЙ список.\n"
+        "  #   page_unit='files' — FS-маршрут: offset/limit/has_more — в ФАЙЛАХ, total_callers — строки\n"
+        "  #   страницы (total_callers=None): листай offset += limit, пока has_more.\n"
         "  # ВИД РЕБРА: el['call_kind'] — 'background' (узел ЗАПУСКАЕТ следующий по имени:\n"
         "  #   ФоновыеЗадания.Выполнить, ДлительныеОперации.*) либо 'call'; у to — None, как call_line.\n"
         "  #   Запуск по вычисляемому имени ребра не дает: find_unresolved_calls(reasons=['dynamic_name']).\n"
@@ -21918,8 +23947,7 @@ def make_bsl_helpers(
         find_unresolved_calls,
         "find_unresolved_calls(layer='all', reasons=None, path='', limit=50, offset=0) -> "
         "{issues:[{file, line, caller, owner, expression, target, kind, reason, target_owner}], total, has_more, "
-        "by_reason, not_checked, partial}"
-        "  # адресат в тексте: Модуль.Метод, Коллекция.X.Метод, запуск по имени",
+        "by_reason, not_checked, partial}",
         "code",
         [
             "неразрешен",
@@ -21933,6 +23961,7 @@ def make_bsl_helpers(
             "фоновое задание",
         ],
         "UNRESOLVED CALLS (после обновления типовой: у каких обращений нет адресата):\n"
+        "  # Проверяется адресат в тексте: Модуль.Метод, Коллекция.X.Метод, запуск по имени\n"
         "  res = find_unresolved_calls()                 # основная конфигурация + расширения\n"
         "  print(res['total'], res['by_reason'], res['not_checked'])\n"
         "  for i in res['issues']:\n"
@@ -21956,7 +23985,7 @@ def make_bsl_helpers(
         "find_definition(name(str|list), module_hint='', limit=50) -> {name, definitions:[{file, line, end_line, "
         "type, is_export, params, category, object_name, module_type, owner}], total, truncated, partial, "
         "_meta:{index_used, unique, slow_fallback, source, extensions_included, total_exact, ...}}  "
-        "# list → {имя: ответ}; hint по объекту — ТОЧНОЕ имя",
+        "# list → {имя: ответ}",
         "code",
         [
             "definition",
@@ -21970,6 +23999,7 @@ def make_bsl_helpers(
             "перейти к определению",
         ],
         "FIND DEFINITION (где определён метод — форвард-комплемент find_callers_context):\n"
+        "  # hint по объекту — ТОЧНОЕ имя (не подстрока)\n"
         "  d = find_definition('ПересчитатьИтоги')\n"
         "  for x in d['definitions']:\n"
         "      print(x['file'], x['line'], x['type'], 'export' if x['is_export'] else '')\n"
@@ -22033,7 +24063,9 @@ def make_bsl_helpers(
         "  #   code_metrics(path)['total_lines'], без пустых и комментариев — ['code_lines'].\n"
         "  # _meta.index_used=False + fallback_reason — индекс недоступен/устарел (отработал live-парсинг);\n"
         "  #   'extension_module_not_indexed' — модуль соседнего расширения: в индексе основной\n"
-        "  #   конфигурации его нет по построению (это не устаревание индекса).",
+        "  #   конфигурации его нет по построению (это не устаревание индекса).\n"
+        "  # Путь в любой форме (абсолютный, с '\\\\') приводится к каноническому от корня сессии: path в ответе —\n"
+        "  #   канон (`../cfe/…` у расширения), аргумент в другой форме — _meta.requested_path.",
     )
     _reg(
         "find_callers",
@@ -22121,10 +24153,11 @@ def make_bsl_helpers(
     _reg(
         "parse_form",
         parse_form,
-        "parse_form(object_name, form_name='', handler='') -> [{form_name, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table?, query_text?}]}]  # имя элемента — element; types — list[str]; в CF элемент несет префикс пространства имен, в EDT нет, поэтому `'DynamicList' in types` — сравнение по ЭЛЕМЕНТУ — на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]; handler= режет формы И handlers",
+        "parse_form(object_name, form_name='', handler='') -> [{form_name, category, object_name, file, module_path, handlers:[{element, element_type, event, handler, data_path, scope}], commands:[{name, action}], attributes:[{name, types, main, main_table?, query_text?}]}]  # имя элемента — element; types — list[str]; в CF элемент несет префикс пространства имен, в EDT нет, поэтому `'DynamicList' in types` на CF дает False: сверяй ХВОСТ t.rsplit(':',1)[-1]; handler= режет формы И handlers",
         "xml",
         kw=["parse_form", "события формы", "обработчики формы", "элементы формы", "form handler", "form event"],
         recipe=(
+            "PARSE FORM (обработчики, команды и реквизиты форм объекта):\n"
             "# ИМЕНА ПОЛЕЙ: имя элемента — element (НЕ element_name: так называется\n"
             "# колонка БД); НЕ attr_type — это поле find_attributes, а не parse_form.\n"
             "# Обработчики и команды формы объекта:\n"
@@ -22169,7 +24202,8 @@ def make_bsl_helpers(
             "        if q:\n"
             "            print(f['form_name'], a['name'], q[:80])\n"
             "# query_text ОБРЕЗАН до 512 символов и флага усечения НЕ несёт: полный текст\n"
-            "# запроса читай из самого XML формы либо через extract_queries(module_path).\n"
+            "# запроса — read_file(f['file']) (XML формы основной конфигурации; форма\n"
+            "# расширения '../' песочницей не читается). В модуле формы этого запроса нет.\n"
         ),
     )
     _reg(
@@ -22184,6 +24218,8 @@ def make_bsl_helpers(
         "  print(f\"{result['name']} ({result['synonym']})\")\n"
         "  for v in result['values']:\n"
         "      print(f\"  {v['name']}: {v['synonym']}\")\n"
+        "  # Точное имя — первым; 'Перечисление.X' — только точное (нет — error); фрагмент — ближайшее по\n"
+        "  #   подстроке и result['hint'] (сверь name); голое имя объекта другой категории — ValueError.\n"
         "  # BATCH: несколько перечислений одним вызовом → {enum_name: {...}|{error}};\n"
         "  #   ошибки изолированы ПОЭЛЕМЕНТНО, батч цел:\n"
         "  many = find_enum_values(['СтатусыЗаказов', 'ВидыОпераций'])\n"
@@ -22278,6 +24314,9 @@ def make_bsl_helpers(
         "  # ровно нужное: get_object_profile(name, sections=['structure','roles'])\n"
         "  # тяжёлое ТОЛЬКО по флагу: get_object_profile(name, include_flow=True) → +секция flow\n"
         "  #   (analyze_document_flow), include_code_usages=True → +code-scan. Без флагов они НЕ считаются.\n"
+        "  #   flow — поток объекта категории профиля: у не-документа status='error' (_meta.error — маршрут).\n"
+        "  # items секций subscriptions и flow несут event_reachable=False у Posting/UndoPosting документа\n"
+        "  #   с Posting=Deny — как find_event_subscriptions (событие не наступает).\n"
         "  # ДИЗАМБИГУАЦИЯ: весь обзор за 1 вызов → get_object_profile; только код-скелет → get_object_modules;\n"
         "  #   только метаданные → get_object_full_structure; глубокий разбор тел/потока → analyze_document_flow / analyze_object",
     )
@@ -22296,7 +24335,10 @@ def make_bsl_helpers(
         "  print(f\"Объект: {result['name']} ({meta.get('synonym', '')})\")\n"
         "  for m in result.get('modules', []):\n"
         "      print(f\"  {m['module_type']}: {m['procedures_count']} проц, {m['exports_count']} эксп\")\n"
-        "  # Обзор за 1 дешёвый вызов → get_object_profile(name); код-скелет → get_object_modules(name).",
+        "  # Обзор за 1 дешевый вызов → get_object_profile(name); код-скелет → get_object_modules(name).\n"
+        "  # Омоним — модули ОДНОГО объекта (категории первого точного модуля). Объект без модулей (роль,\n"
+        "  #   подсистема, общая картинка…) — metadata его описателя и modules=[]; фрагмент имени — модули\n"
+        "  #   одного ближайшего объекта и hint; объект основной в сессии на расширении — error.",
     )
     _reg(
         "get_object_full_structure",
@@ -22304,7 +24346,7 @@ def make_bsl_helpers(
         "get_object_full_structure(name, enum_values_limit=50) -> {object_name, category, synonym, posting, "
         "attributes, tabular_sections, dimensions, resources, predefined_items, "
         "enum_values_for_typed_refs, enum_values_truncated, forms, templates, value_type, "
-        "_meta:{index_used,fallback_reason,ts_synonyms_available}}"
+        "_meta:{index_used, fallback_reason:str|None, ts_synonyms_available}}"
         "  # posting=None — НЕ читалось, не «не проводится»",
         "composite",
         [
@@ -22372,8 +24414,8 @@ def make_bsl_helpers(
             "batch structure",
             "по критерию",
         ],
-        "BATCH OBJECT STRUCTURES (критерий вместо ручного цикла — ТРЕБУЕТ индекс, без него используй "
-        "search_objects()/find_module() + get_object_full_structure() по одному):\n"
+        "BATCH OBJECT STRUCTURES (критерий вместо цикла по одному объекту; нужен индекс):\n"
+        "  # Без индекса — {error, hint}: search_objects()/find_module() + get_object_full_structure() по одному.\n"
         "  # Сначала дёшево — сколько вообще совпадает (names_only=True, без раскрытия структур):\n"
         "  passport = get_object_structures(name_like='Взаиморасчеты', names_only=True)\n"
         "  print(passport['total_matched'], 'объектов, truncated=', passport['truncated'])\n"
@@ -22395,8 +24437,8 @@ def make_bsl_helpers(
         "get_object_modules(name, include_methods=False, no_live=False) -> {object_name, category, "
         "modules:[{path, module_type, form_name, owner, totals:{methods,exports,regions,loc=Σ строк методов}, "
         "outline:[{region, line, end_line, totals, children, methods?}], "
-        "overrides:{count, methods:[...]}, orphan_methods?, _meta:{index_used, fallback_reason, skipped_live}}], "
-        "totals:{modules, methods, exports, overrides}, _meta:{index_used, modules_truncated, modules_skipped_live}} | {error, _meta}",
+        "overrides:{count=методов, methods:[...]}, orphan_methods?, _meta:{index_used, fallback_reason, skipped_live}}], "
+        "totals:{modules, methods, exports, overrides}, _meta:{index_used=все из индекса, modules_truncated, modules_skipped_live}} | {error, _meta}",
         "composite",
         [
             "модули объекта",
@@ -22411,8 +24453,19 @@ def make_bsl_helpers(
         "  # На индексном пути НЕ читает тела (extract_procedures) и НЕ парсит XML — легче analyze_object.\n"
         "  # no_live=True → stale/no-index модули помечаются skipped_live БЕЗ live-чтения.\n"
         "  # fallback_reason='extension_module_not_indexed' — модуль соседнего расширения (в индексе\n"
-        "  #   основной его нет по построению); секция modules профиля, где пропущены только такие\n"
-        "  #   модули, — _meta.reason='extension_modules_skipped_live'.\n"
+        "  #   основной его нет по построению); секция modules профиля такие модули читает живьем.\n"
+        "  # _meta.modules_index / modules_live / modules_skipped — сколько модулей из индекса, разобрано\n"
+        "  #   живьем, не прочитано (пропуск или отказ разбора); каждый модуль — ровно в одном.\n"
+        "  # Модуль без процедур, совпадающий с диском, — ответ индекса (index_empty_for_module — только\n"
+        "  #   если файл изменился после сборки).\n"
+        "  # Объект без модулей (роль, подсистема…) — error «У объекта Категория/Имя нет модулей» с маршрутом\n"
+        "  #   parse_object_xml(путь описателя).\n"
+        "  # ЕДИНИЦЫ: overrides.count модуля (и totals.overrides) — число перехваченных МЕТОДОВ, а не строк\n"
+        "  #   перехватов (get_overrides(объект)['total'] считает строки: два перехвата одного метода — здесь 1,\n"
+        "  #   там 2).\n"
+        "  #   Верхний _meta.index_used=True — ВСЕ модули из индекса; False — хотя бы один разобран живьем или не\n"
+        "  #   прочитан (модули соседних расширений в индексе основной нет по построению): сколько каких — в\n"
+        "  #   _meta.modules_index / modules_live / modules_skipped, а не «индекс не использован».\n"
         "  om = get_object_modules('РеализацияТоваров')  # include_methods=False — только области + агрегаты\n"
         "  if 'error' in om:\n"
         "      print(om['error'])\n"
@@ -22449,10 +24502,12 @@ def make_bsl_helpers(
     _reg(
         "analyze_document_flow",
         analyze_document_flow,
-        "analyze_document_flow(doc_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # dict (+ is_postable/hint для непроводимых)",
+        "analyze_document_flow(doc_name) -> {document, metadata, event_subscriptions, register_movements, related_scheduled_jobs, based_on, print_forms}  # + is_postable/hint для непроводимых",
         "composite",
         ["lifecycle", "жизненн", "flow", "end-to-end", "полный анализ", "как работает"],
         "FULL DOCUMENT LIFECYCLE:\n"
+        "  # metadata и event_subscriptions — у ДОКУМЕНТА: голое имя с одноименным регистром/справочником\n"
+        "  #   отвечается документом, если он есть.\n"
         "  # Формы вложенных значений: register_movements — сам dict (контракт см.\n"
         "  # find_register_movements), based_on — dict (см. find_based_on_documents),\n"
         "  # event_subscriptions / related_scheduled_jobs — списки.\n"
@@ -22523,7 +24578,9 @@ def make_bsl_helpers(
         "      for r in mod['custom_regions']:\n"
         "          print(f\"  #Область {r['name']} (стр.{r['line']})\")\n"
         "  for attr in result.get('custom_attributes', []):\n"
-        "      print(f\"Реквизит: {attr['name']} ({attr.get('synonym', '')})\")",
+        "      print(f\"Реквизит: {attr['name']} ({attr.get('synonym', '')})\")\n"
+        "  # Префиксы не обнаружены — error: передай custom_prefixes=['мой_']. Объект без модулей —\n"
+        "  #   modules_analyzed=0 и custom_attributes из описателя; фрагмент имени — модули одного объекта + hint.",
     )
 
     _reg(
@@ -22532,17 +24589,24 @@ def make_bsl_helpers(
         "find_event_subscriptions(obj, custom_only=False, event_filter=None, limit=None, include_source_types=False)"
         " -> list[dict] | {subscriptions, total, returned, has_more} (limit)"
         "  # при непустом obj строка несёт scope=exact|set|partial|universal, matched_via, matched_types,"
-        " matched_sets; source_types — по include_source_types=True; полное имя — ТОЧНОЕ совпадение,"
-        " фрагмент — подстрока; 'Документ.X' -> category-aware",
+        " matched_sets, event_reachable?; source_types — по include_source_types=True",
         "business",
         ["подписк", "subscription", "событи", "event", "BeforeWrite", "OnWrite", "ПриЗаписи", "ПередЗаписью"],
         "FIND EVENT SUBSCRIPTIONS:\n"
+        "  # Отбор: полное имя — ТОЧНОЕ совпадение, фрагмент — подстрока; 'Документ.X' -> category-aware\n"
+        "  # Обзор — '' (или пробелы); префикс/путь без имени ('Документ.', 'Documents/') — ValueError.\n"
+        "  # event_reachable=False — строка Posting/UndoPosting у документа с Posting=Deny: событие не\n"
+        "  #   наступает (ключа нет у прочих строк и когда проведение не определено).\n"
+        "  # Наборы SequenceRecordSet/RecalculationRecordSet/DocumentJournalManager — у объекта своей\n"
+        "  #   категории set, у прочих строки нет; set_unresolved — набор с неизвестным составом.\n"
+        "  # Имя, которому не соответствует ни один объект (и фрагмент), — без строк наборов (scope=set);\n"
+        "  #   ссылка на несуществующий объект и слово категории ('Documents') — ValueError.\n"
         "  # Default — весь список (контракт прежний):\n"
         "  subs = find_event_subscriptions('АвансовыйОтчет')\n"
         "  for s in subs: print(s['event'], s['handler'])\n"
         "  # С фильтром по событию (case-insensitive substring) — list[str] ИЛИ одна строка.\n"
         "  # Имя события — английское, как в XML подписки (BeforeWrite, OnWrite, Posting, Filling):\n"
-        "  # русское имя обработчика ('ПередЗаписью') не совпадает никогда.\n"
+        "  # русское имя обработчика ('ПередЗаписью') не совпадает никогда — такой фильтр ValueError.\n"
         "  write_events = find_event_subscriptions('АвансовыйОтчет', event_filter=['BeforeWrite','OnWrite'])\n"
         "  before_write_one = find_event_subscriptions('АвансовыйОтчет', event_filter='BeforeWrite')  # ок: одна строка\n"
         "  # С пагинацией (формат меняется на dict!):\n"
@@ -22598,8 +24662,10 @@ def make_bsl_helpers(
         "  #   алиас main) и на индексе v15 оно None — это контракт, а не пропуск.\n"
         "  # ФОРМА ответа: code_registers — СЛОВАРИ (у каждого есть source: code|manager_code),\n"
         "  #   а erp_mechanisms / manager_tables / adapted_registers — списки ИМЕН-СТРОК.\n"
-        "  # partial=True означает неполное чтение CFE: _meta.modules_scanned содержит только\n"
-        "  #   успешно прочитанные модули. При пустом code_registers смотри posting_handler_present + hint.\n"
+        "  # modules_scanned — ObjectModule документа, чьи движения учтены: основной конфигурации\n"
+        "  #   первым, затем прочитанные модули расширений; partial=True — часть CFE не прочитана\n"
+        "  #   (_meta.extension_modules_unreadable). При пустом code_registers смотри posting_handler_present + hint.\n"
+        "  # hint: пояснение вида делегата — у ПЕРВОГО делегата этого вида, у следующих — только шаги.\n"
         "  # source у строки code_registers:\n"
         "  #   'code'         — прямое Движения.X в ObjectModule документа либо делегат\n"
         '  #     «регистр по имени» (ПроведениеСервер.ОтразитьДвиженияПоРегистру(..., "Имя"));\n'
@@ -22665,6 +24731,8 @@ def make_bsl_helpers(
         "  #   manager_code — набор записей из МОДУЛЯ МЕНЕДЖЕРА документа, имя сверено\n"
         "  #   с каталогом регистров. Схемы, где имя регистра собирается в структуре\n"
         "  #   во время исполнения, статически неразрешимы и сюда НЕ попадают.\n"
+        "  # На индексе строка — пара (документ, источник, файл) без повторов, total_writers — их число;\n"
+        "  #   total_documents_scanned=None (файлы не читались). Без индекса — строки с lines.\n"
         "  for w in result['writers']:\n"
         "      detail = w.get('lines') or w.get('source', '')\n"
         "      print(f\"  {w['document']} ({detail})\")\n"
@@ -22690,7 +24758,8 @@ def make_bsl_helpers(
         "  # Если у документа нет ДобавитьКомандыСозданияНаОсновании (типичный кейс — Письма в ДО3),\n"
         "  # хелпер автоматически делает back_scan по ОбработкаЗаполнения других Documents и находит\n"
         "  # документы, у которых наш doc_name упомянут как ДокументСсылка.<doc_name>.\n"
-        "  # Записи back_scan помечены via='back_scan'; декларативные <BasedOn> из индекса\n"
+        "  # Записи back_scan помечены via='back_scan', их line — строка упоминания\n"
+        "  #   ДокументСсылка.<doc_name> (модули объекта в раскладках CF и EDT); декларативные <BasedOn> из индекса\n"
         "  # (в т.ч. Catalog-основания, невидимые для FS-скана Documents/*) — via='metadata'\n"
         "  # (несут d['category'] и canonical d['ref']).\n"
         "  # Голое имя не-документа (v1.44.0): отвечает объект его категории, ссылка — в\n"
@@ -22704,7 +24773,7 @@ def make_bsl_helpers(
     _reg(
         "find_print_forms",
         find_print_forms,
-        "find_print_forms(obj_name) -> {print_forms: [{name, presentation|None, presentation_source, delegate}], _meta:{delegates}}",
+        "find_print_forms(obj_name) -> {print_forms: [{name, presentation|None, presentation_source, delegate}], hint?, _meta:{delegates}}",
         "business",
         ["печат", "print", "макет", "template", "накладн"],
         "FIND PRINT FORMS:\n"
@@ -22722,7 +24791,14 @@ def make_bsl_helpers(
         "  # Что не раскрыто и почему — _meta.delegates_expanded[i].status: expanded | other_list\n"
         "  #   | module_not_found | procedure_not_found | cycle | depth_limit | unsupported_receiver\n"
         "  #   (ключ есть, только когда делегаты есть).\n"
-        "  # Имя — ТОЧНЫЙ объект ('Документ.X' сужает категорию); фрагмент — подстрочный поиск.",
+        "  # Имя — ТОЧНЫЙ объект ('Документ.X' сужает категорию); фрагмент — подстрочный поиск.\n"
+        "  # Пусто у СУЩЕСТВУЮЩЕГО объекта — hint и _meta.command_candidates [{kind: journal_command |\n"
+        "  #   object_command, owner, command, module_path}]: команды журналов документов, где он\n"
+        "  #   зарегистрирован, затем самого объекта (и его описателей в соседних расширениях; module_path —\n"
+        "  #   рядом с описателем команды); общие команды — маршрутом из hint.\n"
+        "  #   Пустой разбор ДобавитьКомандыПечати — не «команд нет»: идентификатор не литералом\n"
+        "  #   (переменная, выражение) разборщик пропускает — hint дает read_procedure тела.\n"
+        "  # Без имени ('', пробелы, 'Документ.', 'Documents/') — ValueError с именем хелпера.",
     )
     _reg(
         "find_functional_options",
@@ -22795,7 +24871,9 @@ def make_bsl_helpers(
         "  # r['details_truncated']=True сужай qualified object, а НЕ считай список полным.\n"
         "  # Точные маршруты — ТОЛЬКО с индексом: факт ссылки/членства —\n"
         "  # find_references_to_object('Документ.X', kinds=['role_rights']);\n"
-        "  # точные ИМЕНА ПРАВ — get_object_profile('Документ.X', sections=['roles']).",
+        "  # точные ИМЕНА ПРАВ — get_object_profile('Документ.X', sections=['roles']).\n"
+        "  # Имя, которому не соответствует ни один объект, — без ролей по флагу (set_for_new_objects);\n"
+        "  #   ссылка на несуществующий объект — ValueError «объекта … нет».",
     )
     _reg(
         "find_role_objects",
@@ -22880,6 +24958,8 @@ def make_bsl_helpers(
         "  results = search_objects('себестоимость')\n"
         "  for r in results:\n"
         "      print(r['synonym'], r['category'], r['object_name'])\n"
+        "  # synonym — как в описателе, без префикса вида; поиск идет по хранимой форме\n"
+        "  #   «Категория: синоним», поэтому search_objects('Документ:') находит объекты вида.\n"
         "  # Сколько их НА САМОМ ДЕЛЕ (limit на счёт не влияет):\n"
         "  n = search_objects('себестоимость', count_only=True)\n"
         "  print(n['total'], n['source'], n['extensions_included'])\n"
@@ -22887,12 +24967,15 @@ def make_bsl_helpers(
         "  # legacy scope и truncated для этого НЕ годятся. _meta.index_coverage говорит,\n"
         "  # что известно про synonym-домен индекса: build_unproven | disabled |\n"
         "  # wider_than_current | unavailable | not_used. В v15 полнота optional-домена\n"
-        "  # НЕ доказуема, поэтому индексный count честно остаётся partial.",
+        "  # НЕ доказуема, поэтому индексный count честно остается partial.\n"
+        "  # count_only считает ОБЪЕКТЫ, в том числе без модулей (find_by_type считает МОДУЛИ —\n"
+        "  #   общая форма без модуля есть здесь и нет там); на индексе total_exact=False и\n"
+        "  #   partial=True всегда: полноту домена синонимов индекс не доказывает — index_coverage.",
     )
     _reg(
         "search_regions",
         search_regions,
-        "search_regions(query, limit=200, count_only=False, group_by=None) -> [{name, line, end_line, module_path, object_name, category, owner}] "
+        "search_regions(query, limit=200, count_only=False, group_by=None) -> [{name, line, end_line, module_path, object_name|None, category|None, owner}] "
         "| count_only: {total, source, truncated, scope} + total_main/total_extensions при CFE "
         "| group_by='name'|'category': {groups:[{key,count}], groups_total, groups_returned, truncated, group_by, source, scope}"
         "  # limit режет по ORDER BY name — агрегаты только через group_by;"
@@ -22906,6 +24989,8 @@ def make_bsl_helpers(
         "  # 0 совпадений — НЕ доказательство отсутствия: поиск идёт подстрокой без\n"
         "  # стемминга, поэтому 'Себестоимость' не находит 'Себестоимости'. Прежде чем\n"
         "  # писать «такого нет», проверь другую словоформу или корень ('Себестоимост').\n"
+        "  # category/object_name = None — модуль уровня конфигурации или категории вне словаря; ключ\n"
+        "  #   group_by='category' у них — 'Configuration' либо сегмент пути (Sequences, IntegrationServices).\n"
         "  # CENSUS — точное число без выдачи:\n"
         "  n = search_regions('Себестоимость', count_only=True)['total']\n"
         "  # ТОП-N ПО ЧАСТОТЕ — только так. Списочная ветка при пустом query идет\n"
@@ -22927,7 +25012,7 @@ def make_bsl_helpers(
     _reg(
         "search_module_headers",
         search_module_headers,
-        "search_module_headers(query, limit=200, count_only=False) -> [{module_path, object_name, category, header_comment, header_truncated, owner}] "
+        "search_module_headers(query, limit=200, count_only=False) -> [{module_path, object_name|None, category|None, header_comment, header_truncated, owner}] "
         "| {total, with_text, source, truncated, scope} + total_main/total_extensions при CFE"
         "  # подстрока без стемминга: 0 совпадений НЕ доказывает отсутствие — проверь словоформу/корень",
         "discovery",
@@ -22937,6 +25022,7 @@ def make_bsl_helpers(
         "  headers = search_module_headers('себестоимость')\n"
         "  for h in headers:\n"
         "      print(h['category'], h['object_name'], h['header_comment'][:80])\n"
+        "  # category/object_name = None — модуль уровня конфигурации или категории вне словаря.\n"
         "  # CENSUS (молча усекается по limit) — точное число без выдачи:\n"
         "  n = search_module_headers('доработка', count_only=True)['total']\n"
         "  # count = тот же scope, что и выдача (v1.30.0): с расширениями и непустым query\n"
@@ -22971,7 +25057,7 @@ def make_bsl_helpers(
     _reg(
         "get_index_info",
         get_index_info,
-        "get_index_info() -> {status, builder_version, config_name, has_fts, has_synonyms, ...}",
+        "get_index_info() -> {status, index_status, builder_version, config_name, has_fts, has_synonyms, ...}",
         "discovery",
         ["index", "version", "индекс", "версия", "info", "get_index_info"],
         "CHECK INDEX CAPABILITIES:\n"
@@ -22990,7 +25076,11 @@ def make_bsl_helpers(
         "      if info.get('has_object_attributes'): caps.append('find_attributes')\n"
         "      if info.get('has_predefined_items'): caps.append('find_predefined')\n"
         "      if info.get('has_extension_overrides'): caps.append('get_overrides')\n"
-        "      print('INSTANT helpers:', caps)",
+        "      print('INSTANT helpers:', caps)\n"
+        "  # status — читается ли индекс (ok | incomplete | no_index); index_status — СВЕЖЕСТЬ, метка\n"
+        "  #   старта сессии = rlm_start.index.index_status (ok | stale_age | stale_content | incomplete | missing);\n"
+        "  #   content_sample — итог выборочной сверки старта при stale_age (ok | mismatch | skipped |\n"
+        "  #   unavailable), иначе 'not_checked'; regions_count / module_headers_count — числа областей и шапок (None без индекса).",
     )
 
     _reg(
@@ -23048,7 +25138,7 @@ def make_bsl_helpers(
         "find_references_to_object(object_ref, kinds=None, limit=1000, include_code=False) -> {object, references: [{used_in, path, line, kind}], total, truncated, partial, by_kind} (+ code_usages/code_total/code_by_kind/code_truncated/code_partial/code_meta при include_code)"
         "  # _meta ВСЕГДА:"
         " source/extensions_included/unsupported_kinds/index_coverage"
-        "; kinds_requested/kinds_applied; unsupported_kinds — LIVE",
+        "; kinds_requested/kinds_applied/expanded_on_read; unsupported_kinds — LIVE",
         "business",
         [
             "ссылк",
@@ -23070,6 +25160,12 @@ def make_bsl_helpers(
         "  full = find_references_to_object('Документ.X', include_code=True)\n"
         "  print(f\"meta={full['total']} code={full['code_total']} {full['code_by_kind']}\")\n"
         "  # On v11 indexes (no metadata_references table) — partial=True via live scan\n"
+        "  # Голое имя ('Валюты') — ссылка единственной категории объекта (_meta.resolved_ref='Catalog.Валюты');\n"
+        "  #   омоним разных категорий — ValueError с перечнем; объекта нет — total=0 и hint.\n"
+        "  # Ссылка на несуществующий объект ('Справочник.Нет') — ValueError «объекта … нет» с маршрутом\n"
+        "  #   search_objects(…); голое слово категории ('Справочники') — ValueError «имя категории».\n"
+        "  # _meta.expanded_on_read — сколько строк вида раскрыто НА ЧТЕНИИ (подписки на набор типов,\n"
+        "  #   роли по флагу): в by_kind/total они слиты с объявленными; {} — раскрытия не было.\n"
         "  # line — строка САМОЙ ссылки (тег типа), а не строка объявления владельца.\n"
         "  #   Заполнена у видов attribute_type / owner / based_on / default_object_form /\n"
         "  #   default_list_form; у остальных видов line=None — это заявленный контракт,\n"
@@ -23080,7 +25176,7 @@ def make_bsl_helpers(
         "find_data_path",
         find_data_path,
         "find_data_path(from_object, to_object, max_depth=4, kinds=None) -> "
-        "{found, from, to, path:[{from, to, kind, used_in, path, line}]|None, depth, partial, "
+        "{found, from, to, path:[{from, to, kind, used_in, path, line}]|None, depth, partial, hint?, "
         "_meta:{max_depth, nodes_expanded, node_budget, budget_exceeded, kinds}} "
         "| {found:False, error, hint, ...}  "
         "# endpoints — С ПРЕФИКСОМ (Справочник.X/Документ.Y)",
@@ -23098,14 +25194,21 @@ def make_bsl_helpers(
         "  # N-hop BFS по графу МЕТАДАННЫХ (ссылки), а НЕ по графу вызовов.\n"
         "  res = find_data_path('Документ.РеализацияТоваровУслуг', 'РегистрНакопления.Продажи')\n"
         "  if res.get('error'):\n"
-        "      print(res['hint'])  # endpoints ОБЯЗАНЫ быть с префиксом: Справочник./Документ./…\n"
+        "      print(res['error'], res['hint'])  # концы — С ПРЕФИКСОМ (Справочник./Документ./…) и существующие\n"
         "  elif res['found']:\n"
         "      for e in res['path']:  # forward: [from → … → to], каждый элемент = РЕБРО\n"
         "          print(f\"  {e['from']} --{e['kind']}--> {e['to']} ({e['used_in']})\")\n"
         "  else:\n"
-        "      print('partial — нет таблицы metadata_references' if res['partial'] else 'путь не найден')\n"
+        "      print(res.get('hint') or 'путь не найден')  # hint — у КАЖДОГО неокончательного промаха\n"
         "  # Фильтр по виду ссылки: find_data_path('Документ.X', 'Справочник.Y', kinds=['attribute_type'])\n"
-        "  # RU/EN-префикс принимается; _meta.budget_exceeded=True → обход обрезан (сузь max_depth).",
+        "  # RU/EN-префикс принимается; _meta.budget_exceeded=True → обход обрезан (сузь max_depth).\n"
+        "  # Неокончательный промах (budget_exceeded=True или partial=True) несет hint: упор в node_budget,\n"
+        "  #   таблица ссылок недоступна, индекса нет или УСЕЧЕННЫЙ узел — исходящих ссылок не меньше\n"
+        "  #   страницы 1000 (_meta.truncated_nodes=[{object, refs_returned}], счет — truncated_nodes_total;\n"
+        "  #   прямая ссылка на to у него проверена точечно, обход — по первой странице). Маршрут: сузь\n"
+        "  #   kinds либо проверь ссылку обратным поиском find_references_to_object('Справочник.Y').\n"
+        "  #   Узел ПОСЛЕДНЕГО уровня (глубина max_depth-1) усеченным не считается: его дети не раскрывались бы\n"
+        "  #   и так, а прямая ссылка проверена — такой промах окончателен (без hint).",
     )
 
     _reg(
@@ -23128,8 +25231,11 @@ def make_bsl_helpers(
         "      tail = f\" .{u['member']}\" if u['member'] else ''\n"
         "      print(f\"  {u['kind']:8s} {u['path']}:{u['line']}{tail}\")\n"
         "  # kind: 'manager' (Документы.X) | 'ref_type' (\"ДокументСсылка.X\") | 'query' (Документ.X.ТЧ)\n"
+        "  # Голое имя — ссылка единственной категории (_meta.resolved_ref); омоним — ValueError; нет — hint.\n"
+        "  # Ссылка на несуществующий объект ('Документ.Нет') — ValueError «объекта … нет» (search_objects).\n"
         "  # Filter: find_code_usages('Документ.X', kind='query') — работает на ИНДЕКСНОМ\n"
-        "  #   маршруте; живой фолбэк вид не определяет (_meta.kind_filter_applied).\n"
+        "  #   маршруте; живой фолбэк вид не определяет (_meta.kind_filter_applied: True — применен,\n"
+        "  #   False — не применим, None — kind не задан).\n"
         "  # Pairs with find_references_to_object (metadata-XML refs). Охват кода расширений\n"
         "  # зависит от МАРШРУТА и назван в _meta.extensions_included: индекс покрывает ТЕКУЩИЙ\n"
         "  # root, живой фолбэк идёт по CFE-aware каталогу.",
@@ -23149,12 +25255,13 @@ def make_bsl_helpers(
     _reg(
         "detect_extensions",
         detect_extensions,
-        "detect_extensions() -> {config_role, nearby_extensions:[{name, purpose, prefix, path, overrides_count}], nearby_main, warnings}",
+        "detect_extensions() -> {config_role, config_name, config_prefix, nearby_extensions:[{name, purpose, prefix, path, overrides_count}], nearby_main, warnings}",
         "extension",
         ["обнаружить расширения", "детект", "detect", "extension list"],
         "DETECT EXTENSIONS (диагностика контекста):\n"
         "  ctx = detect_extensions()\n"
         "  print(f\"Роль: {ctx['config_role']}\")  # main / extension / unknown\n"
+        "  # config_prefix — префикс текущей конфигурации; нет префикса — None (как current_prefix старта)\n"
         "  for e in ctx.get('nearby_extensions', []):\n"
         "      print(f\"  {e.get('name')} (prefix={e.get('prefix')}) перехватов={e.get('overrides_count')}\")  # ключ 'prefix', не 'name_prefix'\n"
         "  # overrides_count — index-side счёт перехватов: int/0 в MAIN-сессии, None если индекс не покрывал расширение\n"
@@ -23163,7 +25270,7 @@ def make_bsl_helpers(
     _reg(
         "find_ext_overrides",
         find_ext_overrides,
-        "find_ext_overrides(extension_path, object_name='') -> {overrides[:200], total, truncated, partial, _meta?}",
+        "find_ext_overrides(extension_path, object_name='') -> {overrides[:200], total, truncated, partial, extension_path, object_filter, _meta?}",
         "extension",
         ["перехваты расширения", "ext_overrides", "live overrides", "перехваты live"],
         "FIND OVERRIDES IN EXTENSION (live, без индекса):\n"
@@ -23178,6 +25285,8 @@ def make_bsl_helpers(
         "  if ctx.get('nearby_extensions'):\n"
         "      ext_path = ctx['nearby_extensions'][0]['path']\n"
         "      ovr_obj = find_ext_overrides(ext_path, 'Номенклатура')\n"
+        "  # Имя, которому не соответствует ни один объект: total=0 и hint (проверьте имя: search_objects);\n"
+        "  #   ссылка с префиксом на несуществующий объект — ValueError «объекта … нет».\n"
         "  # Если есть индекс v9+ — предпочитай get_overrides() (мгновенно из SQLite).\n"
         "  # find_ext_overrides — для live-проверки на проектах без индекса или для верификации.\n"
         "  # ext_line (= line) — строка АННОТАЦИИ (&Перед/&После/&Вместо) в модуле расширения;\n"
@@ -23195,7 +25304,7 @@ def make_bsl_helpers(
         "get_overrides(object_name='', method_name='', limit=200, offset=0) -> {overrides, total, offset,"
         " returned, has_more, truncated, partial, source, by_annotation/by_object_top/by_extension_top="
         "dict{имя:N}, unique_objects/unique_methods=N имён, unique_object_methods=N пар,"
-        " unique_extensions=N}"
+        " unique_extensions=N, config_level_overrides=N}"
         "  # stats full iff partial=False; row.extension_file — исполним",
         "extension",
         ["перехват", "override", "расширен", "extension", "вместо", "после", "перед"],
@@ -23203,12 +25312,14 @@ def make_bsl_helpers(
         "  result = get_overrides('Номенклатура')\n"
         "  for ov in result['overrides']:\n"
         "      print(f\"  {ov['target_method']} <- {ov['annotation']} {ov.get('extension_name', '')}\")\n"
+        "  # Имя, которому не соответствует ни один объект: total=0 и hint (проверьте имя: search_objects);\n"
+        "  #   ссылка с префиксом на несуществующий объект ('Справочник.Нет') — ValueError «объекта … нет».\n"
         "  # by_annotation / by_object_top / by_extension_top — это DICT {имя: количество},\n"
         "  # НЕ список записей: итерируй .items(), а срезом бери list(d.items())[:5].\n"
         "  # unique_* — ЧИСЛА, а не списки: len() по ним падает.\n"
         "  #   unique_objects/unique_methods считают ИМЕНА: Документы.Заказ и Справочники.Заказ\n"
         "  #   схлопываются в одно. unique_object_methods считает ПАРЫ с учётом категории и\n"
-        "  #   потому их различает (на боевой 130 имён против 189 пар).\n"
+        "  #   потому их различает (на боевой 130 имён против 187 пар).\n"
         "  # Дочитать за пределы страницы (v1.34.0): while result['has_more']:\n"
         "  #     result = get_overrides(offset=result['offset'] + result['returned'])\n"
         "  # has_more = «есть следующая страница»; truncated = «список неполон относительно\n"

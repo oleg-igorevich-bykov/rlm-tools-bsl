@@ -728,7 +728,9 @@ def test_parse_form_recipe_searches_types_over_full_form_set():
         return [with_handler] if handler else [with_handler, without_handler]
 
     ns: dict = {"parse_form": fake_parse_form, "extract_procedures": lambda path: []}
-    exec(compile(recipe, "<parse_form recipe>", "exec"), ns)
+    # v1.45.0: прежде здесь исполнялся весь рецепт; первая строка теперь — заголовок меню help() (Д27),
+    # исполняется тело рецепта после неё
+    exec(compile(recipe.split("\n", 1)[1], "<parse_form recipe>", "exec"), ns)
 
     assert ns["dyn"] == [("ФормаВыбора", "Список")], (
         "рецепт ищет типы по отфильтрованному набору форм — вернулась не та выборка"
@@ -773,6 +775,8 @@ def test_parse_form_recipe_type_check_survives_both_formats():
         "parse_form": lambda object_name, form_name="", handler="": [forms[0]] if handler else forms,
         "extract_procedures": lambda path: [],
     }
-    exec(compile(recipe, "<parse_form recipe>", "exec"), ns)
+    # v1.45.0: прежде здесь исполнялся весь рецепт; первая строка теперь — заголовок меню help() (Д27),
+    # исполняется тело рецепта после неё
+    exec(compile(recipe.split("\n", 1)[1], "<parse_form recipe>", "exec"), ns)
 
     assert ns["dyn"] == [("CF", "СписокCF"), ("EDT", "СписокEDT")]

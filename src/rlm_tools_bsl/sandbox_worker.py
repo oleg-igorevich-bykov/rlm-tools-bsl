@@ -786,6 +786,7 @@ def _build_session(
         format_info=format_info,
         idx_reader=idx_reader,
         idx_zero_callers_authoritative=bool(payload.get("idx_zero_callers_authoritative")),
+        index_start_status=payload.get("index_start_status"),
         extension_paths=worker_extension_paths,
         output_capture_factory=lambda: writer,
         # Отсутствие ключа = прежнее поведение (BSL-хелперы включены).
@@ -795,6 +796,8 @@ def _build_session(
         current_config_role=payload.get("current_config_role"),
         current_config_name=payload.get("current_config_name") or "",
         current_config_root=payload.get("current_config_root") or "",
+        # v1.46.0 (П11): нет ключа у старого payload — "" (проверки существования по основной нет).
+        main_config_root=payload.get("main_config_root") or "",
         extension_name_by_root=dict(payload.get("extension_name_by_root") or {}),
         # v1.40.0: аренда СВОЕГО слота общего бюджета обхода.
         scan_lease=scan_lease,

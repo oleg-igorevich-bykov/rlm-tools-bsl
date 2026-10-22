@@ -2980,8 +2980,10 @@ class TestAuditContract:
         assert full["total"] == len(full["issues"]) == 8
 
     def test_unknown_reason_and_layer(self, audit_helpers):
-        res = audit_helpers["find_unresolved_calls"](reasons=["нет_такой"])
-        assert res["issues"] == [] and "method_missing" in res["_meta"]["arg_warning"]
+        # v1.46.0: прежде здесь стояли пустые `issues` с `_meta.arg_warning` — теперь неизвестная причина — отказ
+        # (Д4, П1), как и неизвестный слой.
+        with pytest.raises(ValueError, match="^find_unresolved_calls: reasons — .*method_missing"):
+            audit_helpers["find_unresolved_calls"](reasons=["нет_такой"])
         with pytest.raises(ValueError, match="layer"):
             audit_helpers["find_unresolved_calls"](layer="нет_такого")
 
@@ -4010,8 +4012,11 @@ class TestExtGraphGuards:
         os.utime(mod, (st.st_atime + 5, st.st_mtime + 5))
         IndexBuilder().update(str(cf))
         after = helpers["find_callers_context"]("Цель", OM)
-        # экспорта больше нет: ключа у ребра расширения нет, остается эвристика по имени
-        assert [c["edge_exact"] for c in after["callers"]] == [False] and after["_meta"]["exact_rows"] == 0
+        # v1.45.0 (Д5): прежде здесь стояла эвристика по имени (`[False]`) — экспорта больше нет, ключа у ребра
+        # расширения нет. Неэкспортную `Цель` квалифицированный вызов `ОМ.Цель()` из чужого модуля расширения
+        # достать не может: вызывающих нет, цель помечена неэкспортной.
+        assert after["callers"] == [] and after["_meta"]["exact_rows"] == 0
+        assert after["_meta"].get("non_export_target") is True
         assert n[0] == passes  # фазы 1-2 не перестраивались
 
     def test_budget_skipped_extension_hint_is_unavailable_not_absent(self, ext_graph_built, monkeypatch):

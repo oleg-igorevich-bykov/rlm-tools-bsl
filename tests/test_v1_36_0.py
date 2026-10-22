@@ -1146,6 +1146,10 @@ _SIG_SUM_BUDGET_WITHOUT_GIT = 12602
 # v1.44.0 merge re-baseline: апстрим +4 нетто (search_module_headers +18 −22,
 # find_register_movements +16 −8, см. лестницу выше); у форка запаса не было — порог +4.
 _SIG_SUM_BUDGET_WITHOUT_GIT = 13155
+# v1.46.0 merge re-baseline: подписи v1.45/v1.46 не влезли в запас форка
+# (нетто +40, в том числе fallback_reason:str|None у get_object_full_structure).
+# Факт смерженного дерева.
+_SIG_SUM_BUDGET_WITHOUT_GIT = 13195
 
 
 def test_sig_budget_headroom_freed_for_release():
@@ -2409,7 +2413,10 @@ def test_object_modules_registered_sig_exact():
 
     sig = build_helper_metadata_snapshot()["get_object_modules"]["sig"]
     # v1.40.0: 467 -> 483 — `loc=Σ строк методов` (+16), осознанное расширение контракта.
-    assert len(sig) == 483
+    # v1.46.0 (П4): 483 -> 506 — подпись называет единицы: `overrides:{count=методов,` и верхний
+    # `_meta:{index_used=все из индекса,` (+23): `index_used=False` рядом с `modules_index=8` читался как
+    # «индекс не использован», а `count` — как число строк перехватов.
+    assert len(sig) == 506
     assert "orphan_methods?" in sig
     assert "# ДЕШЕВЫЙ КОД-СКЕЛЕТ объекта за 1 вызов" not in sig
 

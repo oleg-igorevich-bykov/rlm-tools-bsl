@@ -283,9 +283,15 @@ def test_per_node_caller_truncation_is_inconclusive(monkeypatch, built):
     # → budget_exceeded=True (the dropped caller might have reached `from`).
     bsl, *_ = built
     monkeypatch.setattr(_bh, "_FIND_PATH_NODE_LIMIT", 1)
+    # v1.45.0 (Д1): прежде здесь стояло found=False + budget_exceeded=True — прямое ребро
+    # `Дёрнуть → НизкийМетод` за страницей вызывающих не проверялось. На маршруте строк оно
+    # теперь проверяется по ВСЕМ вызывающим узла.
     res = bsl["find_path"]("Дёрнуть", "НизкийМетод")
-    assert res["found"] is False
-    assert res["_meta"]["budget_exceeded"] is True
+    assert res["found"] is True and res["depth"] == 1
+    # Неокончательность усечённого узла у промаха сохраняется.
+    miss = bsl["find_path"]("НетТакогоМетода", "НизкийМетод")
+    assert miss["found"] is False
+    assert miss["_meta"]["budget_exceeded"] is True and miss["hint"]
 
 
 def test_full_page_finds_caller_that_truncation_would_drop(built):

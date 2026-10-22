@@ -1012,8 +1012,11 @@ class TestIndexReader:
             assert meta["exact_rows"] == 1
             exact_caller = next(c for c in result["callers"] if "CommonModules" in c["file"])
             assert exact_caller["caller_name"] == "ЗаполнитьТабличнуюЧасть"
-            # The unresolved cross-module reference is kept as a labeled fallback.
-            assert meta["fallback_rows"] >= 1
+            # v1.45.0 (Д5): прежде здесь стояло `fallback_rows >= 1` — неразрешённая ссылка
+            # `МойМодуль.ВычислитьИтоги` из ObjectModule шла строкой по имени. Неэкспортную процедуру
+            # из чужого модуля вызвать нельзя: в точном режиме — только вызовы из своего модуля.
+            assert meta["fallback_rows"] == 0 and meta.get("non_export_target") is True
+            assert all("CommonModules" in c["file"] for c in result["callers"])
         finally:
             reader.close()
 

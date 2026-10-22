@@ -44,6 +44,7 @@ from rlm_tools_bsl.bsl_xml_parsers import (
     _RU_REFTYPE_TO_CANONICAL,
     canonicalize_type_ref,
     classify_subscription_row,
+    normalize_used_in,
 )
 
 logger = logging.getLogger(__name__)
@@ -1541,6 +1542,18 @@ _CATEGORY_RU: dict[str, str] = {
     "DefinedTypes": "Определяемый тип",
 }
 
+
+def strip_category_prefix(category: str | None, stored: str) -> str:
+    """Синоним объекта без префикса вида (v1.46.0, Д9): ``object_synonyms.synonym`` хранит
+    ``«<Категория>: <синоним>»`` (ради поиска по виду), а наружу синоним идёт как в описателе. Снимается
+    ровно ``f"{_CATEGORY_RU.get(category, category)}: "`` в начале — не «до первого двоеточия»: ``': '`` бывает
+    и внутри самого синонима. Нет такого префикса — строка как есть."""
+    if not stored:
+        return stored
+    prefix = f"{_CATEGORY_RU.get(category or '', category or '')}: "
+    return stored[len(prefix) :] if stored.startswith(prefix) else stored
+
+
 # Map: top-level category folder -> 1C metadata type singular prefix (used in `used_in`)
 _CATEGORY_TO_TYPE_PREFIX: dict[str, str] = {
     "Documents": "Document",
@@ -1948,8 +1961,44 @@ def _git_head_sha(base_path: str) -> str | None:
         return None
 
 
+def _git_commit_exists(base_path: str, sha: str) -> bool | None:
+    """Check that *sha* resolves to a commit object of the repository.
+
+    Existence is all the git fast path needs from the stored commit: the
+    committed diff (``git diff <sha> HEAD``) compares two trees and does not
+    require *sha* to be an ancestor of HEAD. A commit rewritten by rebase /
+    amend / force-push stays in the object store while the reflog keeps it
+    (``gc.reflogExpireUnreachable``, 30 days by default).
+
+    Returns ``True`` — the commit exists; ``False`` — git confirmed there is no
+    such commit (``rev-parse -q --verify`` exit code 1: the object was pruned,
+    the index was copied from another clone, a shallow history does not contain
+    it); ``None`` — the check itself failed (git not found, timeout, ``OSError``,
+    any other exit code, e.g. a corrupt object). The decision is made on the exit
+    code only, so it does not depend on the language of git messages.
+    """
+    cmd = _git_base_cmd(base_path)
+    if cmd is None:
+        return None
+    try:
+        r = run_git([*cmd, "rev-parse", "-q", "--verify", f"{sha}^{{commit}}"], timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:
+        return False
+    return None
+
+
 def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDirtyResult | None:
     """Collect all files changed since *since_commit* (committed+staged+unstaged+untracked).
+
+    *since_commit* must exist as a commit object (see :func:`_git_commit_exists`)
+    but does **not** have to be an ancestor of HEAD: the committed diff below is a
+    tree-to-tree comparison, valid for any two commits. A commit rewritten by
+    rebase / amend or left on another (unmerged) branch still yields exactly the
+    files whose content differs from HEAD.
 
     Returns a :class:`_GitDirtyResult` with paths relative to *base_path*
     (prefix stripped). Returns ``None`` on a **critical** git error (caller must
@@ -1958,15 +2007,8 @@ def _git_changed_files(base_path: str, since_commit: str, prefix: str) -> _GitDi
     incomplete and the caller must force a full scan (and persist the
     ``git_dirty_unreliable`` flag) rather than silently dropping the changes.
     """
-    # Verify since_commit is an ancestor of HEAD
     cmd = _git_base_cmd(base_path)
     if cmd is None:
-        return None
-    try:
-        r = run_git([*cmd, "merge-base", "--is-ancestor", since_commit, "HEAD"], timeout=60)
-        if r.returncode != 0:
-            return None
-    except (subprocess.TimeoutExpired, OSError):
         return None
 
     base_args = [*cmd, "-c", "core.quotePath=false"]
@@ -2816,6 +2858,25 @@ class IndexStatus(Enum):
     MISSING = "missing"
 
 
+# Метка `index_status` для агента — stable machine-readable contract (codex round 16/22/24): явная карта
+# IndexStatus→строка (FRESH.value — "fresh", наружу — "ok"); простые STALE/MISSING — "missing";
+# незавершённая сборка — отдельным флагом. v1.45.0 (Д29): переехала из server.py, чтобы старт и
+# get_index_info называли свежесть ОДНИМ правилом.
+INDEX_STATUS_LABELS = {
+    IndexStatus.FRESH: "ok",
+    IndexStatus.STALE_AGE: "stale_age",
+    IndexStatus.STALE_CONTENT: "stale_content",
+}
+
+
+def index_status_label(status: IndexStatus | None, *, reader_loaded: bool, incomplete: bool) -> str:
+    """Метка свежести индекса (v1.45.0, Д29): ридер загружен — метка статуса (``ok``/``stale_age``/
+    ``stale_content``); не загружен — ``incomplete`` при незавершённой сборке, иначе ``missing``."""
+    if reader_loaded:
+        return INDEX_STATUS_LABELS.get(status, "ok")
+    return "incomplete" if incomplete else "missing"
+
+
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
@@ -3095,8 +3156,27 @@ def _check_age(meta: dict[str, str]) -> IndexStatus | None:
     return None
 
 
-def _check_content_sample(db_path: Path, base_path: str) -> IndexStatus | None:
-    """Sample random modules and compare mtime+size. Returns STALE_CONTENT or None."""
+def file_matches_index_stat(full_path: Path, mtime: float | None, size: int | None) -> bool:
+    """Совпадает ли файл на диске со строкой индекса: |Δmtime| ≤ 1,0 с и равный размер.
+
+    Единое правило выборочной сверки (`content_sample_status`) и модуля без процедур
+    (`get_module_outline`, v1.45.0). Нет файла или ошибка stat — не совпадает; строка без
+    `mtime`/`size` — тоже (сверять нечего)."""
+    if mtime is None or size is None:
+        return False
+    try:
+        st = Path(full_path).stat()
+    except OSError:
+        return False
+    return abs(st.st_mtime - mtime) <= 1.0 and st.st_size == size
+
+
+def content_sample_check(db_path: Path, base_path: str) -> tuple[str, int]:
+    """Выборочная сверка содержимого: (итог, число сверенных файлов).
+
+    Итог — ``'ok'`` | ``'mismatch'`` (несовпадений больше ``max(1, n // 5)``) | ``'skipped'``
+    (модулей меньше ``RLM_INDEX_SAMPLE_THRESHOLD``) | ``'unavailable'`` (ошибка SQLite или пустая
+    выборка)."""
     sample_size = int(os.environ.get("RLM_INDEX_SAMPLE_SIZE", "5"))
     sample_threshold = int(os.environ.get("RLM_INDEX_SAMPLE_THRESHOLD", "30"))
 
@@ -3104,37 +3184,32 @@ def _check_content_sample(db_path: Path, base_path: str) -> IndexStatus | None:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error:
-        return None
+        return "unavailable", 0
 
     try:
         row = conn.execute("SELECT COUNT(*) AS cnt FROM modules").fetchone()
         total_modules = row["cnt"] if row else 0
 
         if total_modules < sample_threshold:
-            return None
+            return "skipped", 0
 
         rows = conn.execute(
             "SELECT rel_path, mtime, size FROM modules ORDER BY RANDOM() LIMIT ?",
             (sample_size,),
         ).fetchall()
     except sqlite3.Error:
-        return None
+        return "unavailable", 0
     finally:
         conn.close()
 
     if not rows:
-        return None
+        return "unavailable", 0
 
     base = Path(base_path)
 
     def _stat_check(r: sqlite3.Row) -> bool:
         """Return True if mismatch detected."""
-        full_path = base / r["rel_path"]
-        try:
-            st = full_path.stat()
-            return abs(st.st_mtime - r["mtime"]) > 1.0 or st.st_size != r["size"]
-        except OSError:
-            return True
+        return not file_matches_index_stat(base / r["rel_path"], r["mtime"], r["size"])
 
     if len(rows) > 1:
         from concurrent.futures import ThreadPoolExecutor as _TP
@@ -3146,8 +3221,42 @@ def _check_content_sample(db_path: Path, base_path: str) -> IndexStatus | None:
         mismatches = 1 if _stat_check(rows[0]) else 0
 
     if mismatches > max(1, len(rows) // 5):
-        return IndexStatus.STALE_CONTENT
-    return None
+        return "mismatch", len(rows)
+    return "ok", len(rows)
+
+
+def content_sample_status(db_path: str | Path, base_path: str) -> str:
+    """Итог выборочной сверки mtime/size: ``'ok'`` | ``'mismatch'`` | ``'skipped'`` | ``'unavailable'``.
+
+    v1.45.0 (Р1): на ``stale_age`` сверка решает, авторитетен ли граф вызовов (совпала или не
+    проводится из-за порога — авторитетен); ``index_status`` от неё не меняется."""
+    return content_sample_check(Path(db_path), base_path)[0]
+
+
+def _check_content_sample(db_path: Path, base_path: str) -> IndexStatus | None:
+    """Sample random modules and compare mtime+size. Returns STALE_CONTENT or None."""
+    return IndexStatus.STALE_CONTENT if content_sample_check(db_path, base_path)[0] == "mismatch" else None
+
+
+def categories_changed_since(config_root: str, built_at: float, *, tolerance: float = 2.0) -> list[str]:
+    """v1.46.0 (Д16, П3 — вариант V1): категории индекса (``_CATEGORY_RU`` — 33, в том числе подписки,
+    функциональные опции, регламентные задания и определяемые типы, которых нет в ``METADATA_CATEGORIES``), чей
+    каталог ``<config_root>/<категория>`` изменён позже ``built_at + tolerance`` — в нём добавлен или удалён объект
+    либо перезаписан описатель (git checkout/pull пересоздаёт файлы: время каталога растёт и без изменения состава).
+
+    Только ``stat`` каталогов по известным именам, без листинга (на боевых — доли миллисекунды на старт). Вложенную
+    подсистему и модуль или форму, добавленные в СУЩЕСТВУЮЩИЙ объект, проверка не видит: меняется время каталога
+    объекта, а не категории. Нет каталога или ошибка ``stat`` — пропуск. Отсортировано."""
+    root = Path(config_root)
+    changed: list[str] = []
+    for category in _CATEGORY_RU:
+        try:
+            mtime = os.stat(root / category).st_mtime
+        except OSError:
+            continue
+        if mtime > built_at + tolerance:
+            changed.append(category)
+    return sorted(changed)
 
 
 def check_index_usable(
@@ -3164,7 +3273,8 @@ def check_index_usable(
 
     Structural drift (files added/removed) is NOT checked here — use
     check_index_strict() or compare format_info.bsl_file_count with
-    index_meta bsl_count separately.
+    index_meta bsl_count separately. v1.46.0: rlm_start отдельно сверяет состав категорий —
+    ``categories_changed_since`` (``stat`` каталогов 33 категорий против ``built_at``).
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -10020,9 +10130,17 @@ class IndexBuilder:
                 if repo_info:
                     git_root, prefix = repo_info
                     git_head = _git_head_sha(base_path)
-                    git_result = _git_changed_files(base_path, stored_commit, prefix)
+                    # The stored commit only has to EXIST — ancestry is not required
+                    # (tree diff, see _git_changed_files). A rebased / amended /
+                    # force-pushed stored commit therefore keeps the fast path. Only a
+                    # commit git confirms as absent is "stored commit missing"; a failed
+                    # check (None: timeout, corrupt object, ...) stays "git error".
+                    stored_commit_exists = _git_commit_exists(base_path, stored_commit)
+                    git_result = _git_changed_files(base_path, stored_commit, prefix) if stored_commit_exists else None
 
-                    if git_result is None or git_head is None:
+                    if stored_commit_exists is False:
+                        fallback_reason = "stored commit missing"
+                    elif git_result is None or git_head is None:
                         fallback_reason = "git error" if git_result is None else "head sha error"
                     elif git_result.unreliable_reason is not None:
                         # Best-effort detection timed out — the change set is
@@ -10275,10 +10393,6 @@ class IndexBuilder:
                 conn.execute(
                     "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                     ("paths_hash", new_paths_hash),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
-                    ("built_at", str(time.time())),
                 )
 
         # v17: фоновые рёбра зависят и от ОПИСАТЕЛЕЙ (реквизит формы/объекта, предопределённый
@@ -10573,6 +10687,14 @@ class IndexBuilder:
         conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
             ("version", str(BUILDER_VERSION)),
+        )
+        # v1.46.0: `built_at` — момент сверки индекса с исходниками. Полный скан сверил всё и без `.bsl`-дельты
+        # (правка только описателей: роль, подписка) — `built_at` пишется всегда, как у git-быстрого пути и сборки.
+        # Прежде — только при изменённых `.bsl`, и предупреждение старта о составе категорий
+        # (`categories_changed_since`) после такого `update` повторялось, а возраст индекса не сбрасывался.
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            ("built_at", str(time.time())),
         )
 
         # Save git_head_commit on fallback so NEXT update can use git fast path.
@@ -12532,7 +12654,7 @@ class IndexReader:
         with self._lock:
             try:
                 mod_row = self._conn.execute(
-                    "SELECT id, category, object_name, module_type FROM modules WHERE rel_path = ?",
+                    "SELECT id, category, object_name, module_type, mtime, size FROM modules WHERE rel_path = ?",
                     (rel_path,),
                 ).fetchone()
                 if mod_row is None:
@@ -12553,6 +12675,10 @@ class IndexReader:
                     "category": mod_row["category"],
                     "object_name": mod_row["object_name"],
                     "module_type": mod_row["module_type"],
+                    # v1.45.0 (Д14): mtime/size строки модуля — модуль без процедур, совпадающий с диском,
+                    # отвечается индексом, а не признаётся устаревшим (`file_matches_index_stat`).
+                    "mtime": mod_row["mtime"],
+                    "size": mod_row["size"],
                 },
                 "regions": [{"name": r["name"], "line": r["line"], "end_line": r["end_line"]} for r in reg_rows],
                 "methods": [
@@ -12717,12 +12843,21 @@ class IndexReader:
                     "FROM calls c JOIN methods m ON m.id = c.caller_id "
                     "JOIN modules mod ON mod.id = m.module_id "
                 )
+                # v1.45.0 (Д5): неэкспортную процедуру зовут только по имени без точки внутри своего
+                # модуля (и из заимствованного модуля расширения — точное ребро слоя): у такой цели
+                # строки без ключа «по имени» — вызовы ДРУГИХ процедур (общих модулей, значений).
+                non_export = self._is_non_export_target(exact_key, proc_name)
                 # Унарный «+» у `callee_key IS NULL` (здесь и в подсчете ниже) запрещает брать по этому
                 # терму индекс, значения он не меняет. SQLite без stat4 оценивает IS NULL средним stat1 и
                 # не знает, что строк без ключа — половина таблицы: на статистике индексов ERP планировщик
                 # иначе выбирал idx_calls_callee_key и перебирал все строки без ключа (~1 с на запрос)
                 # вместо единиц строк по idx_calls_callee_short.
-                where = f"WHERE (c.callee_key = ? OR (+c.callee_key IS NULL AND {match_sql})){kind_ok}"
+                if non_export:
+                    where = f"WHERE c.callee_key = ?{kind_ok}"
+                    where_params: tuple = (exact_key,)
+                else:
+                    where = f"WHERE (c.callee_key = ? OR (+c.callee_key IS NULL AND {match_sql})){kind_ok}"
+                    where_params = (exact_key, match_param)
 
                 # По callee_key членов цепочки и вычисляемых запусков нет по инварианту
                 # резолвера (их ключ всегда NULL), поэтому точный счёт фильтра не требует.
@@ -12730,15 +12865,18 @@ class IndexReader:
                     "SELECT COUNT(*) AS cnt FROM calls WHERE callee_key = ?", (exact_key,)
                 ).fetchone()
                 exact_rows = exact_cnt_row["cnt"] if exact_cnt_row else 0
-                fb_cnt_row = self._conn.execute(
-                    f"SELECT COUNT(*) AS cnt FROM calls c WHERE +c.callee_key IS NULL AND {match_sql}{kind_ok}",
-                    (match_param,),
-                ).fetchone()
-                fallback_rows = fb_cnt_row["cnt"] if fb_cnt_row else 0
+                if non_export:
+                    fallback_rows = 0
+                else:
+                    fb_cnt_row = self._conn.execute(
+                        f"SELECT COUNT(*) AS cnt FROM calls c WHERE +c.callee_key IS NULL AND {match_sql}{kind_ok}",
+                        (match_param,),
+                    ).fetchone()
+                    fallback_rows = fb_cnt_row["cnt"] if fb_cnt_row else 0
                 total_callers = exact_rows + fallback_rows
 
                 query = base_select + where + " ORDER BY mod.rel_path, call_line LIMIT ? OFFSET ?"
-                rows = self._conn.execute(query, (exact_key, match_param, limit, offset)).fetchall()
+                rows = self._conn.execute(query, (*where_params, limit, offset)).fetchall()
                 callers = [
                     {
                         "file": r["rel_path"],
@@ -12757,20 +12895,20 @@ class IndexReader:
                     }
                     for r in rows
                 ]
-                return {
-                    "callers": callers,
-                    "_meta": {
-                        "total_callers": total_callers,
-                        "returned": len(callers),
-                        "offset": offset,
-                        "has_more": (offset + limit) < total_callers,
-                        "exact_available": True,
-                        "target_exact": True,
-                        "target_key": exact_key,
-                        "exact_rows": exact_rows,
-                        "fallback_rows": fallback_rows,
-                    },
+                exact_meta = {
+                    "total_callers": total_callers,
+                    "returned": len(callers),
+                    "offset": offset,
+                    "has_more": (offset + limit) < total_callers,
+                    "exact_available": True,
+                    "target_exact": True,
+                    "target_key": exact_key,
+                    "exact_rows": exact_rows,
+                    "fallback_rows": fallback_rows,
                 }
+                if non_export:
+                    exact_meta["non_export_target"] = True
+                return {"callers": callers, "_meta": exact_meta}
 
             # --- Fallback (name-based) mode — legacy behavior ----------------
             # Match callers by method name via the shared indexed clause; for a
@@ -12797,6 +12935,7 @@ class IndexReader:
                 WHERE ({match_sql}){kind_ok}
             """
             params_list: list = [match_param]
+            named_non_export = False
 
             if module_hint:
                 # Filter by callee qualification: match qualified "hint.proc"
@@ -12817,6 +12956,10 @@ class IndexReader:
                 if target and (not target["is_export"] or target["is_form"]):
                     query += " AND mod.rel_path = ?"
                     params_list.append(target["rel_path"])
+                    if not target["is_export"]:
+                        # v1.45.0 (Д5): у неэкспортной цели в своём файле — только вызовы без точки.
+                        query += " AND instr(c.callee_name, '.') = 0"
+                        named_non_export = True
 
             # Count total
             _t0 = time.monotonic()
@@ -12866,22 +13009,33 @@ class IndexReader:
                 for r in rows
             ]
 
-            return {
-                "callers": callers,
-                "_meta": {
-                    "total_callers": total_callers,
-                    "returned": len(callers),
-                    "offset": offset,
-                    "has_more": (offset + limit) < total_callers,
-                    # Name-based fallback: schema may support exact mode
-                    # (exact_available) but the target was not uniquely resolved,
-                    # so every returned row is heuristic (name match).
-                    "exact_available": self._has_callee_key,
-                    "target_exact": False,
-                    "exact_rows": 0,
-                    "fallback_rows": total_callers,
-                },
+            named_meta = {
+                "total_callers": total_callers,
+                "returned": len(callers),
+                "offset": offset,
+                "has_more": (offset + limit) < total_callers,
+                # Name-based fallback: schema may support exact mode
+                # (exact_available) but the target was not uniquely resolved,
+                # so every returned row is heuristic (name match).
+                "exact_available": self._has_callee_key,
+                "target_exact": False,
+                "exact_rows": 0,
+                "fallback_rows": total_callers,
             }
+            if named_non_export:
+                named_meta["non_export_target"] = True
+            return {"callers": callers, "_meta": named_meta}
+
+    def _is_non_export_target(self, exact_key: str, proc_name: str) -> bool:
+        """v1.45.0 (Д5): цель точного режима — неэкспортная процедура (ни одно её объявление в модуле
+        ключа не экспортное). Нет объявления — ``False``: прежний ответ. Вызывается под ``self._lock``."""
+        rel_path = exact_key.rsplit("::", 1)[0]
+        row = self._conn.execute(
+            "SELECT MAX(m.is_export) AS exp, COUNT(*) AS cnt FROM methods m JOIN modules mod ON mod.id = m.module_id "
+            "WHERE mod.rel_path = ? AND py_lower(m.name) = py_lower(?)",
+            (rel_path, proc_name),
+        ).fetchone()
+        return bool(row and row["cnt"] and not row["exp"])
 
     @_transient_safe(lambda: None)
     def get_call_resolution_maps(self) -> dict | None:
@@ -13430,7 +13584,8 @@ class IndexReader:
         """Get enum definition from the index.
 
         Args:
-            enum_name: Enum name (or fragment, case-insensitive).
+            enum_name: Enum name (or fragment, case-insensitive). v1.46.0 (Д19): строка с ТОЧНЫМ именем — первой,
+                иначе прежний выбор — первая, чьё имя содержит запрос.
 
         Returns:
             Dict with name, synonym, values, file — or None if table missing / not found.
@@ -13445,6 +13600,10 @@ class IndexReader:
                 return None
 
             name_lower = enum_name.lower()
+            # v1.46.0 (Д19, П9): точное имя (нормализация `lower()`, как у UDF `py_lower`) — ПЕРВЫМ проходом; затем
+            # прежний перебор «первая строка, чьё имя СОДЕРЖИТ запрос» (порядок таблицы). Прежде на точном имени
+            # отвечало чужое перечисление, если его строка шла раньше (`СтавкиНДС` → `СпособыЗаполненияСтавкиНДС`).
+            rows = sorted(rows, key=lambda r: r["name"].lower() != name_lower)
             for r in rows:
                 if name_lower in r["name"].lower():
                     values = []
@@ -13602,12 +13761,17 @@ class IndexReader:
     def get_all_modules(self) -> list[dict] | None:
         """Return all modules from the index for fast _index_state init.
 
+        v1.46.0 (Д5): в порядке пути (``ORDER BY rel_path``; BINARY-сравнение SQLite — порядок кодовых точек).
+        Прежде порядок был порядком вставки — завершения потоков сборки и истории ``update`` (точечное
+        обновление вставляет строки изменённых модулей в конец), — а он становится порядком каталога сессии:
+        проход ``find_by_type``/``find_module`` без имени, «первый точный модуль» омонима.
+
         Returns:
             list of dicts {rel_path, category, object_name, module_type, form_name}.
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT rel_path, category, object_name, module_type, form_name FROM modules"
+                "SELECT rel_path, category, object_name, module_type, form_name FROM modules ORDER BY rel_path"
             ).fetchall()
             return [
                 {
@@ -14364,7 +14528,16 @@ class IndexReader:
             ``{"groups": [{"key", "count"}], "groups_total": N}`` (группы отсортированы
             по убыванию count, при равенстве — по ключу), либо None если таблицы нет.
         """
-        col = "m.category" if by == "category" else "r.name"
+        # v1.45.0 (Д17, Р3): у модуля без категории (уровня конфигурации, категории вне словаря) ключ —
+        # первый сегмент пути: `Ext`/`Configuration` и файл в корне — 'Configuration', иначе сам сегмент
+        # (тем же правилом, что `_group_key` хелпера). Строки по-прежнему несут category=None.
+        seg = "substr(m.rel_path, 1, instr(m.rel_path, '/') - 1)"
+        col = (
+            f"COALESCE(m.category, CASE WHEN instr(m.rel_path, '/') = 0 THEN 'Configuration' "
+            f"WHEN {seg} IN ('Ext', 'Configuration') THEN 'Configuration' ELSE {seg} END)"
+            if by == "category"
+            else "r.name"
+        )
         with self._lock:
             try:
                 where = ""
@@ -15110,10 +15283,8 @@ class IndexReader:
         # read-time bugfix незаметно становится новым глобальным synonym-search.
         # Одного его мало: строка появляется ТОЛЬКО при НЕПУСТОМ <Synonym>, то
         # есть на подсистеме без синонима второй источник молчит.
-        synonym_prefix = f"{_CATEGORY_RU['Subsystems']}: "
         for r in synonym_rows:
-            stored = r["synonym"] or ""
-            raw = stored[len(synonym_prefix) :] if stored.startswith(synonym_prefix) else stored
+            raw = strip_category_prefix("Subsystems", r["synonym"] or "")
             obj = r["object_name"] or ""
             key = (obj, r["file"] or "")
             synonym_hit = raw.lower() == q and _legacy_synonym_candidate(key[1])
@@ -15545,12 +15716,31 @@ class IndexReader:
                     "source_category": r["source_category"],
                     "ref_object": r["ref_object"],
                     "ref_kind": r["ref_kind"],
-                    "used_in": r["used_in"],
+                    # v1.45.0 (Д24): строки индекса до релиза — в написании CF
+                    "used_in": normalize_used_in(r["used_in"], r["ref_kind"]),
                     "path": r["path"],
                     "line": r["line"],
                 }
                 for r in rows
             ]
+
+    @_transient_safe(lambda: None)
+    def get_module_ids(self, rel_paths: list[str]) -> dict[str, int] | None:
+        """``{rel_path: modules.id}`` для перечисленных модулей (v1.45.0, Д10): живые строки перехватов
+        получают ``source_module_id`` того же индекса, что и индексные. Пачками по 500 путей; модуля
+        нет — ключа нет; ``None`` — таблица недоступна."""
+        out: dict[str, int] = {}
+        paths = [p for p in dict.fromkeys(rel_paths) if p]
+        with self._lock:
+            for start in range(0, len(paths), 500):
+                chunk = paths[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._conn.execute(
+                    f"SELECT id, rel_path FROM modules WHERE rel_path IN ({placeholders})",  # noqa: S608
+                    chunk,
+                ).fetchall()
+                out.update({r["rel_path"]: r["id"] for r in rows})
+        return out
 
     @_transient_safe(lambda: None)
     def find_metadata_refs_from(
@@ -15559,8 +15749,13 @@ class IndexReader:
         source_category: str | None = None,
         kinds: list[str] | None = None,
         limit: int = 1000,
+        *,
+        ref_object: str | None = None,
     ) -> list[dict] | None:
         """OUTBOUND metadata references FROM ``source_object`` (v1.19.0).
+
+        v1.45.0: ``ref_object`` (каноническая ссылка, регистр не важен) сужает выборку до ссылок на
+        ЭТОТ объект — точечная проверка прямого ребра у узла ``find_data_path``, чья страница усечена.
 
         The reverse direction of ``find_metadata_references``: "which objects does
         ``source_object`` reference?" (its attribute types, owner, based-on, …).
@@ -15588,6 +15783,9 @@ class IndexReader:
                     placeholders = ",".join("?" for _ in kinds)
                     conditions.append(f"ref_kind IN ({placeholders})")
                     params.extend(kinds)
+                if ref_object:
+                    conditions.append("py_lower(ref_object) = py_lower(?)")
+                    params.append(ref_object)
                 where = " AND ".join(conditions)
                 sql = (
                     "SELECT source_object, source_category, ref_object, ref_kind, "
@@ -15605,7 +15803,8 @@ class IndexReader:
                     "source_category": r["source_category"],
                     "ref_object": r["ref_object"],
                     "ref_kind": r["ref_kind"],
-                    "used_in": r["used_in"],
+                    # v1.45.0 (Д24): строки индекса до релиза — в написании CF
+                    "used_in": normalize_used_in(r["used_in"], r["ref_kind"]),
                     "path": r["path"],
                     "line": r["line"],
                 }

@@ -742,8 +742,11 @@ def test_extension_module_is_not_reported_as_missing_index(ov_index):
 def test_profile_names_skipped_extension_modules(ov_index):
     bsl, _cf, _cfe = ov_index
     sec = bsl["get_object_profile"]("Справочник.Товары", sections=["modules"])["sections"]["modules"]
-    assert sec["status"] == "skipped"
-    assert sec["_meta"]["reason"] == "extension_modules_skipped_live"
+    # v1.45.0 (П1): прежде здесь стояло status='skipped' с reason='extension_modules_skipped_live' — модули
+    # соседних расширений секция не читала. Теперь они разбираются живьём, секция полна, причины пропуска нет.
+    assert sec["status"] == "ok"
+    assert "reason" not in sec["_meta"]
+    assert any(i["path"].startswith("../") and i["methods"] > 0 for i in sec["items"])
 
 
 # ═══════════════ Задача 10 (Д10) — nearby_main ═══════════════
@@ -1769,8 +1772,10 @@ def test_blank_name_finds_nothing(doc_domain, with_index, helper):
     """Имя из одних пробелов — «не найден», как на v1.43.0: разбор формы не превращает его в пустое имя, на
     котором каскад и подстрочный поиск отдавали первый попавшийся объект конфигурации."""
     _fmt, root, reader = doc_domain
-    res = _bsl_for(root, reader if with_index else None)[helper]("  ")
-    assert "не найден" in (res.get("error") or ""), res
+    # v1.45.0 (Д8): прежде здесь стояло «не найден» в ответе — на боевых конфигурациях тот же ввод отдавал
+    # объект (регистр). Теперь имя из пробелов — отказ публичной границы с именем вызванного хелпера.
+    with pytest.raises(ValueError, match=f"^{helper}:"):
+        _bsl_for(root, reader if with_index else None)[helper]("  ")
 
 
 _DTYPE_HELPERS = {
@@ -1930,8 +1935,12 @@ def test_malformed_paths_keep_the_previous_answer(doc_domain):
     bsl = _bsl_for(root)
     assert bsl["parse_form"]("Documents/.xml") == []
     assert bsl["parse_form"]("Documents/.mdo") == []
-    assert bsl["find_print_forms"]("Documents///")["object"] == "//"
-    assert "'//' в категории Documents" in bsl["get_object_modules"]("Documents///")["error"]
+    # v1.45.0 (Д8): прежде здесь стояло — `find_print_forms` отвечал объектом `//`, `get_object_modules` —
+    # «'//' в категории Documents». Путь категории без имени теперь — отказ публичной границы.
+    with pytest.raises(ValueError, match="^find_print_forms:"):
+        bsl["find_print_forms"]("Documents///")
+    with pytest.raises(ValueError, match="^get_object_modules:"):
+        bsl["get_object_modules"]("Documents///")
     outline = bsl["get_module_outline"]("Documents/.xml", no_live=True)
     assert outline["_meta"]["resolved_from_name"] is False
 
@@ -1941,18 +1950,16 @@ def test_malformed_paths_keep_the_previous_answer(doc_domain):
 # Не-ссылка и ответ v1.43.0 на нее. Найдены переписью «хелперы с именем объекта × вырожденные входы» против
 # состояния до анстейджа; до правки каждая форма давала чужой ответ.
 _NON_REFERENCE_ANSWERS = [
-    # префикс без имени: ноль, как прежде (до правки — обзор всех опций)
-    (
-        "find_functional_options",
-        "document.",
-        lambda r: (r["object"], len(r["xml_options"]), len(r["code_options"])),
-        ("document.", 0, 0),
-    ),
+    # префикс без имени: v1.45.0 (Д8) — прежде здесь стояло («document.», 0, 0) — ноль; теперь отказ публичной
+    # границы с именем хелпера (обзорный хелпер отказывает префиксу без имени)
+    ("find_functional_options", "document.", None, ValueError),
     # префикс не объекта метаданных не снимается (до правки — имя `Продажи`)
     ("find_functional_options", "Подсистема.Продажи", lambda r: r["object"], "Подсистема.Продажи"),
     # сегмент из пробелов — не имя объекта (до правки — вхождения всех документов, все подписки на документы)
     ("find_code_usages", "Documents/ /", lambda r: (r["object"], r["total"]), ("Documents/ /", 0)),
-    ("find_event_subscriptions", "Documents/ /", lambda r: sorted(x["name"] for x in r), ["ВсеДокументы"]),
+    # v1.46.0: прежде здесь стояло ["ВсеДокументы"] — строка подписки на набор документов (`scope='set'`): сегмент из
+    # пробелов — не-ссылка, которой не соответствует ни один объект, и подписки на наборы к ней не раскрываются (Д3).
+    ("find_event_subscriptions", "Documents/ /", lambda r: sorted(x["name"] for x in r), []),
     (
         "get_object_full_structure",
         "Documents/ /Оплата",
@@ -1982,8 +1989,8 @@ _NON_REFERENCE_ANSWERS = [
         "Перечисление 'справочник.Договоры.Х' не найдено",
     ),
     ("find_roles", "документ.Оплата.Реквизит.Сумма", lambda r: r["object"], "документ.Оплата.Реквизит.Сумма"),
-    # прежний разбор самого хелпера: определяемый тип снимал свой префикс
-    ("find_defined_types", "DefinedType.", lambda r: r["name"], ""),
+    # v1.45.0 (Д8): прежде здесь стояло name == '' (хелпер снимал свой префикс); префикс без имени — отказ
+    ("find_defined_types", "DefinedType.", None, ValueError),
 ]
 
 
@@ -1997,6 +2004,10 @@ def test_non_reference_keeps_the_previous_answer(doc_domain, with_index, helper,
     сегмент из пробелов, префикс без имени, `/` после префикса с точкой, ссылка на член объекта — прежним
     разбором места вызова, ответ v1.43.0 (находки ревью и перепись)."""
     _fmt, root, reader = doc_domain
+    if expected is ValueError:  # v1.45.0 (Д8): аргумент без имени объекта — отказ публичной границы
+        with pytest.raises(ValueError, match=f"^{helper}:"):
+            _bsl_for(root, reader if with_index else None)[helper](arg)
+        return
     assert view(_bsl_for(root, reader if with_index else None)[helper](arg)) == expected
 
 
@@ -2376,7 +2387,8 @@ def test_closure_names_do_not_shadow_module_names():
 # Ответ v1.43.0 (снят исполнением на HEAD): (document, регистры кода, подписки, объект печатных форм, имя метаданных,
 # документы оснований).
 _FLOW_NON_REFERENCE_ANSWERS = [
-    ("  ", ("  ", [], ["ВсеДокументы", "ПриЗаписиВозврата", "ПриЗаписиДоговора", "ПриЗаписиОплаты"], "", None, [])),
+    # v1.45.0 (Д8): прежде здесь стоял ответ по пустому имени (все подписки) — теперь отказ публичной границы
+    ("  ", ValueError),
     (
         "document.Справочник.Договоры",
         ("document.Справочник.Договоры", [], ["ВсеДокументы"], "document.Справочник.Договоры", None, []),
@@ -2394,6 +2406,10 @@ def test_document_flow_non_reference_keeps_the_previous_answer(doc_domain, with_
     чужих документов), `document.Справочник.Договоры` — справочником, а у `  Оплата  ` пропадали основания (находка
     ревью)."""
     _fmt, root, reader = doc_domain
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="^analyze_document_flow:"):
+            _bsl_for(root, reader if with_index else None)["analyze_document_flow"](arg)
+        return
     res = _bsl_for(root, reader if with_index else None)["analyze_document_flow"](arg)
     got = (
         res["document"],
@@ -2415,6 +2431,12 @@ def test_parse_form_non_reference_keeps_the_previous_answer(doc_domain, with_ind
     давал `ValueError`, а гибрид `Документ.Documents/Оплата` терял форму, которую 1.43.0 находил широким отбором
     (без индекса; с индексом широкого отбора нет — объявлено, на 1.43.0 индексная ветка здесь падала)."""
     _fmt, root, reader = doc_domain
+    if arg in ("Documents///", "   "):
+        # v1.45.0 (Д8): прежде здесь стоял пустой ответ — путь категории и пробельное имя без имени объекта
+        # теперь отвергает собственная проверка parse_form, как пустую строку
+        with pytest.raises(ValueError, match="object_name is required"):
+            _bsl_for(root, reader if with_index else None)["parse_form"](arg)
+        return
     rows = _bsl_for(root, reader if with_index else None)["parse_form"](arg)
     expected = (
         {("Documents", "Оплата", "ФормаДокумента")} if arg == "Документ.Documents/Оплата" and not with_index else set()
